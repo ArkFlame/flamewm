@@ -115,7 +115,7 @@ def exact(
         errors.append(f"promoted owner drifted beyond declared translations: {active} <- {ref}")
 
 
-if not (REF / "Cargo.lock").is_file() or 'version = "0.0.9"' not in (REF / "Cargo.lock").read_text():
+if not (REF / "Cargo.toml").is_file() or 'version = "0.0.9"' not in (REF / "Cargo.toml").read_text():
     errors.append("vendor manifest is not RustWebRender 0.0.9")
 
 for rel in ["layout.rs", "paint.rs"]:
