@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: FlameWM
+Upstream-Contact: ArkFlame Studios <maintainers@arkflame.dev>
+Source: https://github.com/arkflame/flamewm
+
+Files: *
+Copyright: 2026 ArkFlame Studios
+License: LGPL-2.0-only
+
+License: LGPL-2.0-only
+ This package is distributed under the GNU Lesser General Public License,
+ version 2. See /usr/share/common-licenses/LGPL-2 for the complete text.

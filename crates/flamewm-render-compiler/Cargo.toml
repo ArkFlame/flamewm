@@ -1,0 +1,22 @@
+[package]
+name = "flamewm-render-compiler"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+repository.workspace = true
+rust-version = "1.70"
+description = "Build-time HTML/CSS compiler for FlameWM Render"
+
+[dependencies]
+flamewm-render-core = { path = "../flamewm-render-core" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "flamewm-render-compile"
+path = "src/bin/flamewm-render-compile.rs"
+
+[[bin]]
+name = "flamewm-render-inspect"
+path = "src/bin/flamewm-render-inspect.rs"

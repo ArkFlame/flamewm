@@ -1,0 +1,92 @@
+use flamewm_api::applications::{ApplicationLaunchOptions, DesktopApplication};
+use flamewm_api::ports::ApplicationPort;
+use flamewm_api::{DesktopAppId, ErrorCode, FlameError, FlameResult};
+
+use crate::identity::normalize_identity;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApplicationService {
+    applications: Vec<DesktopApplication>,
+    revision: u64,
+}
+
+impl ApplicationService {
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn all(&self) -> &[DesktopApplication] {
+        &self.applications
+    }
+
+    pub fn replace_catalog(&mut self, mut applications: Vec<DesktopApplication>) -> bool {
+        applications.sort_by(|a, b| a.id.cmp(&b.id));
+        applications.dedup_by(|a, b| a.id == b.id);
+        if applications == self.applications {
+            return false;
+        }
+        self.applications = applications;
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+
+    pub fn find_by_id(&self, id: &DesktopAppId) -> FlameResult<&DesktopApplication> {
+        self.applications
+            .iter()
+            .find(|app| &app.id == id)
+            .ok_or_else(|| FlameError::new(ErrorCode::NotFound, "application id not found"))
+    }
+
+    pub fn find_by_window_class(&self, wm_class: &str) -> FlameResult<&DesktopApplication> {
+        let needle = normalize_identity(wm_class);
+        self.applications
+            .iter()
+            .find(|app| normalize_identity(&app.startup_wm_class) == needle)
+            .ok_or_else(|| FlameError::new(ErrorCode::NotFound, "window class not found"))
+    }
+
+    #[must_use]
+    pub fn search(&self, query: &str) -> Vec<DesktopApplication> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return self.applications.clone();
+        }
+        self.applications
+            .iter()
+            .filter(|app| {
+                app.id.as_str().to_lowercase().contains(&needle)
+                    || app.name.to_lowercase().contains(&needle)
+                    || app.generic_name.to_lowercase().contains(&needle)
+                    || app.comment.to_lowercase().contains(&needle)
+                    || app
+                        .keywords
+                        .iter()
+                        .any(|keyword| keyword.to_lowercase().contains(&needle))
+                    || app
+                        .categories
+                        .iter()
+                        .any(|category| category.to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn launch<P: ApplicationPort>(
+        &self,
+        port: &mut P,
+        id: &DesktopAppId,
+        options: &ApplicationLaunchOptions,
+    ) -> FlameResult<()> {
+        self.find_by_id(id)?;
+        port.launch(id, options)
+    }
+
+    pub fn launch_uri<P: ApplicationPort>(&self, port: &mut P, uri: &str) -> FlameResult<()> {
+        if uri.trim().is_empty() || uri.chars().any(char::is_control) {
+            return Err(FlameError::new(ErrorCode::InvalidArgument, "invalid URI"));
+        }
+        port.launch_uri(uri)
+    }
+}

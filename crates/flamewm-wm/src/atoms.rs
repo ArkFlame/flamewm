@@ -1,0 +1,131 @@
+use std::error::Error;
+
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{Atom, ConnectionExt as _};
+
+pub type AnyError = Box<dyn Error + Send + Sync + 'static>;
+
+#[derive(Debug, Clone)]
+pub struct Atoms {
+    pub utf8_string: Atom,
+    pub wm_protocols: Atom,
+    pub wm_delete_window: Atom,
+    pub wm_take_focus: Atom,
+    pub wm_state: Atom,
+    pub net_supported: Atom,
+    pub net_supporting_wm_check: Atom,
+    pub net_wm_name: Atom,
+    pub net_client_list: Atom,
+    pub net_client_list_stacking: Atom,
+    pub net_active_window: Atom,
+    pub net_number_of_desktops: Atom,
+    pub net_current_desktop: Atom,
+    pub net_desktop_names: Atom,
+    pub net_desktop_geometry: Atom,
+    pub net_desktop_viewport: Atom,
+    pub net_workarea: Atom,
+    pub net_showing_desktop: Atom,
+    pub net_wm_desktop: Atom,
+    pub net_wm_state: Atom,
+    pub net_wm_state_hidden: Atom,
+    pub net_wm_state_maximized_vert: Atom,
+    pub net_wm_state_maximized_horz: Atom,
+    pub net_wm_state_fullscreen: Atom,
+    pub net_close_window: Atom,
+    pub net_frame_extents: Atom,
+    pub net_wm_window_type: Atom,
+    pub net_wm_window_type_desktop: Atom,
+    pub net_wm_window_type_dock: Atom,
+    pub net_wm_window_type_utility: Atom,
+    pub net_wm_window_type_popup_menu: Atom,
+    pub net_wm_window_type_dropdown_menu: Atom,
+    pub net_wm_window_type_tooltip: Atom,
+    pub net_wm_window_type_notification: Atom,
+    pub net_wm_window_type_normal: Atom,
+    pub net_wm_strut: Atom,
+    pub net_wm_strut_partial: Atom,
+}
+
+impl Atoms {
+    pub fn new<C: Connection>(conn: &C) -> Result<Self, AnyError> {
+        fn atom<C: Connection>(conn: &C, name: &str) -> Result<Atom, AnyError> {
+            Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+        }
+        Ok(Self {
+            utf8_string: atom(conn, "UTF8_STRING")?,
+            wm_protocols: atom(conn, "WM_PROTOCOLS")?,
+            wm_delete_window: atom(conn, "WM_DELETE_WINDOW")?,
+            wm_take_focus: atom(conn, "WM_TAKE_FOCUS")?,
+            wm_state: atom(conn, "WM_STATE")?,
+            net_supported: atom(conn, "_NET_SUPPORTED")?,
+            net_supporting_wm_check: atom(conn, "_NET_SUPPORTING_WM_CHECK")?,
+            net_wm_name: atom(conn, "_NET_WM_NAME")?,
+            net_client_list: atom(conn, "_NET_CLIENT_LIST")?,
+            net_client_list_stacking: atom(conn, "_NET_CLIENT_LIST_STACKING")?,
+            net_active_window: atom(conn, "_NET_ACTIVE_WINDOW")?,
+            net_number_of_desktops: atom(conn, "_NET_NUMBER_OF_DESKTOPS")?,
+            net_current_desktop: atom(conn, "_NET_CURRENT_DESKTOP")?,
+            net_desktop_names: atom(conn, "_NET_DESKTOP_NAMES")?,
+            net_desktop_geometry: atom(conn, "_NET_DESKTOP_GEOMETRY")?,
+            net_desktop_viewport: atom(conn, "_NET_DESKTOP_VIEWPORT")?,
+            net_workarea: atom(conn, "_NET_WORKAREA")?,
+            net_showing_desktop: atom(conn, "_NET_SHOWING_DESKTOP")?,
+            net_wm_desktop: atom(conn, "_NET_WM_DESKTOP")?,
+            net_wm_state: atom(conn, "_NET_WM_STATE")?,
+            net_wm_state_hidden: atom(conn, "_NET_WM_STATE_HIDDEN")?,
+            net_wm_state_maximized_vert: atom(conn, "_NET_WM_STATE_MAXIMIZED_VERT")?,
+            net_wm_state_maximized_horz: atom(conn, "_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            net_wm_state_fullscreen: atom(conn, "_NET_WM_STATE_FULLSCREEN")?,
+            net_close_window: atom(conn, "_NET_CLOSE_WINDOW")?,
+            net_frame_extents: atom(conn, "_NET_FRAME_EXTENTS")?,
+            net_wm_window_type: atom(conn, "_NET_WM_WINDOW_TYPE")?,
+            net_wm_window_type_desktop: atom(conn, "_NET_WM_WINDOW_TYPE_DESKTOP")?,
+            net_wm_window_type_dock: atom(conn, "_NET_WM_WINDOW_TYPE_DOCK")?,
+            net_wm_window_type_utility: atom(conn, "_NET_WM_WINDOW_TYPE_UTILITY")?,
+            net_wm_window_type_popup_menu: atom(conn, "_NET_WM_WINDOW_TYPE_POPUP_MENU")?,
+            net_wm_window_type_dropdown_menu: atom(conn, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU")?,
+            net_wm_window_type_tooltip: atom(conn, "_NET_WM_WINDOW_TYPE_TOOLTIP")?,
+            net_wm_window_type_notification: atom(conn, "_NET_WM_WINDOW_TYPE_NOTIFICATION")?,
+            net_wm_window_type_normal: atom(conn, "_NET_WM_WINDOW_TYPE_NORMAL")?,
+            net_wm_strut: atom(conn, "_NET_WM_STRUT")?,
+            net_wm_strut_partial: atom(conn, "_NET_WM_STRUT_PARTIAL")?,
+        })
+    }
+
+    pub fn supported(&self) -> Vec<Atom> {
+        vec![
+            self.net_supported,
+            self.net_supporting_wm_check,
+            self.net_wm_name,
+            self.net_client_list,
+            self.net_client_list_stacking,
+            self.net_active_window,
+            self.net_number_of_desktops,
+            self.net_current_desktop,
+            self.net_desktop_names,
+            self.net_desktop_geometry,
+            self.net_desktop_viewport,
+            self.net_workarea,
+            self.net_showing_desktop,
+            self.net_wm_desktop,
+            self.net_wm_state,
+            self.net_wm_state_hidden,
+            self.net_wm_state_maximized_vert,
+            self.net_wm_state_maximized_horz,
+            self.net_wm_state_fullscreen,
+            self.net_close_window,
+            self.net_frame_extents,
+            self.net_wm_window_type,
+            self.net_wm_window_type_desktop,
+            self.net_wm_window_type_dock,
+            self.net_wm_window_type_utility,
+            self.net_wm_window_type_popup_menu,
+            self.net_wm_window_type_dropdown_menu,
+            self.net_wm_window_type_tooltip,
+            self.net_wm_window_type_notification,
+            self.net_wm_window_type_normal,
+            self.net_wm_strut,
+            self.net_wm_strut_partial,
+        ]
+    }
+}

@@ -1,0 +1,14 @@
+# Runtime package layout: source path -> installed path
+.target/release/flamewm                  usr/bin/flamewm
+.target/release/flamewm-settings         usr/bin/flamewm-settings
+.target/release/flamewm-render-x11       usr/bin/flamewm-render-x11
+.target/release/flamewm-render-compile   usr/bin/flamewm-render-compile
+.target/release/flamewm-render-inspect   usr/bin/flamewm-render-inspect
+FLAMEWM_VERSION                          usr/share/flamewm/VERSION
+assets/                                  usr/share/flamewm/assets/
+packaging/flamewm.desktop                usr/share/applications/flamewm.desktop
+LICENSE                                  usr/share/doc/flamewm/LICENSE
+README.md                                usr/share/doc/flamewm/README.md
+docs/INSTALL.md                          usr/share/doc/flamewm/INSTALL.md
+docs/PACKAGING.md                        usr/share/doc/flamewm/PACKAGING.md
+packaging/debian/copyright               usr/share/doc/flamewm/copyright

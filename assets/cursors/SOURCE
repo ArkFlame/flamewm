@@ -1,0 +1,10 @@
+KDE Breeze classic Xcursor theme
+
+Upstream: https://invent.kde.org/plasma/breeze.git
+Release: v6.6.5
+Commit: bfe46a06e92a196fe3051706051d5c5e2d497e92
+Path: cursors/Breeze/Breeze
+
+The prebuilt Xcursor files in this directory are copied byte-for-byte from
+the upstream commit above. The upstream repository and commit are the source
+of record; do not replace these files with the Windows Breeze cursor pack.

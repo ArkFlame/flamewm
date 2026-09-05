@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)"
+cd "$ROOT"
+fail=0
+need(){
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "MISSING command: $1${2:+ ($2)}"
+    fail=1
+  else
+    echo "OK command: $1 -> $(command -v "$1")"
+  fi
+}
+need rustc rustup
+need cargo rustup
+need pkg-config pkg-config
+need python3 python3
+need xdpyinfo x11-utils
+need Xvfb xvfb
+if command -v Xephyr >/dev/null 2>&1; then
+  echo "OK command: Xephyr -> $(command -v Xephyr)"
+else
+  echo "MISSING command: Xephyr (xserver-xephyr; required for ./xephyr)"
+fi
+for pc in x11 dbus-1; do
+  if pkg-config --exists "$pc" 2>/dev/null; then
+    echo "OK pkg-config: $pc $(pkg-config --modversion "$pc")"
+  else
+    echo "MISSING pkg-config module: $pc"
+    fail=1
+  fi
+done
+runtime_lib(){
+  local shown="$1" lookup="$2"
+  if python3 - "$lookup" <<'PY'
+import ctypes.util
+import sys
+raise SystemExit(0 if ctypes.util.find_library(sys.argv[1]) else 1)
+PY
+  then
+    echo "OK runtime: $shown"
+  else
+    echo "MISSING runtime: $shown"
+    fail=1
+  fi
+}
+runtime_lib libXft.so.2 Xft
+runtime_lib libfontconfig.so.1 fontconfig
+if pkg-config --exists xrender 2>/dev/null; then
+  echo "OK pkg-config: xrender $(pkg-config --modversion xrender)"
+else
+  echo "MISSING pkg-config module: xrender"
+  fail=1
+fi
+runtime_lib libXrender.so.1 Xrender
+python3 tools/static_audit.py
+if [[ $fail -ne 0 ]]; then exit 1; fi
+echo "OK FlameWM Render 0.0.4 doctor"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)"
+cd "$ROOT"
+python3 tools/static_audit.py
+python3 tools/verify_rwr_promotion.py
+cargo metadata --format-version 1 --no-deps >/dev/null
+cargo check --workspace --all-targets
+cargo test --workspace
+cargo build --release --workspace
+mkdir -p .target/flamewm
+cargo run --quiet --release -p flamewm-render-compiler --bin flamewm-render-compile -- \
+  -o .target/flamewm/flamewm-shell.rwr ui/index.html
+cargo run --quiet --release -p flamewm-render-compiler --bin flamewm-render-inspect -- \
+  .target/flamewm/flamewm-shell.rwr | grep -E '^(format=RWRB/2|assets=|nodes=|variables=)' >/dev/null
+if find . -path './.target' -prune -o -path './.vendor' -prune -o -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.woff' -o -iname '*.woff2' \) -print | grep -q .; then
+  echo 'ERROR: active package contains font binaries' >&2
+  exit 1
+fi
+echo 'OK FlameWM Render 0.0.4 independent workspace + native WM + compiled shell'

@@ -1,0 +1,9 @@
+Package: flamewm
+Version: @VERSION@
+Architecture: any
+Section: x11
+Priority: optional
+Maintainer: ArkFlame Studios <maintainers@arkflame.dev>
+Depends: libx11-6, libxft2, libfontconfig1
+Description: FlameWM X11 window manager
+ FlameWM is a Rust X11 window manager with native WebRender-compatible UI.

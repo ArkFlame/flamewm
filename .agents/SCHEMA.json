@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkflame.local/agent-coordination.schema.json",
+  "title": "Agent Coordination Packet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job", "kind", "state", "paths", "summary", "verification"],
+  "properties": {
+    "job": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["request", "handoff", "completion"]
+    },
+    "state": {
+      "type": "string",
+      "enum": ["PENDING", "IN_PROGRESS", "DONE", "UNVERIFIED", "BLOCKED"]
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "result"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "result": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "blocker": {
+      "type": "string",
+      "minLength": 1
+    },
+    "next": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["state"],
+        "properties": { "state": { "const": "BLOCKED" } }
+      },
+      "then": { "required": ["blocker", "next"] }
+    }
+  ]
+}

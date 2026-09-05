@@ -1,0 +1,151 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
+use flamewm_api::{ErrorCode, FlameError, FlameResult, OutputId};
+
+use crate::layout::Cell;
+use crate::model::StoredPosition;
+
+pub struct LayoutStore;
+
+impl LayoutStore {
+    #[must_use]
+    pub fn serialize(positions: &BTreeMap<PathBuf, StoredPosition>) -> String {
+        positions
+            .iter()
+            .map(|(path, position)| {
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    hex(path.as_os_str().as_bytes()),
+                    hex(position.output.as_str().as_bytes()),
+                    position.cell.column,
+                    position.cell.row
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    pub fn parse(text: &str) -> FlameResult<BTreeMap<PathBuf, StoredPosition>> {
+        let mut positions = BTreeMap::new();
+        for (line_number, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 4 {
+                return Err(FlameError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("bad desktop layout line {}", line_number + 1),
+                ));
+            }
+            let path = PathBuf::from(OsString::from_vec(unhex(fields[0])?));
+            let output = String::from_utf8(unhex(fields[1])?).map_err(|_| {
+                FlameError::new(ErrorCode::InvalidArgument, "desktop output id is not UTF-8")
+            })?;
+            let column = fields[2]
+                .parse::<i32>()
+                .map_err(|_| FlameError::invalid("bad desktop layout column"))?;
+            let row = fields[3]
+                .parse::<i32>()
+                .map_err(|_| FlameError::invalid("bad desktop layout row"))?;
+            if output.is_empty() || column < 0 || row < 0 {
+                return Err(FlameError::invalid("desktop layout position is invalid"));
+            }
+            positions.insert(
+                path,
+                StoredPosition {
+                    output: OutputId::new(output),
+                    cell: Cell::new(column, row),
+                },
+            );
+        }
+        Ok(positions)
+    }
+
+    pub fn persist(path: &Path, positions: &BTreeMap<PathBuf, StoredPosition>) -> FlameResult<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| FlameError::invalid("desktop layout path has no parent"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error("create desktop layout directory", error))?;
+        let temp = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|error| io_error("open desktop layout temp file", error))?;
+        file.write_all(Self::serialize(positions).as_bytes())
+            .map_err(|error| io_error("write desktop layout", error))?;
+        file.sync_all()
+            .map_err(|error| io_error("sync desktop layout", error))?;
+        fs::rename(&temp, path).map_err(|error| io_error("commit desktop layout", error))?;
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    }
+}
+
+#[must_use]
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn unhex(value: &str) -> FlameResult<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return Err(FlameError::invalid("hex field has odd length"));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = nibble(pair[0])?;
+            let low = nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn nibble(value: u8) -> FlameResult<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(FlameError::invalid("invalid hex field")),
+    }
+}
+
+fn io_error(operation: &str, error: std::io::Error) -> FlameError {
+    FlameError::new(ErrorCode::IoFailure, format!("{operation}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_round_trips_path_output_and_cell() {
+        let positions = BTreeMap::from([(
+            PathBuf::from("/home/juan/Desktop/My File"),
+            StoredPosition {
+                output: OutputId::new("eDP-1"),
+                cell: Cell::new(3, 4),
+            },
+        )]);
+        let parsed = LayoutStore::parse(&LayoutStore::serialize(&positions)).expect("round trip");
+        assert_eq!(parsed, positions);
+    }
+}

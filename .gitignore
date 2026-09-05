@@ -1,0 +1,17 @@
+/target/
+/.target/
+/.agents/runtime/
+*.log
+*.core
+
+# Local and generated development state
+.env
+.env.*
+*.swp
+*~
+
+# Editor and operating-system metadata
+.DS_Store
+.idea/
+.vscode/
+/tools/__pycache__/

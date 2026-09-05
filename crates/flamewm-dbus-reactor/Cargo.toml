@@ -1,0 +1,15 @@
+[package]
+name = "flamewm-dbus-reactor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dbus = { version = "=0.9.12", default-features = false }
+flamewm-api = { path = "../flamewm-api" }
+flamewm-integrations-core = { path = "../flamewm-integrations-core" }
+
+[lints]
+workspace = true

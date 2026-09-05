@@ -1,0 +1,18 @@
+[package]
+name = "flamewm-control-dbus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dbus = { version = "=0.9.12", default-features = false }
+flamewm-api = { path = "../flamewm-api" }
+flamewm-control-core = { path = "../flamewm-control-core" }
+flamewm-control-wire = { path = "../flamewm-control-wire" }
+flamewm-dbus-reactor = { path = "../flamewm-dbus-reactor" }
+flamewm-platform = { path = "../flamewm-platform" }
+
+[lints]
+workspace = true

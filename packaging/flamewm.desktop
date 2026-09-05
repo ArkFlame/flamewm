@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FlameWM
+Comment=FlameWM X11 window manager
+TryExec=flamewm
+Exec=flamewm
+Icon=flamewm
+Categories=System;WindowManager;
+NoDisplay=true
