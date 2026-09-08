@@ -32,6 +32,22 @@ pub type Bool = c_int;
 pub type Status = c_int;
 
 #[repr(C)]
+pub struct XVisualInfo {
+    pub visual: *mut Visual,
+    pub visualid: c_ulong,
+    pub screen: c_int,
+    pub depth: c_int,
+    pub class: c_int,
+    pub red_mask: c_ulong,
+    pub green_mask: c_ulong,
+    pub blue_mask: c_ulong,
+    pub colormap_size: c_int,
+    pub bits_per_rgb: c_int,
+}
+
+pub const TRUE_COLOR_CLASS: c_int = 4;
+
+#[repr(C)]
 pub struct XFontStructHead {
     pub ext_data: *mut c_void,
     pub fid: Font,
@@ -59,6 +75,25 @@ pub struct XImageHead {
 #[repr(C)]
 pub struct XImage {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct XSetWindowAttributes {
+    pub background_pixmap: Pixmap,
+    pub background_pixel: c_ulong,
+    pub border_pixmap: Pixmap,
+    pub border_pixel: c_ulong,
+    pub bit_gravity: c_int,
+    pub win_gravity: c_int,
+    pub backing_store: c_int,
+    pub backing_planes: c_ulong,
+    pub backing_pixel: c_ulong,
+    pub save_under: Bool,
+    pub event_mask: c_long,
+    pub do_not_propagate_mask: c_long,
+    pub override_redirect: Bool,
+    pub colormap: Colormap,
+    pub cursor: Cursor,
 }
 
 #[repr(C)]
@@ -197,6 +232,27 @@ pub struct XClientMessageEvent {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct XMapEvent {
+    pub type_: c_int,
+    pub serial: c_ulong,
+    pub send_event: Bool,
+    pub display: *mut Display,
+    pub event: Window,
+    pub window: Window,
+    pub override_redirect: Bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct XRectangle {
+    pub x: c_short,
+    pub y: c_short,
+    pub width: c_ushort,
+    pub height: c_ushort,
+}
+
+#[repr(C)]
 pub union XEvent {
     pub type_: c_int,
     pub xany: XAnyEvent,
@@ -206,6 +262,7 @@ pub union XEvent {
     pub xkey: XKeyEvent,
     pub xbutton: XButtonEvent,
     pub xclient: XClientMessageEvent,
+    pub xmap: XMapEvent,
     pub pad: [c_long; 24],
 }
 
@@ -225,6 +282,7 @@ pub const BUTTON_RELEASE: c_int = 5;
 pub const MOTION_NOTIFY: c_int = 6;
 pub const LEAVE_NOTIFY: c_int = 8;
 pub const EXPOSE: c_int = 12;
+pub const MAP_NOTIFY: c_int = 19;
 pub const CONFIGURE_NOTIFY: c_int = 22;
 pub const CLIENT_MESSAGE: c_int = 33;
 
@@ -236,6 +294,9 @@ pub const ZPIXMAP: c_int = 2;
 pub const QUEUED_AFTER_READING: c_int = 1;
 pub const PROP_MODE_REPLACE: c_int = 0;
 pub const XA_ATOM: Atom = 4;
+pub const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 9;
+pub const GRAB_MODE_ASYNC: c_int = 1;
+pub const CURRENT_TIME: Time = 0;
 
 pub const SHIFT_MASK: c_uint = 1 << 0;
 pub const CONTROL_MASK: c_uint = 1 << 2;
@@ -275,6 +336,14 @@ unsafe extern "C" {
     pub fn XBlackPixel(display: *mut Display, screen_number: c_int) -> c_ulong;
     pub fn XWhitePixel(display: *mut Display, screen_number: c_int) -> c_ulong;
     pub fn XDefaultColormap(display: *mut Display, screen_number: c_int) -> Colormap;
+    pub fn XMatchVisualInfo(
+        display: *mut Display,
+        screen: c_int,
+        depth: c_int,
+        class: c_int,
+        vinfo_return: *mut XVisualInfo,
+    ) -> Status;
+    pub fn XFree(data: *mut c_void) -> c_int;
     pub fn XCreateSimpleWindow(
         display: *mut Display,
         parent: Window,
@@ -286,6 +355,12 @@ unsafe extern "C" {
         border: c_ulong,
         background: c_ulong,
     ) -> Window;
+    pub fn XChangeWindowAttributes(
+        display: *mut Display,
+        window: Window,
+        valuemask: c_ulong,
+        attributes: *mut XSetWindowAttributes,
+    ) -> c_int;
     pub fn XDestroyWindow(display: *mut Display, window: Window) -> c_int;
     pub fn XCreatePixmap(
         display: *mut Display,
@@ -309,6 +384,30 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn XSelectInput(display: *mut Display, window: Window, event_mask: c_long) -> c_int;
     pub fn XMapWindow(display: *mut Display, window: Window) -> c_int;
+    pub fn XUnmapWindow(display: *mut Display, window: Window) -> c_int;
+    pub fn XRaiseWindow(display: *mut Display, window: Window) -> c_int;
+    pub fn XMoveResizeWindow(
+        display: *mut Display,
+        window: Window,
+        x: c_int,
+        y: c_int,
+        width: c_uint,
+        height: c_uint,
+    ) -> c_int;
+    pub fn XGrabPointer(
+        display: *mut Display,
+        grab_window: Window,
+        owner_events: Bool,
+        event_mask: c_uint,
+        pointer_mode: c_int,
+        keyboard_mode: c_int,
+        confine_to: Window,
+        cursor: Cursor,
+        time: Time,
+    ) -> c_int;
+    pub fn XUngrabPointer(display: *mut Display, time: Time) -> c_int;
+    pub fn XDisplayWidth(display: *mut Display, screen_number: c_int) -> c_int;
+    pub fn XDisplayHeight(display: *mut Display, screen_number: c_int) -> c_int;
     pub fn XStoreName(display: *mut Display, window: Window, window_name: *const c_char) -> c_int;
     pub fn XCreateGC(
         display: *mut Display,
@@ -422,6 +521,8 @@ unsafe extern "C" {
     ) -> Status;
     pub fn XLookupKeysym(key_event: *mut XKeyEvent, index: c_int) -> c_ulong;
     pub fn XNextEvent(display: *mut Display, event_return: *mut XEvent) -> c_int;
+    pub fn XConnectionNumber(display: *mut Display) -> c_int;
+    pub fn XPutBackEvent(display: *mut Display, event: *mut XEvent) -> c_int;
     pub fn XEventsQueued(display: *mut Display, mode: c_int) -> c_int;
     pub fn XPeekEvent(display: *mut Display, event_return: *mut XEvent) -> c_int;
     pub fn XFlush(display: *mut Display) -> c_int;
@@ -449,6 +550,26 @@ unsafe extern "C" {
     pub fn XCreateFontCursor(display: *mut Display, shape: c_uint) -> Cursor;
     pub fn XDefineCursor(display: *mut Display, window: Window, cursor: Cursor) -> c_int;
     pub fn XFreeCursor(display: *mut Display, cursor: Cursor) -> c_int;
+    pub fn XResizeWindow(
+        display: *mut Display,
+        window: Window,
+        width: c_uint,
+        height: c_uint,
+    ) -> c_int;
+    pub fn XSetClipRectangles(
+        display: *mut Display,
+        gc: GC,
+        clip_x_origin: c_int,
+        clip_y_origin: c_int,
+        rectangles: *const XRectangle,
+        n: c_int,
+        ordering: c_int,
+    ) -> c_int;
+    pub fn XTextWidth(
+        font_struct: *mut XFontStructHead,
+        string: *const c_char,
+        count: c_int,
+    ) -> c_int;
 }
 
 unsafe extern "C" {

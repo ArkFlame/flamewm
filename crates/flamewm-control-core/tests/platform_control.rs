@@ -25,6 +25,8 @@ struct FakeDesktop {
     staged_shortcuts: Option<BTreeMap<String, KeyBinding>>,
     next_handle: u64,
     previous_mode: Option<ModeId>,
+    window: WindowSnapshot,
+    closed_windows: Vec<WindowRef>,
 }
 
 impl FakeDesktop {
@@ -41,7 +43,7 @@ impl FakeDesktop {
             display: DisplaySnapshot {
                 generation: 1,
                 outputs: vec![OutputSnapshot {
-                    id: output,
+                    id: output.clone(),
                     connector: "eDP-1".to_owned(),
                     edid_identity: "panel".to_owned(),
                     connected: true,
@@ -71,6 +73,20 @@ impl FakeDesktop {
             staged_shortcuts: None,
             next_handle: 1,
             previous_mode: None,
+            window: WindowSnapshot {
+                reference: WindowRef::new(42, 3),
+                title: "Fake window".to_owned(),
+                app_id: DesktopAppId::new("org.example.Fake"),
+                outer_geometry: Rect::new(0, 0, 800, 600),
+                restore_geometry: Rect::new(0, 0, 800, 600),
+                state: flamewm_api::window::WindowState::Normal,
+                sticky: false,
+                focused: false,
+                workspace: flamewm_api::WorkspaceRef::new(0, 1),
+                output: output.clone(),
+                state_generation: 1,
+            },
+            closed_windows: Vec::new(),
         }
     }
 
@@ -82,14 +98,18 @@ impl FakeDesktop {
 }
 
 impl WindowPort for FakeDesktop {
-    fn get(&self, _window: WindowRef) -> FlameResult<WindowSnapshot> {
-        Err(flamewm_api::FlameError::new(
-            flamewm_api::ErrorCode::NotFound,
-            "no windows in fake",
-        ))
+    fn get(&self, window: WindowRef) -> FlameResult<WindowSnapshot> {
+        if window.id == self.window.reference.id {
+            Ok(self.window.clone())
+        } else {
+            Err(flamewm_api::FlameError::new(
+                flamewm_api::ErrorCode::NotFound,
+                "window not found in fake",
+            ))
+        }
     }
     fn snapshot(&self) -> FlameResult<Vec<WindowSnapshot>> {
-        Ok(Vec::new())
+        Ok(vec![self.window.clone()])
     }
     fn activate(&mut self, _window: WindowRef) -> FlameResult<()> {
         Ok(())
@@ -103,7 +123,8 @@ impl WindowPort for FakeDesktop {
     fn restore(&mut self, _window: WindowRef) -> FlameResult<()> {
         Ok(())
     }
-    fn close(&mut self, _window: WindowRef) -> FlameResult<()> {
+    fn close(&mut self, window: WindowRef) -> FlameResult<()> {
+        self.closed_windows.push(window);
         Ok(())
     }
     fn set_outer_geometry(&mut self, _window: WindowRef, _geometry: Rect) -> FlameResult<()> {
@@ -336,6 +357,31 @@ fn control_workspace_insert_uses_revisioned_platform_transaction() {
 }
 
 #[test]
+fn control_close_window_dispatches_canonical_service_and_rejects_stale_reference() {
+    let path = settings_path("close-window");
+    let mut host = PlatformHost::new(FakeDesktop::new(), path);
+    let dispatcher = Dispatcher::new();
+    let window = WindowRef::new(42, 3);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(&mut host, ControlRequest::CloseWindow(window))
+            .expect("close succeeds"),
+        ControlResponse::Unit
+    );
+    assert_eq!(host.engine().closed_windows, vec![window]);
+
+    let error = dispatcher
+        .dispatch(
+            &mut host,
+            ControlRequest::CloseWindow(WindowRef::new(42, 2)),
+        )
+        .expect_err("stale window generation");
+    assert_eq!(error.code, flamewm_api::ErrorCode::StaleRevision);
+    assert_eq!(host.engine().closed_windows, vec![window]);
+}
+
+#[test]
 fn settings_control_transaction_persists_only_after_native_shortcut_commit() {
     let path = settings_path("settings");
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
@@ -368,10 +414,103 @@ fn settings_control_transaction_persists_only_after_native_shortcut_commit() {
 }
 
 #[test]
+fn control_system_returns_host_snapshot_without_engine_round_trip() {
+    let path = settings_path("system");
+    let mut host = PlatformHost::new(FakeDesktop::new(), path);
+    host.start().expect("host starts");
+    host.system_mut().update_audio(
+        flamewm_api::system::AudioSnapshot {
+            availability: flamewm_api::system::ServiceAvailability::Available,
+            generation: 1,
+            server_generation: 1,
+            sink_name: "alsa_output".to_owned(),
+            volume_percent: 72,
+            muted: false,
+            ..flamewm_api::system::AudioSnapshot::default()
+        }
+        .with_items(
+            vec![flamewm_api::system::AudioEndpointSnapshot {
+                id: 7,
+                kind: flamewm_api::system::AudioEndpointKind::Sink,
+                name: "alsa_output".to_owned(),
+                description: "Speakers".to_owned(),
+                volume_percent: 72,
+                muted: false,
+                is_default: true,
+            }],
+            vec![flamewm_api::system::AudioStreamSnapshot {
+                id: 9,
+                endpoint_id: 7,
+                name: "Player".to_owned(),
+                volume_percent: 72,
+                muted: false,
+            }],
+        ),
+    );
+    let expected = host.system_snapshot();
+    let dispatcher = Dispatcher::new();
+    let response = dispatcher
+        .dispatch(&mut host, ControlRequest::GetSystem)
+        .expect("system snapshot");
+    assert_eq!(response, ControlResponse::System(expected));
+}
+
+#[test]
+fn system_action_reports_explicit_stale_and_unsupported_errors() {
+    let path = settings_path("system-action");
+    let mut host = PlatformHost::new(FakeDesktop::new(), path);
+    let dispatcher = Dispatcher::new();
+    let stale = dispatcher
+        .dispatch(
+            &mut host,
+            ControlRequest::SystemAction {
+                action: flamewm_api::system::SystemAction::Scan,
+                expected_revision: 1,
+            },
+        )
+        .expect_err("stale revision");
+    assert_eq!(stale.code, flamewm_api::ErrorCode::StaleRevision);
+    let unsupported = dispatcher
+        .dispatch(
+            &mut host,
+            ControlRequest::SystemAction {
+                action: flamewm_api::system::SystemAction::Scan,
+                expected_revision: 0,
+            },
+        )
+        .expect_err("no provider installed");
+    assert_eq!(unsupported.code, flamewm_api::ErrorCode::Unsupported);
+}
+
+#[test]
 fn canonical_dbus_protocol_keeps_v8_identity_based_reorder() {
     const XML: &str = include_str!("../protocol/com.arkflame.FlameWM1.xml");
     assert!(XML.contains("<method name=\"Reorder\">"));
     assert!(XML.contains("<arg name=\"entryId\" type=\"s\" direction=\"in\"/>"));
     assert!(XML.contains("<arg name=\"index\" type=\"u\" direction=\"in\"/>"));
     assert!(XML.contains("<arg name=\"expectedRevision\" type=\"t\" direction=\"in\"/>"));
+}
+
+#[test]
+fn canonical_dbus_protocol_matches_system_action_wire_members() {
+    const XML: &str = include_str!("../protocol/com.arkflame.FlameWM1.xml");
+    for member in [
+        "SetWifiEnabled",
+        "ConnectKnown",
+        "ConnectWifi",
+        "SubmitNetworkSecret",
+        "CancelNetworkSecret",
+        "Disconnect",
+        "Scan",
+        "Play",
+        "Pause",
+        "PlayPause",
+        "Next",
+        "Previous",
+        "SetVolume",
+        "SetMute",
+        "SystemChanged",
+    ] {
+        assert!(XML.contains(&format!("name=\"{member}\"")));
+    }
 }

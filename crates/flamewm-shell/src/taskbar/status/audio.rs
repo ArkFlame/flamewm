@@ -1,0 +1,378 @@
+use flamewm_api::system::{
+    AudioMuteAction, AudioSnapshot, AudioTarget, AudioVolumeAction, ServiceAvailability,
+    SystemAction, SystemSnapshot,
+};
+use flamewm_control_core::ControlRequest;
+use flamewm_shell_core::{AudioPopoverModel, AudioView};
+
+use super::super::intent::StatusIntent;
+
+/// Maximum audio rows a popover page can show. The compiled audio template
+/// currently exposes only summary nodes, so paging selects which model rows
+/// are visible to callers; the model itself is never truncated.
+pub const AUDIO_SLOT_COUNT: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioRowKind {
+    Endpoint,
+    Stream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioRowView {
+    pub slot: usize,
+    pub id: String,
+    pub kind: AudioRowKind,
+    pub label: String,
+    pub volume_percent: u8,
+    pub muted: bool,
+    pub selected: bool,
+}
+
+/// Paged audio rows with stable model IDs.
+///
+/// Rows come only from `snapshot.audio.endpoints`/`snapshot.audio.streams`.
+/// No synthetic rows are fabricated; paging selects a stable window and the
+/// full model is preserved. Stable IDs are `endpoint:sink:<id>` /
+/// `endpoint:source:<id>` for endpoints (kind included so a sink and a
+/// source sharing a numeric id can never collide) and `stream:<id>`.
+///
+/// Legacy `endpoint:<id>` rows (no kind segment) resolve sink-first for
+/// backward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioPopoverView {
+    pub popover: AudioPopoverModel,
+    pub active_page: usize,
+    pub page_count: usize,
+    pub visible_rows: Vec<AudioRowView>,
+}
+
+#[must_use]
+pub fn project(snapshot: &SystemSnapshot) -> AudioView {
+    let mut view = flamewm_shell_core::StatusViews::from_snapshot(snapshot).audio;
+    view.visible = snapshot.audio.availability == ServiceAvailability::Available;
+    view
+}
+
+#[must_use]
+pub fn page_count(snapshot: &AudioSnapshot) -> usize {
+    ceil_div(
+        snapshot.endpoints().len() + snapshot.streams().len(),
+        AUDIO_SLOT_COUNT,
+    )
+}
+
+/// Page containing the default endpoint when present, else the first page.
+/// Keeps the selected endpoint visible while paging the full model.
+#[must_use]
+pub fn active_page(snapshot: &AudioSnapshot) -> usize {
+    let position = snapshot
+        .endpoints()
+        .iter()
+        .position(|endpoint| endpoint.is_default);
+    match position {
+        Some(index) => index / AUDIO_SLOT_COUNT,
+        None => 0,
+    }
+}
+
+/// `(slot, row)` pairs for the active page, endpoints first then streams.
+#[must_use]
+pub fn paged_rows(snapshot: &AudioSnapshot) -> Vec<(usize, RowSource)> {
+    paged_rows_for_page(snapshot, active_page(snapshot))
+}
+
+#[must_use]
+pub fn paged_rows_for_page(snapshot: &AudioSnapshot, page: usize) -> Vec<(usize, RowSource)> {
+    let rows: Vec<RowSource> = snapshot
+        .endpoints()
+        .iter()
+        .map(RowSource::from_endpoint)
+        .chain(snapshot.streams().iter().map(RowSource::from_stream))
+        .collect();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let pages = ceil_div(rows.len(), AUDIO_SLOT_COUNT);
+    let clamped = page.min(pages.saturating_sub(1));
+    rows.into_iter()
+        .skip(clamped * AUDIO_SLOT_COUNT)
+        .take(AUDIO_SLOT_COUNT)
+        .enumerate()
+        .map(|(slot, row)| (slot, row))
+        .collect()
+}
+
+/// Stable row identity for audio slot `slot` on the active page.
+#[must_use]
+pub fn slot_id(snapshot: &AudioSnapshot, slot: usize) -> Option<String> {
+    paged_rows(snapshot)
+        .into_iter()
+        .find(|(page_slot, _)| *page_slot == slot)
+        .map(|(_, row)| row.stable_id())
+}
+
+/// Stable slot index for a row identity on the active page.
+#[must_use]
+pub fn slot_for_row(snapshot: &AudioSnapshot, id: &str) -> Option<usize> {
+    paged_rows(snapshot)
+        .into_iter()
+        .find(|(_, row)| row.stable_id() == id)
+        .map(|(slot, _)| slot)
+}
+
+#[must_use]
+pub fn popover(snapshot: &SystemSnapshot) -> Option<AudioPopoverModel> {
+    if snapshot.audio.availability != ServiceAvailability::Available {
+        return None;
+    }
+    flamewm_shell_core::StatusPopovers::from_snapshot(snapshot).audio
+}
+
+#[must_use]
+pub fn popover_view(snapshot: &SystemSnapshot) -> Option<AudioPopoverView> {
+    let popover = popover(snapshot)?;
+    let count = page_count(&snapshot.audio);
+    let page = active_page(&snapshot.audio).min(count.saturating_sub(1));
+    let visible_rows = paged_rows_for_page(&snapshot.audio, page)
+        .into_iter()
+        .map(|(slot, row)| row.into_view(slot))
+        .collect();
+    Some(AudioPopoverView {
+        popover,
+        active_page: page,
+        page_count: count,
+        visible_rows,
+    })
+}
+
+#[must_use]
+pub fn default_endpoint_row(snapshot: &AudioSnapshot) -> Option<RowSource> {
+    snapshot
+        .endpoints()
+        .iter()
+        .find(|endpoint| endpoint.is_default)
+        .map(RowSource::from_endpoint)
+}
+
+/// Resolve a stable endpoint/stream row id into one revision-fenced action.
+#[must_use]
+pub fn system_action_for_row(
+    snapshot: &SystemSnapshot,
+    row_id: &str,
+    percent: Option<u8>,
+    muted: Option<bool>,
+) -> Option<ControlRequest> {
+    if snapshot.audio.availability != ServiceAvailability::Available {
+        return None;
+    }
+    let target = if let Some(rest) = row_id.strip_prefix("endpoint:") {
+        let (kind, id): (flamewm_api::system::AudioEndpointKind, u32) =
+            if let Some((kind_name, id_text)) = rest.split_once(':') {
+                let id = id_text.parse::<u32>().ok()?;
+                match kind_name {
+                    "sink" => (flamewm_api::system::AudioEndpointKind::Sink, id),
+                    "source" => (flamewm_api::system::AudioEndpointKind::Source, id),
+                    _ => return None,
+                }
+            } else {
+                // Legacy `endpoint:<id>`: resolve through the endpoint that
+                // owns the numeric id, so the result always matches row
+                // identity instead of first-match order.
+                let id = rest.parse::<u32>().ok()?;
+                let endpoint = snapshot
+                    .audio
+                    .endpoints()
+                    .iter()
+                    .find(|endpoint| endpoint.id == id)?;
+                (endpoint.kind, id)
+            };
+        snapshot
+            .audio
+            .endpoints()
+            .iter()
+            .find(|endpoint| endpoint.id == id && endpoint.kind == kind)?;
+        AudioTarget::Endpoint { id, kind }
+    } else if let Some(id) = row_id.strip_prefix("stream:") {
+        let id = id.parse::<u32>().ok()?;
+        snapshot
+            .audio
+            .streams()
+            .iter()
+            .find(|stream| stream.id == id)?;
+        AudioTarget::Stream { id }
+    } else {
+        return None;
+    };
+    let action = match (percent, muted) {
+        (Some(percent), None) if percent <= 150 => SystemAction::SetVolume(AudioVolumeAction {
+            target,
+            percent,
+            generation: snapshot.audio.generation,
+            server_generation: snapshot.audio.server_generation,
+        }),
+        (None, Some(muted)) => SystemAction::SetMute(AudioMuteAction {
+            target,
+            muted,
+            generation: snapshot.audio.generation,
+            server_generation: snapshot.audio.server_generation,
+        }),
+        _ => return None,
+    };
+    Some(ControlRequest::SystemAction {
+        action,
+        expected_revision: snapshot.revision,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowSource {
+    pub kind: AudioRowKind,
+    pub id: String,
+    pub label: String,
+    pub volume_percent: u8,
+    pub muted: bool,
+    pub selected: bool,
+}
+
+impl RowSource {
+    fn endpoint_kind_name(kind: flamewm_api::system::AudioEndpointKind) -> &'static str {
+        match kind {
+            flamewm_api::system::AudioEndpointKind::Sink => "sink",
+            flamewm_api::system::AudioEndpointKind::Source => "source",
+        }
+    }
+
+    #[must_use]
+    pub fn from_endpoint(endpoint: &flamewm_api::system::AudioEndpointSnapshot) -> Self {
+        let label = if endpoint.description.is_empty() {
+            endpoint.name.clone()
+        } else {
+            endpoint.description.clone()
+        };
+        Self {
+            kind: AudioRowKind::Endpoint,
+            id: format!(
+                "endpoint:{}:{}",
+                Self::endpoint_kind_name(endpoint.kind),
+                endpoint.id
+            ),
+            label,
+            volume_percent: endpoint.volume_percent,
+            muted: endpoint.muted,
+            selected: endpoint.is_default,
+        }
+    }
+
+    #[must_use]
+    pub fn from_stream(stream: &flamewm_api::system::AudioStreamSnapshot) -> Self {
+        Self {
+            kind: AudioRowKind::Stream,
+            id: format!("stream:{}", stream.id),
+            label: if stream.name.is_empty() {
+                format!("Stream {}", stream.id)
+            } else {
+                stream.name.clone()
+            },
+            volume_percent: stream.volume_percent,
+            muted: stream.muted,
+            selected: false,
+        }
+    }
+
+    #[must_use]
+    pub fn stable_id(&self) -> String {
+        self.id.clone()
+    }
+
+    #[must_use]
+    pub fn into_view(self, slot: usize) -> AudioRowView {
+        AudioRowView {
+            slot,
+            id: self.id,
+            kind: self.kind,
+            label: self.label,
+            volume_percent: self.volume_percent,
+            muted: self.muted,
+            selected: self.selected,
+        }
+    }
+}
+
+#[must_use]
+pub fn intent(snapshot: &SystemSnapshot) -> Option<StatusIntent> {
+    (snapshot.audio.availability == ServiceAvailability::Available).then_some(StatusIntent::Audio)
+}
+
+fn ceil_div(total: usize, per_page: usize) -> usize {
+    if total == 0 {
+        1
+    } else {
+        (total + per_page - 1) / per_page
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flamewm_api::system::{AudioEndpointKind, AudioEndpointSnapshot, AudioStreamSnapshot};
+
+    #[test]
+    fn endpoint_row_maps_to_revision_fenced_volume_action() {
+        let mut snapshot = SystemSnapshot::default();
+        snapshot.revision = 9;
+        snapshot.audio.availability = ServiceAvailability::Available;
+        snapshot.audio.generation = 3;
+        snapshot.audio.server_generation = 4;
+        snapshot.audio.endpoints.push(AudioEndpointSnapshot {
+            id: 7,
+            kind: AudioEndpointKind::Sink,
+            name: "sink".to_owned(),
+            description: String::new(),
+            volume_percent: 50,
+            muted: false,
+            is_default: true,
+        });
+        assert_eq!(
+            system_action_for_row(&snapshot, "endpoint:sink:7", Some(60), None),
+            Some(ControlRequest::SystemAction {
+                action: SystemAction::SetVolume(AudioVolumeAction {
+                    target: AudioTarget::Endpoint {
+                        id: 7,
+                        kind: AudioEndpointKind::Sink
+                    },
+                    percent: 60,
+                    generation: 3,
+                    server_generation: 4
+                }),
+                expected_revision: 9
+            })
+        );
+    }
+
+    #[test]
+    fn active_page_keeps_default_endpoint_and_stream_rows_reachable() {
+        let mut snapshot = AudioSnapshot::default();
+        for id in 1..=4 {
+            snapshot.endpoints.push(AudioEndpointSnapshot {
+                id,
+                kind: AudioEndpointKind::Sink,
+                name: format!("sink-{id}"),
+                description: String::new(),
+                volume_percent: 50,
+                muted: false,
+                is_default: id == 4,
+            });
+        }
+        snapshot.streams.push(AudioStreamSnapshot {
+            id: 9,
+            endpoint_id: 4,
+            name: "app".to_owned(),
+            volume_percent: 50,
+            muted: false,
+        });
+        assert_eq!(active_page(&snapshot), 1);
+        assert_eq!(slot_id(&snapshot, 0), Some("endpoint:sink:4".to_owned()));
+        assert_eq!(slot_id(&snapshot, 1), Some("stream:9".to_owned()));
+    }
+}

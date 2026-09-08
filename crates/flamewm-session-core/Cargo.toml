@@ -9,5 +9,5 @@ repository.workspace = true
 [dependencies]
 flamewm-api = { path = "../flamewm-api" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"

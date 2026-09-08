@@ -1,15 +1,13 @@
 #![allow(non_camel_case_types)]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::mem;
-use std::os::raw::{c_char, c_int, c_ulong, c_void};
+use std::os::raw::{c_int, c_ulong, c_void};
 
 use flamewm_render_core::{Color, Rect};
 
+use crate::ffi::dynamic_library::DynamicLibrary;
 use crate::xlib::{Display, Drawable, Visual};
 
-const RTLD_NOW: c_int = 2;
 const PICT_OP_OVER: c_int = 3;
 
 type Picture = c_ulong;
@@ -29,6 +27,7 @@ struct XRenderColor {
 }
 
 type FindVisualFormatFn = unsafe extern "C" fn(*mut Display, *mut Visual) -> *mut XRenderPictFormat;
+type FindStandardFormatFn = unsafe extern "C" fn(*mut Display, c_int) -> *mut XRenderPictFormat;
 type CreatePictureFn = unsafe extern "C" fn(
     *mut Display,
     Drawable,
@@ -57,59 +56,11 @@ type FreePictureFn = unsafe extern "C" fn(*mut Display, Picture);
 #[derive(Clone, Copy)]
 struct XRenderApi {
     find_visual_format: FindVisualFormatFn,
+    find_standard_format: FindStandardFormatFn,
     create_picture: CreatePictureFn,
     create_solid_fill: CreateSolidFillFn,
     composite: CompositeFn,
     free_picture: FreePictureFn,
-}
-
-struct DynamicLibrary {
-    handle: *mut c_void,
-}
-
-impl DynamicLibrary {
-    unsafe fn open(names: &[&str]) -> Result<Self, String> {
-        for name in names {
-            let c_name = CString::new(*name).expect("library name is static and NUL-free");
-            let handle = dlopen(c_name.as_ptr(), RTLD_NOW);
-            if !handle.is_null() {
-                return Ok(Self { handle });
-            }
-        }
-        Err(format!("unable to load any of: {}", names.join(", ")))
-    }
-
-    unsafe fn symbol<T: Copy>(&self, name: &'static [u8]) -> Result<T, String> {
-        debug_assert_eq!(name.last().copied(), Some(0));
-        dlerror();
-        let raw = dlsym(self.handle, name.as_ptr() as *const c_char);
-        let error = dlerror();
-        if raw.is_null() || !error.is_null() {
-            let message = if error.is_null() {
-                "symbol resolved to NULL".to_string()
-            } else {
-                CStr::from_ptr(error).to_string_lossy().into_owned()
-            };
-            return Err(format!(
-                "{}: {message}",
-                String::from_utf8_lossy(&name[..name.len() - 1])
-            ));
-        }
-        if mem::size_of::<T>() != mem::size_of::<*mut c_void>() {
-            return Err("dynamic function pointer has unexpected size".to_string());
-        }
-        Ok(mem::transmute_copy(&raw))
-    }
-}
-
-impl Drop for DynamicLibrary {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.handle.is_null() {
-                dlclose(self.handle);
-            }
-        }
-    }
 }
 
 pub struct XRenderBackend {
@@ -122,24 +73,34 @@ pub struct XRenderBackend {
 }
 
 impl XRenderBackend {
+    /// # Safety
+    ///
+    /// `display` must be a live Xlib display and `drawable`/`visual` valid for
+    /// it; the loaded XRender symbols stay alive inside the returned backend.
     pub unsafe fn new(
         display: *mut Display,
         drawable: Drawable,
         visual: *mut Visual,
     ) -> Result<Self, String> {
         let library = DynamicLibrary::open(&["libXrender.so.1", "libXrender.so"])?;
+        // SAFETY: each name is a static NUL-terminated symbol and `T` is the exact
+        // function-pointer type declared in `XRenderApi`, matching the C ABI.
         let api = XRenderApi {
-            find_visual_format: library.symbol(b"XRenderFindVisualFormat\0")?,
-            create_picture: library.symbol(b"XRenderCreatePicture\0")?,
-            create_solid_fill: library.symbol(b"XRenderCreateSolidFill\0")?,
-            composite: library.symbol(b"XRenderComposite\0")?,
-            free_picture: library.symbol(b"XRenderFreePicture\0")?,
+            find_visual_format: unsafe { library.symbol(b"XRenderFindVisualFormat\0") }?,
+            find_standard_format: unsafe { library.symbol(b"XRenderFindStandardFormat\0") }?,
+            create_picture: unsafe { library.symbol(b"XRenderCreatePicture\0") }?,
+            create_solid_fill: unsafe { library.symbol(b"XRenderCreateSolidFill\0") }?,
+            composite: unsafe { library.symbol(b"XRenderComposite\0") }?,
+            free_picture: unsafe { library.symbol(b"XRenderFreePicture\0") }?,
         };
-        let format = (api.find_visual_format)(display, visual);
+        // SAFETY: `display`/`visual` are live per `new`'s contract; NULL is rejected below.
+        let format = unsafe { (api.find_visual_format)(display, visual) };
         if format.is_null() {
             return Err("XRenderFindVisualFormat returned NULL".to_string());
         }
-        let destination = (api.create_picture)(display, drawable, format, 0, std::ptr::null());
+        // SAFETY: same live `display`/`format`; NULL attributes select defaults.
+        let destination =
+            unsafe { (api.create_picture)(display, drawable, format, 0, std::ptr::null()) };
         if destination == 0 {
             return Err("XRenderCreatePicture returned 0".to_string());
         }
@@ -154,13 +115,17 @@ impl XRenderBackend {
     }
 
     pub unsafe fn set_drawable(&mut self, drawable: Drawable) -> Result<(), String> {
-        let replacement =
-            (self.api.create_picture)(self.display, drawable, self.format, 0, std::ptr::null());
+        // SAFETY: `display`/`format` stay live in this backend and `drawable` is
+        // valid per the caller's contract; zero return is reported below.
+        let replacement = unsafe {
+            (self.api.create_picture)(self.display, drawable, self.format, 0, std::ptr::null())
+        };
         if replacement == 0 {
             return Err("XRenderCreatePicture returned 0 while changing drawable".to_string());
         }
         if self.destination != 0 {
-            (self.api.free_picture)(self.display, self.destination);
+            // SAFETY: `destination` is a live picture owned by this backend.
+            unsafe { (self.api.free_picture)(self.display, self.destination) };
         }
         self.destination = replacement;
         Ok(())
@@ -181,7 +146,8 @@ impl XRenderBackend {
         }
         let radius = radius.round().max(0.0).min((width.min(height) / 2) as f32) as u32;
         if radius <= 1 {
-            return self.fill_rect(x, y, width, height, color);
+            // SAFETY: same validated rect/color inputs as `fill_rounded_rect`.
+            return unsafe { self.fill_rect(x, y, width, height, color) };
         }
 
         // Paint each destination pixel at most once. With PictOpOver, overlapping
@@ -191,7 +157,8 @@ impl XRenderBackend {
         // large selection/snap rectangles during pointer motion.
         let middle_height = height.saturating_sub(radius * 2);
         if middle_height > 0 {
-            self.fill_rect(x, y + radius as i32, width, middle_height, color)?;
+            // SAFETY: same validated inputs as `fill_rounded_rect`.
+            unsafe { self.fill_rect(x, y + radius as i32, width, middle_height, color)? };
         }
         for row in 0..radius {
             let inset = rounded_row_inset(width, height, radius, row);
@@ -199,10 +166,12 @@ impl XRenderBackend {
             if span == 0 {
                 continue;
             }
-            self.fill_rect(x + inset as i32, y + row as i32, span, 1, color)?;
+            // SAFETY: same validated inputs as `fill_rounded_rect`.
+            unsafe { self.fill_rect(x + inset as i32, y + row as i32, span, 1, color)? };
             let bottom_row = height - 1 - row;
             if bottom_row != row {
-                self.fill_rect(x + inset as i32, y + bottom_row as i32, span, 1, color)?;
+                // SAFETY: same validated inputs as `fill_rounded_rect`.
+                unsafe { self.fill_rect(x + inset as i32, y + bottom_row as i32, span, 1, color)? };
             }
         }
         Ok(())
@@ -239,13 +208,16 @@ impl XRenderBackend {
                 || width <= thickness * 2
                 || height <= thickness * 2
             {
-                self.fill_rect(
-                    x + outer_left as i32,
-                    y + row as i32,
-                    outer_right - outer_left,
-                    1,
-                    color,
-                )?;
+                // SAFETY: same validated inputs as the enclosing `stroke_rounded_rect`.
+                unsafe {
+                    self.fill_rect(
+                        x + outer_left as i32,
+                        y + row as i32,
+                        outer_right - outer_left,
+                        1,
+                        color,
+                    )?
+                };
                 continue;
             }
 
@@ -258,22 +230,28 @@ impl XRenderBackend {
             let inner_right = width.saturating_sub(thickness + inner_inset);
 
             if inner_left > outer_left {
-                self.fill_rect(
-                    x + outer_left as i32,
-                    y + row as i32,
-                    inner_left - outer_left,
-                    1,
-                    color,
-                )?;
+                // SAFETY: same validated inputs as the enclosing `stroke_rounded_rect`.
+                unsafe {
+                    self.fill_rect(
+                        x + outer_left as i32,
+                        y + row as i32,
+                        inner_left - outer_left,
+                        1,
+                        color,
+                    )?
+                };
             }
             if outer_right > inner_right {
-                self.fill_rect(
-                    x + inner_right as i32,
-                    y + row as i32,
-                    outer_right - inner_right,
-                    1,
-                    color,
-                )?;
+                // SAFETY: same validated inputs as the enclosing `stroke_rounded_rect`.
+                unsafe {
+                    self.fill_rect(
+                        x + inner_right as i32,
+                        y + row as i32,
+                        outer_right - inner_right,
+                        1,
+                        color,
+                    )?
+                };
             }
         }
         Ok(())
@@ -287,22 +265,125 @@ impl XRenderBackend {
         height: u32,
         color: Color,
     ) -> Result<(), String> {
-        let source = self.solid(color)?;
-        (self.api.composite)(
-            self.display,
-            PICT_OP_OVER,
-            source,
-            0,
-            self.destination,
-            0,
-            0,
-            0,
-            0,
-            x,
-            y,
-            width,
-            height,
-        );
+        let source = unsafe { self.solid(color) }?;
+        // SAFETY: `source`/`destination` are live pictures owned by this backend
+        // and `display` stays live for the whole backend lifetime.
+        unsafe {
+            (self.api.composite)(
+                self.display,
+                PICT_OP_OVER,
+                source,
+                0,
+                self.destination,
+                0,
+                0,
+                0,
+                0,
+                x,
+                y,
+                width,
+                height,
+            )
+        };
+        Ok(())
+    }
+
+    /// ARGB32 premultiplied source blit with true alpha through PictOpOver.
+    /// `source` must be a depth-32 pixmap holding premultiplied ARGB32.
+    /// The transient source picture (standard ARGB32 format) is freed
+    /// before this call returns; never leaks into the cache.
+    ///
+    /// # Safety
+    ///
+    /// `source` must be a live pixmap on this backend's display.
+    pub unsafe fn blit_argb32_over(
+        &mut self,
+        source: Drawable,
+        dx: i32,
+        dy: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        // PictStandardARGB32 == 0 in render.h.
+        let format = unsafe { (self.api.find_standard_format)(self.display, 0) };
+        if format.is_null() {
+            return Err("XRenderFindStandardFormat(ARGB32) returned NULL".to_string());
+        }
+        let picture =
+            unsafe { (self.api.create_picture)(self.display, source, format, 0, std::ptr::null()) };
+        if picture == 0 {
+            return Err("XRenderCreatePicture returned 0 for ARGB32 image blit".to_string());
+        }
+        unsafe {
+            (self.api.composite)(
+                self.display,
+                PICT_OP_OVER,
+                picture,
+                0,
+                self.destination,
+                0,
+                0,
+                0,
+                0,
+                dx,
+                dy,
+                width,
+                height,
+            )
+        };
+        // Release Picture before Pixmap per protocol ordering; caller frees
+        // the cached pixmap later at its own lifecycle point.
+        unsafe { (self.api.free_picture)(self.display, picture) };
+        Ok(())
+    }
+    /// Opaque pixmap blit through PictOpOver using the drawable's own
+    /// visual format. Callers needing true alpha use `blit_argb32_over`.
+    ///
+    /// # Safety
+    ///
+    /// `source` must be a live pixmap on this backend's display.
+    pub unsafe fn blit_over(
+        &mut self,
+        source: Drawable,
+        dx: i32,
+        dy: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        // SAFETY: same live `display`/`format` as `new`; NULL attributes select
+        // defaults. The transient source picture is freed at the end of this call.
+        let picture = unsafe {
+            (self.api.create_picture)(self.display, source, self.format, 0, std::ptr::null())
+        };
+        if picture == 0 {
+            return Err("XRenderCreatePicture returned 0 for image blit".to_string());
+        }
+        // SAFETY: `picture` and `destination` are live; `display` outlives the backend.
+        unsafe {
+            (self.api.composite)(
+                self.display,
+                PICT_OP_OVER,
+                picture,
+                0,
+                self.destination,
+                0,
+                0,
+                0,
+                0,
+                dx,
+                dy,
+                width,
+                height,
+            )
+        };
+        // SAFETY: `picture` is the transient source owned by this call.
+        unsafe { (self.api.free_picture)(self.display, picture) };
         Ok(())
     }
 
@@ -321,7 +402,9 @@ impl XRenderBackend {
             blue: premultiplied_u16(color.b, color.a),
             alpha: u16::from(color.a) * 257,
         };
-        let picture = (self.api.create_solid_fill)(self.display, &value);
+        // SAFETY: `display` is live per the backend contract; `value` is a valid
+        // stack reference for the call. A zero picture is reported below.
+        let picture = unsafe { (self.api.create_solid_fill)(self.display, &value) };
         if picture == 0 {
             return Err("XRenderCreateSolidFill returned 0".to_string());
         }
@@ -367,6 +450,8 @@ mod tests {
 
 impl Drop for XRenderBackend {
     fn drop(&mut self) {
+        // SAFETY: teardown only frees backend-owned pictures while `display` is
+        // live; draining first guarantees each picture is released once.
         unsafe {
             for (_, picture) in self.solids.drain() {
                 (self.api.free_picture)(self.display, picture);
@@ -377,12 +462,4 @@ impl Drop for XRenderBackend {
             }
         }
     }
-}
-
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlerror() -> *const c_char;
 }

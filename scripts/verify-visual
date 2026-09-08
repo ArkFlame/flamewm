@@ -37,6 +37,9 @@ DISPLAY_NUM="${FLAMEWM_VISUAL_DISPLAY:-:98}"
 SCREEN=1350x641
 OUT="${FLAMEWM_VISUAL_OUTPUT:-.target/flamewm/visual-current.png}"
 REF="${FLAMEWM_VISUAL_REFERENCE:-project_sources/visual/user-rwr-0.0.6-xephyr.png}"
+# Optional canary harness sampling (SR08 black-pixel gate) on the visual display.
+# Off unless FLAMEWM_VISUAL_CANARY=1; never changes the reference comparison.
+VISUAL_CANARY="${FLAMEWM_VISUAL_CANARY:-0}"
 mkdir -p .target/flamewm "$(dirname "$OUT")"
 
 export RWR_UI_FONT="${RWR_UI_FONT:-IBM Plex Sans}"
@@ -134,6 +137,16 @@ capture_root() {
 }
 
 capture_root
+
+if [[ "$VISUAL_CANARY" == 1 ]]; then
+  CANARY_BIN="${CANARY_BIN:-./.target/release/flamewm-x11-canary}"
+  if [[ ! -x "$CANARY_BIN" ]]; then
+    echo '[visual-canary] building flamewm-x11-canary harness' >&2
+    cargo build --quiet --release -p flamewm-x11-canary
+  fi
+  # SR08 black-pixel gate on the visual display; fails the run on all-black root.
+  DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" sr08 || { echo "VISUAL_FAIL canary SR08 black-pixel gate" >&2; exit 1; }
+fi
 
 # Reference and current must be compared without resizing; geometry drift is a failure.
 CUR_GEOM="$(im_identify -format '%wx%h' "$OUT")"

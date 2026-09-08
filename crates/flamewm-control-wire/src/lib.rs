@@ -7,19 +7,28 @@
 
 use std::collections::BTreeMap;
 
+use flamewm_api::applications::{ApplicationLaunchOptions, DesktopApplication};
 use flamewm_api::display::{DisplayMode, DisplaySnapshot, OutputSnapshot, PendingModeChange};
 use flamewm_api::panels::{PanelSnapshot, PanelsSnapshot, TaskEntry, TaskEntryKind};
 use flamewm_api::session::{SessionAction, SessionCapabilities};
 use flamewm_api::settings::{SettingValue, SettingsChange, SettingsSnapshot, SettingsTransaction};
 use flamewm_api::shortcuts::{KeyBinding, ShortcutSnapshot};
+use flamewm_api::system::{
+    AudioEndpointKind, AudioEndpointSnapshot, AudioMuteAction, AudioSnapshot, AudioStreamSnapshot,
+    AudioTarget, AudioVolumeAction, MediaSnapshot, NetworkAccessPointSnapshot, NetworkKind,
+    NetworkSecretRequestSnapshot, NetworkSnapshot, PlaybackState, ServiceAvailability,
+    SystemAction, SystemSnapshot,
+};
+use flamewm_api::window::{WindowSnapshot, WindowState};
 use flamewm_api::workspace::WorkspaceSnapshot;
 use flamewm_api::{
     DesktopAppId, ErrorCode, ModeId, OutputId, PanelEdge, Rect, Size, TaskEntryId, TransactionId,
     WindowRef,
 };
 use flamewm_control_core::{
-    ControlError, ControlRequest, ControlResponse, IFACE_DISPLAYS, IFACE_PANELS, IFACE_ROOT,
-    IFACE_SESSION, IFACE_SETTINGS, IFACE_SHORTCUTS, IFACE_WORKSPACES, Version,
+    ControlError, ControlRequest, ControlResponse, IFACE_APPLICATIONS, IFACE_DISPLAYS,
+    IFACE_PANELS, IFACE_ROOT, IFACE_SESSION, IFACE_SETTINGS, IFACE_SHORTCUTS, IFACE_SYSTEM,
+    IFACE_WINDOWS, IFACE_WORKSPACES, Version,
 };
 
 pub type WireDict = BTreeMap<String, WireValue>;
@@ -98,13 +107,40 @@ impl WireValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WireCall {
     pub interface: String,
     pub member: String,
     pub args: Vec<WireValue>,
     /// Monotonic clock supplied by the WM reactor; not part of the D-Bus ABI.
     pub now_ms: u64,
+}
+
+impl core::fmt::Debug for WireCall {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let args: Vec<_> = if self.interface == IFACE_SYSTEM && self.member == "SubmitNetworkSecret"
+        {
+            self.args
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    if index == 2 {
+                        WireValue::String("<redacted>".to_owned())
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect()
+        } else {
+            self.args.clone()
+        };
+        f.debug_struct("WireCall")
+            .field("interface", &self.interface)
+            .field("member", &self.member)
+            .field("args", &args)
+            .field("now_ms", &self.now_ms)
+            .finish()
+    }
 }
 
 impl WireCall {
@@ -161,6 +197,36 @@ pub fn decode_call(call: &WireCall) -> Result<ControlRequest, ControlError> {
         (IFACE_ROOT, "GetVersion") => expect_arity(call, 0).map(|()| ControlRequest::GetVersion),
         (IFACE_ROOT, "GetCapabilities") => {
             expect_arity(call, 0).map(|()| ControlRequest::GetCapabilities)
+        }
+        (IFACE_WINDOWS, "GetWindows") => expect_arity(call, 0).map(|()| ControlRequest::GetWindows),
+        (IFACE_APPLICATIONS, "GetApplications") => {
+            expect_arity(call, 0).map(|()| ControlRequest::GetApplications)
+        }
+        (IFACE_APPLICATIONS, "LaunchApplication") => {
+            expect_arity(call, 3)?;
+            Ok(ControlRequest::LaunchApplication {
+                app: DesktopAppId::new(required_string(&call.args[0], "appId")?),
+                options: ApplicationLaunchOptions {
+                    extra_args: required_string_array(&call.args[1], "extraArgs")?.to_vec(),
+                    uris: required_string_array(&call.args[2], "uris")?.to_vec(),
+                },
+            })
+        }
+        (
+            IFACE_WINDOWS,
+            member @ ("ActivateWindow" | "MinimizeWindow" | "RestoreWindow" | "CloseWindow"),
+        ) => {
+            expect_arity(call, 2)?;
+            let window = WindowRef::new(
+                required_u64(&call.args[0], "windowId")?,
+                required_u64(&call.args[1], "generation")?,
+            );
+            Ok(match member {
+                "ActivateWindow" => ControlRequest::ActivateWindow(window),
+                "MinimizeWindow" => ControlRequest::MinimizeWindow(window),
+                "RestoreWindow" => ControlRequest::RestoreWindow(window),
+                _ => ControlRequest::CloseWindow(window),
+            })
         }
         (IFACE_SETTINGS, "GetSnapshot") => {
             expect_arity(call, 0).map(|()| ControlRequest::GetSettings)
@@ -326,6 +392,8 @@ pub fn decode_call(call: &WireCall) -> Result<ControlRequest, ControlError> {
         (IFACE_SESSION, "Suspend") => session_action(call, SessionAction::Suspend),
         (IFACE_SESSION, "Reboot") => session_action(call, SessionAction::Reboot),
         (IFACE_SESSION, "Shutdown") => session_action(call, SessionAction::Shutdown),
+        (IFACE_SYSTEM, "GetSnapshot") => expect_arity(call, 0).map(|()| ControlRequest::GetSystem),
+        (IFACE_SYSTEM, member) => system_action_request(call, member),
         _ => Err(ControlError {
             name: flamewm_control_core::error_name(ErrorCode::NotFound),
             code: ErrorCode::NotFound,
@@ -343,6 +411,23 @@ pub fn encode_call(request: &ControlRequest) -> Result<WireCall, ControlError> {
         ControlRequest::Ping => WireCall::new(IFACE_ROOT, "Ping", Vec::new()),
         ControlRequest::GetVersion => WireCall::new(IFACE_ROOT, "GetVersion", Vec::new()),
         ControlRequest::GetCapabilities => WireCall::new(IFACE_ROOT, "GetCapabilities", Vec::new()),
+        ControlRequest::GetWindows => WireCall::new(IFACE_WINDOWS, "GetWindows", Vec::new()),
+        ControlRequest::GetApplications => {
+            WireCall::new(IFACE_APPLICATIONS, "GetApplications", Vec::new())
+        }
+        ControlRequest::LaunchApplication { app, options } => WireCall::new(
+            IFACE_APPLICATIONS,
+            "LaunchApplication",
+            vec![
+                WireValue::String(app.as_str().to_owned()),
+                WireValue::StringArray(options.extra_args.clone()),
+                WireValue::StringArray(options.uris.clone()),
+            ],
+        ),
+        ControlRequest::ActivateWindow(window) => window_call("ActivateWindow", *window),
+        ControlRequest::MinimizeWindow(window) => window_call("MinimizeWindow", *window),
+        ControlRequest::RestoreWindow(window) => window_call("RestoreWindow", *window),
+        ControlRequest::CloseWindow(window) => window_call("CloseWindow", *window),
         ControlRequest::GetSettings => WireCall::new(IFACE_SETTINGS, "GetSnapshot", Vec::new()),
         ControlRequest::ApplySettings(transaction) => match &transaction.reset_section {
             Some(section) => WireCall::new(
@@ -509,6 +594,11 @@ pub fn encode_call(request: &ControlRequest) -> Result<WireCall, ControlError> {
         ControlRequest::GetSessionCapabilities => {
             WireCall::new(IFACE_SESSION, "GetCapabilities", Vec::new())
         }
+        ControlRequest::GetSystem => WireCall::new(IFACE_SYSTEM, "GetSnapshot", Vec::new()),
+        ControlRequest::SystemAction {
+            action,
+            expected_revision,
+        } => system_action_call(action, *expected_revision),
         ControlRequest::SessionAction(action) => {
             WireCall::new(IFACE_SESSION, session_method(*action), Vec::new())
         }
@@ -538,6 +628,14 @@ fn panel_call(member: &str, app: &str, revision: u64) -> WireCall {
     )
 }
 
+fn window_call(member: &str, window: WindowRef) -> WireCall {
+    WireCall::new(
+        IFACE_WINDOWS,
+        member,
+        vec![WireValue::U64(window.id), WireValue::U64(window.generation)],
+    )
+}
+
 const fn session_method(action: SessionAction) -> &'static str {
     match action {
         SessionAction::Lock => "Lock",
@@ -559,6 +657,16 @@ pub fn encode_reply(
         }
         (IFACE_ROOT, "GetCapabilities", ControlResponse::Capabilities(items)) => {
             vec![WireValue::StringArray(items.clone())]
+        }
+        (IFACE_WINDOWS, "GetWindows", ControlResponse::Windows(windows)) => {
+            vec![WireValue::Array(
+                windows.iter().map(window_wire_value).collect(),
+            )]
+        }
+        (IFACE_APPLICATIONS, "GetApplications", ControlResponse::Applications(applications)) => {
+            vec![WireValue::Array(
+                applications.iter().map(application_wire_value).collect(),
+            )]
         }
         (IFACE_SETTINGS, "GetSnapshot", ControlResponse::Settings(snapshot)) => {
             vec![WireValue::Dict(settings_dict(snapshot))]
@@ -585,6 +693,9 @@ pub fn encode_reply(
             vec![WireValue::StringArray(session_capability_names(
                 *capabilities,
             ))]
+        }
+        (IFACE_SYSTEM, "GetSnapshot", ControlResponse::System(snapshot)) => {
+            vec![WireValue::Dict(system_dict(snapshot))]
         }
         (_, _, ControlResponse::Unit | ControlResponse::Changed(_)) => Vec::new(),
         _ => {
@@ -619,6 +730,24 @@ pub fn decode_reply(call: &WireCall, reply: &WireReply) -> Result<ControlRespons
             expect_reply_arity(reply, 1)?;
             Ok(ControlResponse::Capabilities(
                 required_string_array(&reply.values[0], "capabilities")?.to_vec(),
+            ))
+        }
+        (IFACE_WINDOWS, "GetWindows") => {
+            expect_reply_arity(reply, 1)?;
+            Ok(ControlResponse::Windows(
+                required_array(&reply.values[0], "windows")?
+                    .iter()
+                    .map(window_snapshot)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        (IFACE_APPLICATIONS, "GetApplications") => {
+            expect_reply_arity(reply, 1)?;
+            Ok(ControlResponse::Applications(
+                required_array(&reply.values[0], "applications")?
+                    .iter()
+                    .map(application_snapshot)
+                    .collect::<Result<Vec<_>, _>>()?,
             ))
         }
         (IFACE_SETTINGS, "GetSnapshot") => {
@@ -672,11 +801,40 @@ pub fn decode_reply(call: &WireCall, reply: &WireReply) -> Result<ControlRespons
                 required_string_array(&reply.values[0], "capabilities")?,
             )))
         }
+        (IFACE_SYSTEM, "GetSnapshot") => {
+            expect_reply_arity(reply, 1)?;
+            Ok(ControlResponse::System(system_snapshot(required_dict(
+                &reply.values[0],
+                "snapshot",
+            )?)?))
+        }
+        (
+            IFACE_SYSTEM,
+            "SetWifiEnabled"
+            | "ConnectKnown"
+            | "ConnectWifi"
+            | "SubmitNetworkSecret"
+            | "CancelNetworkSecret"
+            | "Disconnect"
+            | "Scan"
+            | "Play"
+            | "Pause"
+            | "PlayPause"
+            | "Next"
+            | "Previous"
+            | "SetVolume"
+            | "SetMute",
+        ) => {
+            expect_reply_arity(reply, 0)?;
+            Ok(ControlResponse::Unit)
+        }
         (IFACE_WORKSPACES, "Activate" | "InsertAfter" | "Remove")
         | (IFACE_DISPLAYS, "Keep" | "Revert" | "SetShellScale")
         | (IFACE_SHORTCUTS, "SetBinding" | "ClearBinding" | "ResetBinding")
         | (IFACE_PANELS, "SetEdge" | "SetSize" | "Pin" | "Unpin" | "Reorder")
-        | (IFACE_SESSION, "Lock" | "Logout" | "Suspend" | "Reboot" | "Shutdown") => {
+        | (IFACE_SESSION, "Lock" | "Logout" | "Suspend" | "Reboot" | "Shutdown")
+        | (IFACE_WINDOWS, "ActivateWindow" | "MinimizeWindow" | "RestoreWindow" | "CloseWindow")
+        | (IFACE_APPLICATIONS, "LaunchApplication") => {
             expect_reply_arity(reply, 0)?;
             Ok(ControlResponse::Unit)
         }
@@ -702,6 +860,58 @@ fn settings_snapshot(dict: &WireDict) -> Result<SettingsSnapshot, ControlError> 
         snapshot.values.insert(key.clone(), typed);
     }
     Ok(snapshot)
+}
+
+fn window_snapshot(value: &WireValue) -> Result<WindowSnapshot, ControlError> {
+    let dict = required_dict(value, "window")?;
+    let state = match dict_string(dict, "state")? {
+        "normal" => WindowState::Normal,
+        "minimized" => WindowState::Minimized,
+        "maximized" => WindowState::Maximized,
+        "fullscreen" => WindowState::Fullscreen,
+        "hidden" => WindowState::Hidden,
+        _ => return Err(invalid("window state is invalid")),
+    };
+    Ok(WindowSnapshot {
+        reference: WindowRef::new(dict_u64(dict, "windowId")?, dict_u64(dict, "generation")?),
+        title: dict_string(dict, "title")?.to_owned(),
+        app_id: DesktopAppId::new(dict_string(dict, "appId")?),
+        outer_geometry: rect_dict(dict, "outer")?,
+        restore_geometry: rect_dict(dict, "restore")?,
+        state,
+        sticky: dict_bool(dict, "sticky")?,
+        focused: dict_bool(dict, "focused")?,
+        workspace: flamewm_api::WorkspaceRef::new(
+            dict_i32(dict, "workspaceIndex")?,
+            dict_u64(dict, "workspaceRevision")?,
+        ),
+        output: OutputId::new(dict_string(dict, "output")?),
+        state_generation: dict_u64(dict, "stateGeneration")?,
+    })
+}
+
+fn application_snapshot(value: &WireValue) -> Result<DesktopApplication, ControlError> {
+    let dict = required_dict(value, "application")?;
+    Ok(DesktopApplication {
+        id: DesktopAppId::new(dict_string(dict, "id")?),
+        name: dict_string(dict, "name")?.to_owned(),
+        generic_name: dict_string(dict, "genericName")?.to_owned(),
+        comment: dict_string(dict, "comment")?.to_owned(),
+        startup_wm_class: dict_string(dict, "startupWmClass")?.to_owned(),
+        argv: dict_string_array(dict, "argv")?.to_vec(),
+        keywords: dict_string_array(dict, "keywords")?.to_vec(),
+        icon_name: dict_string(dict, "iconName")?.to_owned(),
+        categories: dict_string_array(dict, "categories")?.to_vec(),
+    })
+}
+
+fn rect_dict(dict: &WireDict, prefix: &str) -> Result<Rect, ControlError> {
+    Ok(Rect::new(
+        dict_i32(dict, &format!("{prefix}X"))?,
+        dict_i32(dict, &format!("{prefix}Y"))?,
+        dict_i32(dict, &format!("{prefix}Width"))?,
+        dict_i32(dict, &format!("{prefix}Height"))?,
+    ))
 }
 
 fn workspace_snapshot(dict: &WireDict) -> Result<WorkspaceSnapshot, ControlError> {
@@ -968,6 +1178,102 @@ pub enum ControlSignal {
     PanelsChanged {
         revision: u64,
     },
+    SystemChanged {
+        revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSignal {
+    pub interface: String,
+    pub member: String,
+    pub args: Vec<WireValue>,
+}
+
+#[must_use]
+pub fn encode_signal(signal: &ControlSignal) -> WireSignal {
+    match signal {
+        ControlSignal::SystemChanged { revision } => WireSignal {
+            interface: IFACE_SYSTEM.to_owned(),
+            member: "SystemChanged".to_owned(),
+            args: vec![WireValue::U64(*revision)],
+        },
+        ControlSignal::SettingsChanged { revision, keys } => WireSignal {
+            interface: IFACE_SETTINGS.to_owned(),
+            member: "SettingsChanged".to_owned(),
+            args: vec![
+                WireValue::U64(*revision),
+                WireValue::StringArray(keys.clone()),
+            ],
+        },
+        ControlSignal::WorkspacesChanged { revision } => {
+            revision_signal(IFACE_WORKSPACES, "WorkspacesChanged", *revision)
+        }
+        ControlSignal::TopologyChanged { generation } => {
+            revision_signal(IFACE_DISPLAYS, "TopologyChanged", *generation)
+        }
+        ControlSignal::ShortcutsChanged { revision } => {
+            revision_signal(IFACE_SHORTCUTS, "ShortcutsChanged", *revision)
+        }
+        ControlSignal::PanelsChanged { revision } => {
+            revision_signal(IFACE_PANELS, "PanelsChanged", *revision)
+        }
+        ControlSignal::DisplayTransactionChanged {
+            transaction,
+            state,
+            deadline_ms,
+        } => WireSignal {
+            interface: IFACE_DISPLAYS.to_owned(),
+            member: "DisplayTransactionChanged".to_owned(),
+            args: vec![
+                WireValue::U64(*transaction),
+                WireValue::String(state.clone()),
+                WireValue::U64(*deadline_ms),
+            ],
+        },
+    }
+}
+
+pub fn decode_signal(signal: &WireSignal) -> Result<ControlSignal, ControlError> {
+    let call = WireCall::new(&signal.interface, &signal.member, signal.args.clone());
+    match (signal.interface.as_str(), signal.member.as_str()) {
+        (IFACE_SYSTEM, "SystemChanged") => Ok(ControlSignal::SystemChanged {
+            revision: signal_revision(&call)?,
+        }),
+        (IFACE_SETTINGS, "SettingsChanged") => {
+            expect_arity(&call, 2)?;
+            Ok(ControlSignal::SettingsChanged {
+                revision: required_u64(&call.args[0], "revision")?,
+                keys: required_string_array(&call.args[1], "keys")?.to_vec(),
+            })
+        }
+        (IFACE_WORKSPACES, "WorkspacesChanged") => Ok(ControlSignal::WorkspacesChanged {
+            revision: signal_revision(&call)?,
+        }),
+        (IFACE_DISPLAYS, "TopologyChanged") => Ok(ControlSignal::TopologyChanged {
+            generation: signal_revision(&call)?,
+        }),
+        (IFACE_SHORTCUTS, "ShortcutsChanged") => Ok(ControlSignal::ShortcutsChanged {
+            revision: signal_revision(&call)?,
+        }),
+        (IFACE_PANELS, "PanelsChanged") => Ok(ControlSignal::PanelsChanged {
+            revision: signal_revision(&call)?,
+        }),
+        _ => Err(invalid("unknown Flame Control signal")),
+    }
+}
+
+fn revision_signal(interface: &str, member: &str, revision: u64) -> WireSignal {
+    WireSignal {
+        interface: interface.to_owned(),
+        member: member.to_owned(),
+        args: vec![WireValue::U64(revision)],
+    }
+}
+
+fn signal_revision(call: &WireCall) -> Result<u64, ControlError> {
+    expect_arity(call, 1)?;
+    required_u64(&call.args[0], "revision")
 }
 
 #[must_use]
@@ -1048,6 +1354,398 @@ pub fn shortcut_dict(snapshot: &ShortcutSnapshot) -> WireDict {
         );
     }
     out
+}
+
+#[must_use]
+pub fn system_dict(snapshot: &SystemSnapshot) -> WireDict {
+    let mut out = WireDict::new();
+    out.insert("revision".to_owned(), WireValue::U64(snapshot.revision));
+    out.insert(
+        "networkAvailability".to_owned(),
+        WireValue::String(availability_name(snapshot.network.availability).to_owned()),
+    );
+    out.insert(
+        "networkGeneration".to_owned(),
+        WireValue::U64(snapshot.network.generation),
+    );
+    out.insert(
+        "networkKind".to_owned(),
+        WireValue::String(network_kind_name(snapshot.network.kind).to_owned()),
+    );
+    out.insert(
+        "networkLabel".to_owned(),
+        WireValue::String(snapshot.network.label.clone()),
+    );
+    out.insert(
+        "networkStrength".to_owned(),
+        WireValue::U32(u32::from(snapshot.network.strength_percent)),
+    );
+    out.insert(
+        "wifiEnabled".to_owned(),
+        WireValue::Bool(snapshot.network.wifi_enabled),
+    );
+    out.insert(
+        "networkingEnabled".to_owned(),
+        WireValue::Bool(snapshot.network.networking_enabled),
+    );
+    out.insert(
+        "networkActivePath".to_owned(),
+        WireValue::String(snapshot.network.active_path.clone()),
+    );
+    out.insert(
+        "accessPoints".to_owned(),
+        WireValue::Array(
+            snapshot
+                .network
+                .access_points
+                .iter()
+                .map(access_point_wire_value)
+                .collect(),
+        ),
+    );
+    out.insert(
+        "hasPendingNetworkSecret".to_owned(),
+        WireValue::Bool(snapshot.network.pending_secret.is_some()),
+    );
+    if let Some(pending) = &snapshot.network.pending_secret {
+        out.insert(
+            "pendingNetworkSecretRequestId".to_owned(),
+            WireValue::U64(pending.request_id),
+        );
+        out.insert(
+            "pendingNetworkSecretAccessPointPath".to_owned(),
+            WireValue::String(pending.access_point_path.clone()),
+        );
+    }
+    out.insert(
+        "mediaAvailability".to_owned(),
+        WireValue::String(availability_name(snapshot.media.availability).to_owned()),
+    );
+    out.insert(
+        "mediaGeneration".to_owned(),
+        WireValue::U64(snapshot.media.generation),
+    );
+    out.insert(
+        "mediaBusName".to_owned(),
+        WireValue::String(snapshot.media.active_bus_name.clone()),
+    );
+    out.insert(
+        "mediaIdentity".to_owned(),
+        WireValue::String(snapshot.media.identity.clone()),
+    );
+    out.insert(
+        "mediaTitle".to_owned(),
+        WireValue::String(snapshot.media.title.clone()),
+    );
+    out.insert(
+        "mediaArtist".to_owned(),
+        WireValue::String(snapshot.media.artist.clone()),
+    );
+    out.insert(
+        "mediaPlayback".to_owned(),
+        WireValue::String(playback_name(snapshot.media.playback).to_owned()),
+    );
+    out.insert(
+        "mediaCanPlay".to_owned(),
+        WireValue::Bool(snapshot.media.can_play),
+    );
+    out.insert(
+        "mediaCanPause".to_owned(),
+        WireValue::Bool(snapshot.media.can_pause),
+    );
+    out.insert(
+        "mediaCanNext".to_owned(),
+        WireValue::Bool(snapshot.media.can_next),
+    );
+    out.insert(
+        "mediaCanPrevious".to_owned(),
+        WireValue::Bool(snapshot.media.can_previous),
+    );
+    out.insert(
+        "audioAvailability".to_owned(),
+        WireValue::String(availability_name(snapshot.audio.availability).to_owned()),
+    );
+    out.insert(
+        "audioGeneration".to_owned(),
+        WireValue::U64(snapshot.audio.generation),
+    );
+    out.insert(
+        "audioServerGeneration".to_owned(),
+        WireValue::U64(snapshot.audio.server_generation),
+    );
+    out.insert(
+        "audioSinkName".to_owned(),
+        WireValue::String(snapshot.audio.sink_name.clone()),
+    );
+    out.insert(
+        "audioVolume".to_owned(),
+        WireValue::U32(u32::from(snapshot.audio.volume_percent)),
+    );
+    out.insert(
+        "audioMuted".to_owned(),
+        WireValue::Bool(snapshot.audio.muted),
+    );
+    out.insert(
+        "audioEndpoints".to_owned(),
+        WireValue::Array(
+            snapshot
+                .audio
+                .endpoints()
+                .iter()
+                .map(audio_endpoint_wire_value)
+                .collect(),
+        ),
+    );
+    out.insert(
+        "audioStreams".to_owned(),
+        WireValue::Array(
+            snapshot
+                .audio
+                .streams()
+                .iter()
+                .map(audio_stream_wire_value)
+                .collect(),
+        ),
+    );
+    out
+}
+
+fn access_point_wire_value(point: &NetworkAccessPointSnapshot) -> WireValue {
+    let mut item = WireDict::new();
+    item.insert("path".to_owned(), WireValue::String(point.path.clone()));
+    item.insert("ssid".to_owned(), WireValue::String(point.ssid.clone()));
+    item.insert(
+        "strength".to_owned(),
+        WireValue::U32(u32::from(point.strength_percent)),
+    );
+    item.insert("secured".to_owned(), WireValue::Bool(point.secured));
+    item.insert("known".to_owned(), WireValue::Bool(point.known));
+    WireValue::Dict(item)
+}
+
+const fn availability_name(value: ServiceAvailability) -> &'static str {
+    match value {
+        ServiceAvailability::Unknown => "unknown",
+        ServiceAvailability::Available => "available",
+        ServiceAvailability::Unavailable => "unavailable",
+    }
+}
+
+const fn network_kind_name(value: NetworkKind) -> &'static str {
+    match value {
+        NetworkKind::Unavailable => "unavailable",
+        NetworkKind::Disconnected => "disconnected",
+        NetworkKind::Connecting => "connecting",
+        NetworkKind::Wired => "wired",
+        NetworkKind::Wireless => "wireless",
+    }
+}
+
+const fn playback_name(value: PlaybackState) -> &'static str {
+    match value {
+        PlaybackState::Playing => "playing",
+        PlaybackState::Paused => "paused",
+        PlaybackState::Stopped => "stopped",
+        PlaybackState::Unavailable => "unavailable",
+    }
+}
+
+fn parse_availability(value: &str) -> Result<ServiceAvailability, ControlError> {
+    match value {
+        "unknown" => Ok(ServiceAvailability::Unknown),
+        "available" => Ok(ServiceAvailability::Available),
+        "unavailable" => Ok(ServiceAvailability::Unavailable),
+        _ => Err(invalid("availability is invalid")),
+    }
+}
+
+fn parse_network_kind(value: &str) -> Result<NetworkKind, ControlError> {
+    match value {
+        "unavailable" => Ok(NetworkKind::Unavailable),
+        "disconnected" => Ok(NetworkKind::Disconnected),
+        "connecting" => Ok(NetworkKind::Connecting),
+        "wired" => Ok(NetworkKind::Wired),
+        "wireless" => Ok(NetworkKind::Wireless),
+        _ => Err(invalid("network kind is invalid")),
+    }
+}
+
+fn parse_playback(value: &str) -> Result<PlaybackState, ControlError> {
+    match value {
+        "playing" => Ok(PlaybackState::Playing),
+        "paused" => Ok(PlaybackState::Paused),
+        "stopped" => Ok(PlaybackState::Stopped),
+        "unavailable" => Ok(PlaybackState::Unavailable),
+        _ => Err(invalid("playback state is invalid")),
+    }
+}
+
+const fn audio_endpoint_kind_name(value: AudioEndpointKind) -> &'static str {
+    match value {
+        AudioEndpointKind::Sink => "sink",
+        AudioEndpointKind::Source => "source",
+    }
+}
+
+fn parse_audio_endpoint_kind(value: &str) -> Result<AudioEndpointKind, ControlError> {
+    match value {
+        "sink" => Ok(AudioEndpointKind::Sink),
+        "source" => Ok(AudioEndpointKind::Source),
+        _ => Err(invalid("audio endpoint kind must be sink or source")),
+    }
+}
+
+fn audio_target(kind: &str, endpoint_kind: &str, id: u32) -> Result<AudioTarget, ControlError> {
+    match kind {
+        "endpoint" => Ok(AudioTarget::Endpoint {
+            id,
+            kind: parse_audio_endpoint_kind(endpoint_kind)?,
+        }),
+        "stream" if endpoint_kind.is_empty() => Ok(AudioTarget::Stream { id }),
+        "stream" => Err(invalid("audio stream endpointKind must be empty")),
+        _ => Err(invalid("audio target kind must be endpoint or stream")),
+    }
+}
+
+fn access_point_snapshot(value: &WireValue) -> Result<NetworkAccessPointSnapshot, ControlError> {
+    let dict = required_dict(value, "accessPoint")?;
+    let strength = dict_u32(dict, "strength")?;
+    Ok(NetworkAccessPointSnapshot {
+        path: dict_string(dict, "path")?.to_owned(),
+        ssid: dict_string(dict, "ssid")?.to_owned(),
+        strength_percent: u8::try_from(strength)
+            .map_err(|_| invalid("access point strength exceeds u8"))?,
+        secured: dict_bool(dict, "secured")?,
+        known: dict_bool(dict, "known")?,
+    })
+}
+
+fn system_snapshot(dict: &WireDict) -> Result<SystemSnapshot, ControlError> {
+    let strength = dict_u32(dict, "networkStrength")?;
+    let volume = dict_u32(dict, "audioVolume")?;
+    Ok(SystemSnapshot {
+        revision: dict_u64(dict, "revision")?,
+        network: NetworkSnapshot {
+            availability: parse_availability(dict_string(dict, "networkAvailability")?)?,
+            generation: dict_u64(dict, "networkGeneration")?,
+            kind: parse_network_kind(dict_string(dict, "networkKind")?)?,
+            label: dict_string(dict, "networkLabel")?.to_owned(),
+            strength_percent: u8::try_from(strength)
+                .map_err(|_| invalid("network strength exceeds u8"))?,
+            wifi_enabled: dict_bool(dict, "wifiEnabled")?,
+            networking_enabled: dict_bool(dict, "networkingEnabled")?,
+            active_path: dict_string(dict, "networkActivePath")?.to_owned(),
+            access_points: dict_value(dict, "accessPoints").and_then(|value| {
+                required_array(value, "accessPoints")?
+                    .iter()
+                    .map(access_point_snapshot)
+                    .collect::<Result<Vec<_>, _>>()
+            })?,
+            pending_secret: if dict_bool(dict, "hasPendingNetworkSecret")? {
+                Some(NetworkSecretRequestSnapshot {
+                    request_id: dict_u64(dict, "pendingNetworkSecretRequestId")?,
+                    access_point_path: dict_string(dict, "pendingNetworkSecretAccessPointPath")?
+                        .to_owned(),
+                })
+            } else {
+                None
+            },
+        },
+        media: MediaSnapshot {
+            availability: parse_availability(dict_string(dict, "mediaAvailability")?)?,
+            generation: dict_u64(dict, "mediaGeneration")?,
+            active_bus_name: dict_string(dict, "mediaBusName")?.to_owned(),
+            identity: dict_string(dict, "mediaIdentity")?.to_owned(),
+            title: dict_string(dict, "mediaTitle")?.to_owned(),
+            artist: dict_string(dict, "mediaArtist")?.to_owned(),
+            playback: parse_playback(dict_string(dict, "mediaPlayback")?)?,
+            can_play: dict_bool(dict, "mediaCanPlay")?,
+            can_pause: dict_bool(dict, "mediaCanPause")?,
+            can_next: dict_bool(dict, "mediaCanNext")?,
+            can_previous: dict_bool(dict, "mediaCanPrevious")?,
+        },
+        audio: AudioSnapshot {
+            availability: parse_availability(dict_string(dict, "audioAvailability")?)?,
+            generation: dict_u64(dict, "audioGeneration")?,
+            server_generation: dict_u64(dict, "audioServerGeneration")?,
+            sink_name: dict_string(dict, "audioSinkName")?.to_owned(),
+            volume_percent: u8::try_from(volume).map_err(|_| invalid("audio volume exceeds u8"))?,
+            muted: dict_bool(dict, "audioMuted")?,
+            ..AudioSnapshot::default()
+        }
+        .with_items(
+            dict_value(dict, "audioEndpoints")
+                .and_then(|value| required_array(value, "audioEndpoints"))?
+                .iter()
+                .map(audio_endpoint_snapshot)
+                .collect::<Result<Vec<_>, _>>()?,
+            dict_value(dict, "audioStreams")
+                .and_then(|value| required_array(value, "audioStreams"))?
+                .iter()
+                .map(audio_stream_snapshot)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    })
+}
+
+fn audio_endpoint_wire_value(endpoint: &AudioEndpointSnapshot) -> WireValue {
+    let mut out = WireDict::new();
+    out.insert("id".to_owned(), WireValue::U32(endpoint.id));
+    out.insert(
+        "kind".to_owned(),
+        WireValue::String(audio_endpoint_kind_name(endpoint.kind).to_owned()),
+    );
+    out.insert("name".to_owned(), WireValue::String(endpoint.name.clone()));
+    out.insert(
+        "description".to_owned(),
+        WireValue::String(endpoint.description.clone()),
+    );
+    out.insert(
+        "volume".to_owned(),
+        WireValue::U32(u32::from(endpoint.volume_percent)),
+    );
+    out.insert("muted".to_owned(), WireValue::Bool(endpoint.muted));
+    out.insert("default".to_owned(), WireValue::Bool(endpoint.is_default));
+    WireValue::Dict(out)
+}
+
+fn audio_stream_wire_value(stream: &AudioStreamSnapshot) -> WireValue {
+    let mut out = WireDict::new();
+    out.insert("id".to_owned(), WireValue::U32(stream.id));
+    out.insert("endpointId".to_owned(), WireValue::U32(stream.endpoint_id));
+    out.insert("name".to_owned(), WireValue::String(stream.name.clone()));
+    out.insert(
+        "volume".to_owned(),
+        WireValue::U32(u32::from(stream.volume_percent)),
+    );
+    out.insert("muted".to_owned(), WireValue::Bool(stream.muted));
+    WireValue::Dict(out)
+}
+
+fn audio_endpoint_snapshot(value: &WireValue) -> Result<AudioEndpointSnapshot, ControlError> {
+    let dict = required_dict(value, "audio endpoint")?;
+    Ok(AudioEndpointSnapshot {
+        id: dict_u32(dict, "id")?,
+        kind: parse_audio_endpoint_kind(dict_string(dict, "kind")?)?,
+        name: dict_string(dict, "name")?.to_owned(),
+        description: dict_string(dict, "description")?.to_owned(),
+        volume_percent: u8::try_from(dict_u32(dict, "volume")?)
+            .map_err(|_| invalid("audio endpoint volume exceeds u8"))?,
+        muted: dict_bool(dict, "muted")?,
+        is_default: dict_bool(dict, "default")?,
+    })
+}
+
+fn audio_stream_snapshot(value: &WireValue) -> Result<AudioStreamSnapshot, ControlError> {
+    let dict = required_dict(value, "audio stream")?;
+    Ok(AudioStreamSnapshot {
+        id: dict_u32(dict, "id")?,
+        endpoint_id: dict_u32(dict, "endpointId")?,
+        name: dict_string(dict, "name")?.to_owned(),
+        volume_percent: u8::try_from(dict_u32(dict, "volume")?)
+            .map_err(|_| invalid("audio stream volume exceeds u8"))?,
+        muted: dict_bool(dict, "muted")?,
+    })
 }
 
 #[must_use]
@@ -1198,6 +1896,120 @@ fn output_wire_value(output: &OutputSnapshot) -> WireValue {
     WireValue::Dict(item)
 }
 
+fn window_wire_value(window: &WindowSnapshot) -> WireValue {
+    let mut out = WireDict::new();
+    out.insert("windowId".to_owned(), WireValue::U64(window.reference.id));
+    out.insert(
+        "generation".to_owned(),
+        WireValue::U64(window.reference.generation),
+    );
+    out.insert("title".to_owned(), WireValue::String(window.title.clone()));
+    out.insert(
+        "appId".to_owned(),
+        WireValue::String(window.app_id.as_str().to_owned()),
+    );
+    out.insert("outerX".to_owned(), WireValue::I32(window.outer_geometry.x));
+    out.insert("outerY".to_owned(), WireValue::I32(window.outer_geometry.y));
+    out.insert(
+        "outerWidth".to_owned(),
+        WireValue::I32(window.outer_geometry.width),
+    );
+    out.insert(
+        "outerHeight".to_owned(),
+        WireValue::I32(window.outer_geometry.height),
+    );
+    out.insert(
+        "restoreX".to_owned(),
+        WireValue::I32(window.restore_geometry.x),
+    );
+    out.insert(
+        "restoreY".to_owned(),
+        WireValue::I32(window.restore_geometry.y),
+    );
+    out.insert(
+        "restoreWidth".to_owned(),
+        WireValue::I32(window.restore_geometry.width),
+    );
+    out.insert(
+        "restoreHeight".to_owned(),
+        WireValue::I32(window.restore_geometry.height),
+    );
+    out.insert(
+        "state".to_owned(),
+        WireValue::String(window_state_name(window.state).to_owned()),
+    );
+    out.insert("sticky".to_owned(), WireValue::Bool(window.sticky));
+    out.insert("focused".to_owned(), WireValue::Bool(window.focused));
+    out.insert(
+        "workspaceIndex".to_owned(),
+        WireValue::I32(window.workspace.index),
+    );
+    out.insert(
+        "workspaceRevision".to_owned(),
+        WireValue::U64(window.workspace.revision),
+    );
+    out.insert(
+        "output".to_owned(),
+        WireValue::String(window.output.as_str().to_owned()),
+    );
+    out.insert(
+        "stateGeneration".to_owned(),
+        WireValue::U64(window.state_generation),
+    );
+    WireValue::Dict(out)
+}
+
+fn application_wire_value(application: &DesktopApplication) -> WireValue {
+    let mut out = WireDict::new();
+    out.insert(
+        "id".to_owned(),
+        WireValue::String(application.id.as_str().to_owned()),
+    );
+    out.insert(
+        "name".to_owned(),
+        WireValue::String(application.name.clone()),
+    );
+    out.insert(
+        "genericName".to_owned(),
+        WireValue::String(application.generic_name.clone()),
+    );
+    out.insert(
+        "comment".to_owned(),
+        WireValue::String(application.comment.clone()),
+    );
+    out.insert(
+        "startupWmClass".to_owned(),
+        WireValue::String(application.startup_wm_class.clone()),
+    );
+    out.insert(
+        "argv".to_owned(),
+        WireValue::StringArray(application.argv.clone()),
+    );
+    out.insert(
+        "keywords".to_owned(),
+        WireValue::StringArray(application.keywords.clone()),
+    );
+    out.insert(
+        "iconName".to_owned(),
+        WireValue::String(application.icon_name.clone()),
+    );
+    out.insert(
+        "categories".to_owned(),
+        WireValue::StringArray(application.categories.clone()),
+    );
+    WireValue::Dict(out)
+}
+
+const fn window_state_name(state: WindowState) -> &'static str {
+    match state {
+        WindowState::Normal => "normal",
+        WindowState::Minimized => "minimized",
+        WindowState::Maximized => "maximized",
+        WindowState::Fullscreen => "fullscreen",
+        WindowState::Hidden => "hidden",
+    }
+}
+
 fn panel_wire_value(panel: &PanelSnapshot) -> WireValue {
     let mut item = WireDict::new();
     item.insert(
@@ -1298,6 +2110,241 @@ fn session_action(call: &WireCall, action: SessionAction) -> Result<ControlReque
     Ok(ControlRequest::SessionAction(action))
 }
 
+fn system_action_request(call: &WireCall, member: &str) -> Result<ControlRequest, ControlError> {
+    let (action, expected_revision) = match member {
+        "SetWifiEnabled" => {
+            expect_arity(call, 2)?;
+            (
+                SystemAction::SetWifiEnabled(
+                    call.args[0]
+                        .as_bool()
+                        .ok_or_else(|| invalid("enabled must be bool"))?,
+                ),
+                required_u64(&call.args[1], "expectedRevision")?,
+            )
+        }
+        "ConnectKnown" => {
+            expect_arity(call, 2)?;
+            (
+                SystemAction::ConnectKnown {
+                    access_point_path: required_string(&call.args[0], "accessPointPath")?
+                        .to_owned(),
+                },
+                required_u64(&call.args[1], "expectedRevision")?,
+            )
+        }
+        "ConnectWifi" => {
+            expect_arity(call, 3)?;
+            (
+                SystemAction::ConnectWifi {
+                    access_point_path: required_string(&call.args[0], "accessPointPath")?
+                        .to_owned(),
+                    generation: required_u64(&call.args[1], "generation")?,
+                },
+                required_u64(&call.args[2], "expectedRevision")?,
+            )
+        }
+        "SubmitNetworkSecret" => {
+            expect_arity(call, 4)?;
+            (
+                SystemAction::SubmitNetworkSecret {
+                    request_id: required_u64(&call.args[0], "requestId")?,
+                    generation: required_u64(&call.args[1], "generation")?,
+                    secret: required_string(&call.args[2], "secret")?.to_owned(),
+                },
+                required_u64(&call.args[3], "expectedRevision")?,
+            )
+        }
+        "CancelNetworkSecret" => {
+            expect_arity(call, 3)?;
+            (
+                SystemAction::CancelNetworkSecret {
+                    request_id: required_u64(&call.args[0], "requestId")?,
+                    generation: required_u64(&call.args[1], "generation")?,
+                },
+                required_u64(&call.args[2], "expectedRevision")?,
+            )
+        }
+        "Disconnect" => system_simple_action(call, SystemAction::Disconnect)?,
+        "Scan" => system_simple_action(call, SystemAction::Scan)?,
+        "Play" => system_media_action(call, |bus_name| SystemAction::Play { bus_name })?,
+        "Pause" => system_media_action(call, |bus_name| SystemAction::Pause { bus_name })?,
+        "PlayPause" => system_media_action(call, |bus_name| SystemAction::PlayPause { bus_name })?,
+        "Next" => system_media_action(call, |bus_name| SystemAction::Next { bus_name })?,
+        "Previous" => system_media_action(call, |bus_name| SystemAction::Previous { bus_name })?,
+        "SetVolume" => {
+            expect_arity(call, 7)?;
+            let percent = u8::try_from(required_u32(&call.args[3], "percent")?)
+                .map_err(|_| invalid("percent exceeds u8"))?;
+            if percent > 150 {
+                return Err(invalid("percent must be in 0..=150"));
+            }
+            (
+                SystemAction::SetVolume(AudioVolumeAction {
+                    target: audio_target(
+                        required_string(&call.args[0], "targetKind")?,
+                        required_string(&call.args[1], "endpointKind")?,
+                        required_u32(&call.args[2], "id")?,
+                    )?,
+                    percent,
+                    generation: required_u64(&call.args[4], "generation")?,
+                    server_generation: required_u64(&call.args[5], "serverGeneration")?,
+                }),
+                required_u64(&call.args[6], "expectedRevision")?,
+            )
+        }
+        "SetMute" => {
+            expect_arity(call, 7)?;
+            (
+                SystemAction::SetMute(AudioMuteAction {
+                    target: audio_target(
+                        required_string(&call.args[0], "targetKind")?,
+                        required_string(&call.args[1], "endpointKind")?,
+                        required_u32(&call.args[2], "id")?,
+                    )?,
+                    muted: call.args[3]
+                        .as_bool()
+                        .ok_or_else(|| invalid("muted must be bool"))?,
+                    generation: required_u64(&call.args[4], "generation")?,
+                    server_generation: required_u64(&call.args[5], "serverGeneration")?,
+                }),
+                required_u64(&call.args[6], "expectedRevision")?,
+            )
+        }
+        _ => {
+            return Err(ControlError {
+                name: flamewm_control_core::error_name(ErrorCode::NotFound),
+                code: ErrorCode::NotFound,
+                message: format!("unknown Flame Control system method {member}"),
+            });
+        }
+    };
+    Ok(ControlRequest::SystemAction {
+        action,
+        expected_revision,
+    })
+}
+
+fn system_simple_action(
+    call: &WireCall,
+    action: SystemAction,
+) -> Result<(SystemAction, u64), ControlError> {
+    expect_arity(call, 1)?;
+    Ok((action, required_u64(&call.args[0], "expectedRevision")?))
+}
+
+fn system_media_action(
+    call: &WireCall,
+    action: impl FnOnce(String) -> SystemAction,
+) -> Result<(SystemAction, u64), ControlError> {
+    expect_arity(call, 2)?;
+    Ok((
+        action(required_string(&call.args[0], "busName")?.to_owned()),
+        required_u64(&call.args[1], "expectedRevision")?,
+    ))
+}
+
+fn system_action_call(action: &SystemAction, expected_revision: u64) -> WireCall {
+    let (member, mut args) = match action {
+        SystemAction::SetWifiEnabled(enabled) => {
+            ("SetWifiEnabled", vec![WireValue::Bool(*enabled)])
+        }
+        SystemAction::ConnectKnown { access_point_path } => (
+            "ConnectKnown",
+            vec![WireValue::String(access_point_path.clone())],
+        ),
+        SystemAction::ConnectWifi {
+            access_point_path,
+            generation,
+        } => (
+            "ConnectWifi",
+            vec![
+                WireValue::String(access_point_path.clone()),
+                WireValue::U64(*generation),
+            ],
+        ),
+        SystemAction::SubmitNetworkSecret {
+            request_id,
+            generation,
+            secret,
+        } => (
+            "SubmitNetworkSecret",
+            vec![
+                WireValue::U64(*request_id),
+                WireValue::U64(*generation),
+                WireValue::String(secret.clone()),
+            ],
+        ),
+        SystemAction::CancelNetworkSecret {
+            request_id,
+            generation,
+        } => (
+            "CancelNetworkSecret",
+            vec![WireValue::U64(*request_id), WireValue::U64(*generation)],
+        ),
+        SystemAction::Disconnect => ("Disconnect", Vec::new()),
+        SystemAction::Scan => ("Scan", Vec::new()),
+        SystemAction::Play { bus_name } => ("Play", vec![WireValue::String(bus_name.clone())]),
+        SystemAction::Pause { bus_name } => ("Pause", vec![WireValue::String(bus_name.clone())]),
+        SystemAction::PlayPause { bus_name } => {
+            ("PlayPause", vec![WireValue::String(bus_name.clone())])
+        }
+        SystemAction::Next { bus_name } => ("Next", vec![WireValue::String(bus_name.clone())]),
+        SystemAction::Previous { bus_name } => {
+            ("Previous", vec![WireValue::String(bus_name.clone())])
+        }
+        SystemAction::SetVolume(action) => (
+            "SetVolume",
+            audio_action_args(
+                action.target,
+                Some(action.percent),
+                None,
+                action.generation,
+                action.server_generation,
+            ),
+        ),
+        SystemAction::SetMute(action) => (
+            "SetMute",
+            audio_action_args(
+                action.target,
+                None,
+                Some(action.muted),
+                action.generation,
+                action.server_generation,
+            ),
+        ),
+    };
+    args.push(WireValue::U64(expected_revision));
+    WireCall::new(IFACE_SYSTEM, member, args)
+}
+
+fn audio_action_args(
+    target: AudioTarget,
+    percent: Option<u8>,
+    muted: Option<bool>,
+    generation: u64,
+    server_generation: u64,
+) -> Vec<WireValue> {
+    let (target_kind, endpoint_kind, id) = match target {
+        AudioTarget::Endpoint { id, kind } => ("endpoint", audio_endpoint_kind_name(kind), id),
+        AudioTarget::Stream { id } => ("stream", "", id),
+    };
+    let mut args = vec![
+        WireValue::String(target_kind.to_owned()),
+        WireValue::String(endpoint_kind.to_owned()),
+        WireValue::U32(id),
+    ];
+    if let Some(percent) = percent {
+        args.push(WireValue::U32(u32::from(percent)));
+    }
+    if let Some(muted) = muted {
+        args.push(WireValue::Bool(muted));
+    }
+    args.push(WireValue::U64(generation));
+    args.push(WireValue::U64(server_generation));
+    args
+}
+
 fn expect_arity(call: &WireCall, expected: usize) -> Result<(), ControlError> {
     if call.args.len() == expected {
         Ok(())
@@ -1373,6 +2420,10 @@ fn i32_saturating(value: usize) -> i32 {
 mod tests {
     use super::*;
     use flamewm_api::settings::SettingValue;
+    use flamewm_api::system::{
+        AudioSnapshot, MediaSnapshot, NetworkAccessPointSnapshot, NetworkKind, NetworkSnapshot,
+        PlaybackState, ServiceAvailability,
+    };
 
     #[test]
     fn settings_apply_decodes_typed_variants_without_stringly_typed_core() {
@@ -1521,6 +2572,257 @@ mod tests {
         assert_eq!(
             decode_reply(&call, &reply).expect("decode"),
             ControlResponse::Settings(source)
+        );
+    }
+
+    fn window_fixture() -> WindowSnapshot {
+        WindowSnapshot {
+            reference: WindowRef::new(42, 3),
+            title: "Editor".to_owned(),
+            app_id: DesktopAppId::new("org.example.Editor"),
+            outer_geometry: Rect::new(10, 20, 800, 600),
+            restore_geometry: Rect::new(30, 40, 640, 480),
+            state: WindowState::Maximized,
+            sticky: false,
+            focused: true,
+            workspace: flamewm_api::WorkspaceRef::new(1, 8),
+            output: OutputId::new("HDMI-1"),
+            state_generation: 9,
+        }
+    }
+
+    fn application_fixture() -> DesktopApplication {
+        DesktopApplication {
+            id: DesktopAppId::new("org.example.Editor"),
+            name: "Editor".to_owned(),
+            generic_name: "Text Editor".to_owned(),
+            comment: "Edit text files".to_owned(),
+            startup_wm_class: "Editor".to_owned(),
+            argv: vec!["editor".to_owned(), "%U".to_owned()],
+            keywords: vec!["write".to_owned()],
+            icon_name: "editor".to_owned(),
+            categories: vec!["Utility".to_owned()],
+        }
+    }
+
+    #[test]
+    fn shell_snapshot_requests_round_trip_through_wire_mapping() {
+        for request in [ControlRequest::GetWindows, ControlRequest::GetApplications] {
+            let call = encode_call(&request).expect("encode");
+            assert_eq!(decode_call(&call).expect("decode"), request);
+        }
+    }
+
+    #[test]
+    fn application_launch_request_round_trips_options_through_wire_mapping() {
+        let request = ControlRequest::LaunchApplication {
+            app: DesktopAppId::new("org.example.Browser"),
+            options: ApplicationLaunchOptions {
+                extra_args: vec!["--private".to_owned()],
+                uris: vec!["https://example.test".to_owned()],
+            },
+        };
+        let call = encode_call(&request).expect("encode");
+        assert_eq!(decode_call(&call).expect("decode"), request);
+        let reply = encode_reply(&call, &ControlResponse::Unit).expect("encode reply");
+        assert_eq!(
+            decode_reply(&call, &reply).expect("decode reply"),
+            ControlResponse::Unit
+        );
+    }
+
+    #[test]
+    fn window_control_requests_round_trip_through_wire_mapping() {
+        for request in [
+            ControlRequest::ActivateWindow(WindowRef::new(7, 3)),
+            ControlRequest::MinimizeWindow(WindowRef::new(7, 3)),
+            ControlRequest::RestoreWindow(WindowRef::new(7, 3)),
+            ControlRequest::CloseWindow(WindowRef::new(7, 3)),
+        ] {
+            let call = encode_call(&request).expect("encode");
+            assert_eq!(decode_call(&call).expect("decode"), request);
+            let reply = encode_reply(&call, &ControlResponse::Unit).expect("encode reply");
+            assert_eq!(
+                decode_reply(&call, &reply).expect("decode reply"),
+                ControlResponse::Unit
+            );
+        }
+    }
+
+    #[test]
+    fn window_snapshot_reply_round_trips_through_wire_mapping() {
+        let call = WireCall::new(IFACE_WINDOWS, "GetWindows", Vec::new());
+        let source = vec![window_fixture()];
+        let reply = encode_reply(&call, &ControlResponse::Windows(source.clone())).expect("encode");
+        assert_eq!(
+            decode_reply(&call, &reply).expect("decode"),
+            ControlResponse::Windows(source)
+        );
+    }
+
+    #[test]
+    fn application_snapshot_reply_round_trips_through_wire_mapping() {
+        let call = WireCall::new(IFACE_APPLICATIONS, "GetApplications", Vec::new());
+        let source = vec![application_fixture()];
+        let reply =
+            encode_reply(&call, &ControlResponse::Applications(source.clone())).expect("encode");
+        assert_eq!(
+            decode_reply(&call, &reply).expect("decode"),
+            ControlResponse::Applications(source)
+        );
+    }
+
+    fn system_fixture() -> SystemSnapshot {
+        SystemSnapshot {
+            revision: 11,
+            network: NetworkSnapshot {
+                availability: ServiceAvailability::Available,
+                generation: 3,
+                kind: NetworkKind::Wireless,
+                label: "ArkNet 5G".to_owned(),
+                strength_percent: 82,
+                wifi_enabled: true,
+                networking_enabled: true,
+                active_path: "/nm/ap/1".to_owned(),
+                access_points: vec![NetworkAccessPointSnapshot {
+                    path: "/nm/ap/1".to_owned(),
+                    ssid: "ArkNet 5G".to_owned(),
+                    strength_percent: 82,
+                    secured: true,
+                    known: true,
+                }],
+                pending_secret: None,
+            },
+            media: MediaSnapshot {
+                availability: ServiceAvailability::Available,
+                generation: 5,
+                active_bus_name: "org.mpris.elisa".to_owned(),
+                identity: "Elisa".to_owned(),
+                title: "Neon Skyline".to_owned(),
+                artist: "Prototype Player".to_owned(),
+                playback: PlaybackState::Playing,
+                can_play: true,
+                can_pause: true,
+                can_next: true,
+                can_previous: false,
+            },
+            audio: AudioSnapshot {
+                availability: ServiceAvailability::Available,
+                generation: 7,
+                server_generation: 2,
+                sink_name: "alsa_output".to_owned(),
+                volume_percent: 72,
+                muted: false,
+                ..AudioSnapshot::default()
+            }
+            .with_items(
+                vec![AudioEndpointSnapshot {
+                    id: 7,
+                    kind: AudioEndpointKind::Sink,
+                    name: "alsa_output".to_owned(),
+                    description: "Speakers".to_owned(),
+                    volume_percent: 72,
+                    muted: false,
+                    is_default: true,
+                }],
+                vec![AudioStreamSnapshot {
+                    id: 8,
+                    endpoint_id: 7,
+                    name: "Player".to_owned(),
+                    volume_percent: 72,
+                    muted: false,
+                }],
+            ),
+        }
+    }
+
+    #[test]
+    fn system_call_round_trips_through_wire_mapping() {
+        let call = encode_call(&ControlRequest::GetSystem).expect("encode");
+        assert_eq!(call.interface, IFACE_SYSTEM);
+        assert_eq!(call.member, "GetSnapshot");
+        assert_eq!(
+            decode_call(&call).expect("decode"),
+            ControlRequest::GetSystem
+        );
+    }
+
+    #[test]
+    fn system_reply_round_trips_full_authoritative_snapshot() {
+        let call = WireCall::new(IFACE_SYSTEM, "GetSnapshot", Vec::new());
+        let source = system_fixture();
+        let reply = encode_reply(&call, &ControlResponse::System(source.clone())).expect("encode");
+        assert_eq!(
+            decode_reply(&call, &reply).expect("decode"),
+            ControlResponse::System(source)
+        );
+    }
+
+    #[test]
+    fn system_actions_and_change_signal_round_trip_through_wire_mapping() {
+        let request = ControlRequest::SystemAction {
+            action: SystemAction::ConnectWifi {
+                access_point_path: "/network/ap/1".to_owned(),
+                generation: 3,
+            },
+            expected_revision: 11,
+        };
+        let call = encode_call(&request).expect("encode");
+        assert_eq!(call.member, "ConnectWifi");
+        assert_eq!(decode_call(&call).expect("decode"), request);
+        let signal = ControlSignal::SystemChanged { revision: 12 };
+        assert_eq!(
+            decode_signal(&encode_signal(&signal)).expect("decode signal"),
+            signal
+        );
+    }
+
+    #[test]
+    fn audio_target_actions_round_trip_with_identity_and_generations() {
+        for action in [
+            SystemAction::SetVolume(AudioVolumeAction {
+                target: AudioTarget::Endpoint {
+                    id: 7,
+                    kind: AudioEndpointKind::Sink,
+                },
+                percent: 150,
+                generation: 5,
+                server_generation: 3,
+            }),
+            SystemAction::SetMute(AudioMuteAction {
+                target: AudioTarget::Stream { id: 11 },
+                muted: true,
+                generation: 5,
+                server_generation: 3,
+            }),
+        ] {
+            let request = ControlRequest::SystemAction {
+                action,
+                expected_revision: 9,
+            };
+            let call = encode_call(&request).expect("encode");
+            assert_eq!(decode_call(&call).expect("decode"), request);
+        }
+    }
+
+    #[test]
+    fn audio_volume_above_provider_range_is_rejected() {
+        let call = WireCall::new(
+            IFACE_SYSTEM,
+            "SetVolume",
+            vec![
+                WireValue::String("endpoint".to_owned()),
+                WireValue::String("sink".to_owned()),
+                WireValue::U32(7),
+                WireValue::U32(151),
+                WireValue::U64(5),
+                WireValue::U64(3),
+                WireValue::U64(9),
+            ],
+        );
+        assert_eq!(
+            decode_call(&call).expect_err("out of range").code,
+            ErrorCode::InvalidArgument
         );
     }
 }

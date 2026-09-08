@@ -29,3 +29,7 @@ pub use ids::{
 };
 
 pub use panels::PanelEdge;
+pub use system::{
+    AudioEndpointKind, AudioEndpointSnapshot, AudioMuteAction, AudioSnapshot, AudioStreamSnapshot,
+    AudioTarget, AudioVolumeAction, NetworkSecretRequestSnapshot,
+};

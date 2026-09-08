@@ -7,15 +7,18 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
+use flamewm_api::applications::{ApplicationLaunchOptions, DesktopApplication};
 use flamewm_api::display::DisplaySnapshot;
 use flamewm_api::panels::PanelsSnapshot;
 use flamewm_api::ports::EnginePorts;
 use flamewm_api::session::{SessionAction, SessionCapabilities};
 use flamewm_api::settings::{SettingsSnapshot, SettingsTransaction};
 use flamewm_api::shortcuts::{KeyBinding, ShortcutSnapshot};
+use flamewm_api::system::{SystemAction, SystemSnapshot};
+use flamewm_api::window::WindowSnapshot;
 use flamewm_api::workspace::WorkspaceSnapshot;
 use flamewm_api::{
-    DesktopAppId, ErrorCode, FlameError, ModeId, OutputId, PanelEdge, TransactionId,
+    DesktopAppId, ErrorCode, FlameError, ModeId, OutputId, PanelEdge, TransactionId, WindowRef,
 };
 use flamewm_platform::host::PlatformHost;
 
@@ -28,6 +31,9 @@ pub const IFACE_DISPLAYS: &str = "com.arkflame.FlameWM1.Displays";
 pub const IFACE_SHORTCUTS: &str = "com.arkflame.FlameWM1.Shortcuts";
 pub const IFACE_PANELS: &str = "com.arkflame.FlameWM1.Panels";
 pub const IFACE_SESSION: &str = "com.arkflame.FlameWM1.Session";
+pub const IFACE_WINDOWS: &str = "com.arkflame.FlameWM1.Windows";
+pub const IFACE_APPLICATIONS: &str = "com.arkflame.FlameWM1.Applications";
+pub const IFACE_SYSTEM: &str = "com.arkflame.FlameWM1.System";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
@@ -67,7 +73,7 @@ impl fmt::Display for Version {
 
 #[must_use]
 pub const fn current_version() -> Version {
-    Version::new(0, 1, 3)
+    Version::new(0, 1, 4)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +81,16 @@ pub enum ControlRequest {
     Ping,
     GetVersion,
     GetCapabilities,
+    GetWindows,
+    GetApplications,
+    LaunchApplication {
+        app: DesktopAppId,
+        options: ApplicationLaunchOptions,
+    },
+    ActivateWindow(WindowRef),
+    MinimizeWindow(WindowRef),
+    RestoreWindow(WindowRef),
+    CloseWindow(WindowRef),
     GetSettings,
     ApplySettings(SettingsTransaction),
     GetWorkspaces,
@@ -152,6 +168,11 @@ pub enum ControlRequest {
     },
     GetSessionCapabilities,
     SessionAction(SessionAction),
+    GetSystem,
+    SystemAction {
+        action: SystemAction,
+        expected_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +180,8 @@ pub enum ControlResponse {
     Pong,
     Version(Version),
     Capabilities(Vec<String>),
+    Windows(Vec<WindowSnapshot>),
+    Applications(Vec<DesktopApplication>),
     Settings(SettingsSnapshot),
     Workspaces(WorkspaceSnapshot),
     Displays(DisplaySnapshot),
@@ -167,6 +190,7 @@ pub enum ControlResponse {
     Panels(PanelsSnapshot),
     SessionCapabilities(SessionCapabilities),
     Changed(bool),
+    System(SystemSnapshot),
     Unit,
 }
 
@@ -223,6 +247,33 @@ impl Dispatcher {
             ControlRequest::GetVersion => ControlResponse::Version(current_version()),
             ControlRequest::GetCapabilities => {
                 ControlResponse::Capabilities(host.capabilities().items().to_vec())
+            }
+            ControlRequest::GetWindows => {
+                host.refresh_windows()?;
+                ControlResponse::Windows(host.engine().snapshot()?)
+            }
+            ControlRequest::GetApplications => {
+                ControlResponse::Applications(host.search_applications(""))
+            }
+            ControlRequest::LaunchApplication { app, options } => {
+                host.launch_application(&app, &options)?;
+                ControlResponse::Unit
+            }
+            ControlRequest::ActivateWindow(window) => {
+                host.activate_window(window)?;
+                ControlResponse::Unit
+            }
+            ControlRequest::MinimizeWindow(window) => {
+                host.minimize_window(window)?;
+                ControlResponse::Unit
+            }
+            ControlRequest::RestoreWindow(window) => {
+                host.restore_window(window)?;
+                ControlResponse::Unit
+            }
+            ControlRequest::CloseWindow(window) => {
+                host.close_window(window)?;
+                ControlResponse::Unit
             }
             ControlRequest::GetSettings => ControlResponse::Settings(host.settings_snapshot()),
             ControlRequest::ApplySettings(transaction) => {
@@ -352,6 +403,14 @@ impl Dispatcher {
                 host.session_action(action)?;
                 ControlResponse::Unit
             }
+            ControlRequest::GetSystem => ControlResponse::System(host.system_snapshot().clone()),
+            ControlRequest::SystemAction {
+                action,
+                expected_revision,
+            } => {
+                host.system_action(action, expected_revision)?;
+                ControlResponse::Unit
+            }
         };
         Ok(response)
     }
@@ -363,7 +422,7 @@ mod tests {
 
     #[test]
     fn version_parser_rejects_noncanonical_and_accepts_current() {
-        assert_eq!(Version::parse("0.1.3"), Some(current_version()));
+        assert_eq!(Version::parse("0.1.4"), Some(current_version()));
         assert_eq!(Version::parse("00.0.3"), None);
     }
 

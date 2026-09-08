@@ -29,6 +29,59 @@ pub mod launcher {
     pub use super::launch_argv;
 }
 
+impl DesktopEntry {
+    pub fn from_file(path: &Path) -> FlameResult<Option<Self>> {
+        let file_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .ok_or_else(|| FlameError::invalid("desktop entry path has no file name"))?;
+        Self::from_file_with_id(path, DesktopAppId::new(file_name))
+    }
+
+    pub fn from_file_with_id(path: &Path, id: DesktopAppId) -> FlameResult<Option<Self>> {
+        parse_desktop_entry(path, id)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &DesktopAppId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn application(&self) -> &DesktopApplication {
+        &self.application
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.application.name
+    }
+
+    #[must_use]
+    pub fn icon(&self) -> &str {
+        &self.application.icon_name
+    }
+
+    #[must_use]
+    pub fn exec(&self) -> &str {
+        &self.exec
+    }
+
+    pub fn argv(&self, options: &ApplicationLaunchOptions) -> FlameResult<Vec<String>> {
+        expand_exec_with_path(&self.exec, &self.application, &self.path, options)
+    }
+
+    pub fn launch(&self, options: &ApplicationLaunchOptions) -> FlameResult<Child> {
+        let argv = self.argv(options)?;
+        launch_argv(&argv, &ApplicationLaunchOptions::default())
+    }
+}
+
 impl ApplicationCatalog {
     pub fn discover() -> FlameResult<Self> {
         Self::from_dirs(&xdg_application_dirs())
@@ -479,5 +532,105 @@ mod tests {
                 "--extra"
             ]
         );
+    }
+
+    fn write_entry(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn from_file_exposes_name_icon_exec() {
+        let root = fixture();
+        let path = write_entry(
+            &root,
+            "entry.desktop",
+            "[Desktop Entry]\nType=Application\nName=Entry Name\nIcon=entry-icon\nExec=myapp --flag\n",
+        );
+        let entry = DesktopEntry::from_file(&path).unwrap().unwrap();
+        assert_eq!(entry.name(), "Entry Name");
+        assert_eq!(entry.icon(), "entry-icon");
+        assert_eq!(entry.exec(), "myapp --flag");
+        assert_eq!(entry.application().name, "Entry Name");
+        assert_eq!(entry.path(), path.as_path());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn from_file_absolute_icon_path() {
+        let root = fixture();
+        let path = write_entry(
+            &root,
+            "absolute.desktop",
+            "[Desktop Entry]\nType=Application\nName=Absolute\nIcon=/usr/share/icons/absolute.png\nExec=myapp\n",
+        );
+        let entry = DesktopEntry::from_file(&path).unwrap().unwrap();
+        assert_eq!(entry.icon(), "/usr/share/icons/absolute.png");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn from_file_icon_name() {
+        let root = fixture();
+        let path = write_entry(
+            &root,
+            "named.desktop",
+            "[Desktop Entry]\nType=Application\nName=Named\nIcon=text-editor\nExec=myapp\n",
+        );
+        let entry = DesktopEntry::from_file(&path).unwrap().unwrap();
+        assert_eq!(entry.icon(), "text-editor");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn from_file_expands_field_codes() {
+        let root = fixture();
+        let path = write_entry(
+            &root,
+            "codes.desktop",
+            "[Desktop Entry]\nType=Application\nName=Field Codes\nIcon=icon\nExec=myapp %c %k %f\n",
+        );
+        let entry = DesktopEntry::from_file(&path).unwrap().unwrap();
+        let options = ApplicationLaunchOptions {
+            extra_args: Vec::new(),
+            uris: vec!["file:///tmp/input".into()],
+        };
+        let argv = entry.argv(&options).unwrap();
+        let desktop = path.to_string_lossy().into_owned();
+        assert_eq!(
+            argv,
+            vec![
+                "myapp".to_owned(),
+                "Field Codes".to_owned(),
+                desktop,
+                "file:///tmp/input".to_owned(),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn from_file_missing_exec_is_none() {
+        let root = fixture();
+        let path = write_entry(
+            &root,
+            "noexec.desktop",
+            "[Desktop Entry]\nType=Application\nName=No Exec\nIcon=icon\n",
+        );
+        assert!(DesktopEntry::from_file(&path).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn from_file_hidden_is_none() {
+        let root = fixture();
+        let path = write_entry(
+            &root,
+            "hidden-entry.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hidden Entry\nHidden=true\nExec=myapp\n",
+        );
+        assert!(DesktopEntry::from_file(&path).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }

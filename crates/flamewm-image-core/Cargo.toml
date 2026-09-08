@@ -1,0 +1,13 @@
+[package]
+name = "flamewm-image-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+resvg = { version = "=0.48.1", default-features = false, features = ["raster-images"] }
+
+[lints]
+workspace = true

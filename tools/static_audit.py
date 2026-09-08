@@ -33,7 +33,8 @@ required = [
     "ui/shell/flamewm.css",
     "crates/flamewm-wm/Cargo.toml",
     "crates/flamewm-wm/src/main.rs",
-    "crates/flamewm-wm/src/wm.rs",
+    "crates/flamewm-wm-x11/Cargo.toml",
+    "crates/flamewm-wm-x11/src/wm.rs",
     "crates/flamewm-shell/Cargo.toml",
     "crates/flamewm-shell/build.rs",
     "crates/flamewm-shell/src/main.rs",
@@ -52,8 +53,8 @@ for path in required:
     require(path)
 
 version = read_required("FLAMEWM_VERSION").strip()
-if version != "0.0.4":
-    errors.append(f"project version must be 0.0.4, got {version!r}")
+if version != "0.0.7":
+    errors.append(f"project version must be 0.0.7, got {version!r}")
 
 root_manifest = ROOT / "Cargo.toml"
 try:
@@ -63,8 +64,8 @@ except Exception as exc:
     root_cargo = {}
 workspace = root_cargo.get("workspace", {})
 package = workspace.get("package", {})
-if package.get("version") != "0.0.4":
-    errors.append("workspace.package.version must be 0.0.4")
+if package.get("version") != "0.0.7":
+    errors.append("workspace.package.version must be 0.0.7")
 if package.get("rust-version") != "1.85":
     errors.append("workspace.package.rust-version must be 1.85")
 if workspace.get("members") != ["crates/*"]:
@@ -184,15 +185,44 @@ for required_id in ["taskbar", "start-menu", "desktop-menu", "settings-window"]:
         errors.append(f"web prototype port missing required UI node: {required_id}")
 
 shell = read_required("crates/flamewm-shell/src/main.rs")
+shell_runtime = read_required("crates/flamewm-shell/src/runtime.rs")
+shell_build = read_required("crates/flamewm-shell/build.rs")
 shell_manifest = read_required("crates/flamewm-shell/Cargo.toml")
 if not re.search(r'(?im)^\s*name\s*=\s*["\']flamewm-shell["\']\s*$', shell_manifest):
     errors.append("canonical shell manifest must declare package flamewm-shell")
-for contract in [
-    'include_bytes!(concat!(env!("OUT_DIR"), "/flamewm-shell.rwr"))',
-    "X11WindowRole::Desktop",
+shell_artifacts = [
+    ("flamewm-panel.rwr", "panel.html"),
+    ("flamewm-start.rwr", "start.html"),
+    ("flamewm-start-submenu.rwr", "start-apps.html"),
+    ("flamewm-task-menu.rwr", "task-menu.html"),
+    ("flamewm-media.rwr", "media.html"),
+    ("flamewm-audio.rwr", "audio.html"),
+    ("flamewm-network.rwr", "network.html"),
+    ("flamewm-calendar.rwr", "calendar.html"),
+]
+for artifact, source in shell_artifacts:
+    if f'(\"{artifact}\", \"{source}\")' not in shell_build:
+        errors.append(f"shell build must declare separate artifact {artifact} from {source}")
+    if f'\"/{artifact}\"' not in shell_runtime:
+        errors.append(f"shell runtime must include separate artifact {artifact}")
+for path, text in [
+    ("crates/flamewm-shell/build.rs", shell_build),
+    ("crates/flamewm-shell/src/main.rs", shell),
+    ("crates/flamewm-shell/src/runtime.rs", shell_runtime),
 ]:
-    if contract not in shell:
-        errors.append(f"web shell missing contract: {contract}")
+    if "flamewm-shell.rwr" in text:
+        errors.append(f"combined shell artifact is forbidden: {path}")
+if "SurfaceRuntime::new" not in shell:
+    errors.append("shell must create surfaces through SurfaceRuntime")
+for role in ["SurfaceRole::Dock", "SurfaceRole::PopupMenu", "SurfaceRole::DropdownMenu"]:
+    if role not in shell_runtime:
+        errors.append(f"shell runtime missing surface role: {role}")
+
+desktop = read_required("crates/flamewm-desktop/src/main.rs")
+if "flamewm_ui_x11" not in desktop or "UiWindowRole::Desktop" not in desktop:
+    errors.append("desktop must use the flamewm-ui-x11 desktop boundary")
+if "X11WindowRole::Desktop" in desktop:
+    errors.append("desktop must not use raw X11WindowRole::Desktop")
 for contract in ["https://wm.arkflame.com"]:
     if contract not in html:
         errors.append(f"canonical shell UI missing contract: {contract}")
@@ -205,10 +235,17 @@ for base in [ROOT / "crates", ROOT / "scripts", ROOT / "tools"]:
         if stale_shell_name in p.read_text(errors="ignore"):
             errors.append(f"stale renamed shell reference in active source: {p.relative_to(ROOT)}")
 
-wm = read_required("crates/flamewm-wm/src/wm.rs")
-for contract in ["SUBSTRUCTURE_REDIRECT", "change_save_set", "reparent_window", "net_current_desktop", "snap_geometry"]:
-    if contract not in wm:
-        errors.append(f"native WM missing core contract: {contract}")
+wm_x11_path = "crates/flamewm-wm-x11/src/wm.rs"
+wm_x11 = read_required(wm_x11_path)
+for contract, anchor in {
+    "SUBSTRUCTURE_REDIRECT": "EventMask::SUBSTRUCTURE_REDIRECT",
+    "change_save_set": ".change_save_set(",
+    "reparent_window": ".reparent_window(",
+    "net_current_desktop": "self.atoms.net_current_desktop",
+    "snap_geometry": "core_snap_geometry(",
+}.items():
+    if anchor not in wm_x11:
+        errors.append(f"native X11 WM missing core contract: {contract} ({wm_x11_path})")
 
 # No font binaries in active distributable paths. Runtime extraction belongs to ignored target/ only.
 for p in ROOT.rglob("*"):
@@ -229,4 +266,81 @@ if errors:
         print(f"ERROR {error}", file=sys.stderr)
     raise SystemExit(1)
 
-print("OK FlameWM Rust WebRender 0.0.4 static audit")
+print("OK FlameWM Rust WebRender 0.0.7 static audit")
+
+# --- v62 framework-closure guards (G01-G10) ---
+_compiled_templates = [
+    "ui/shell/panel.html",
+    "ui/shell/start.html",
+    "ui/shell/start-apps.html",
+    "ui/shell/task-menu.html",
+    "ui/shell/media.html",
+    "ui/shell/audio.html",
+    "ui/shell/network.html",
+    "ui/shell/calendar.html",
+]
+_known_keyed_ppms = {
+    "task-start.ppm", "tray-volume.ppm", "tray-volume-muted.ppm", "tray-wifi.ppm",
+    "tray-play.ppm", "tray-pause.ppm", "popup-volume.ppm", "popup-muted.ppm",
+    "media-play.ppm", "media-pause.ppm", "media-prev.ppm", "media-next.ppm",
+    "title-close.ppm", "title-maximize.ppm", "title-minimize.ppm", "title-restore.ppm",
+}
+# G01: compiled shell templates must not reference legacy keyed-magenta PPM roles.
+for template in _compiled_templates:
+    text = read_required(template)
+    for ref in re.findall(r'assets/([A-Za-z0-9_./-]+\.ppm)', text):
+        base = ref.rsplit("/", 1)[-1]
+        if base in _known_keyed_ppms:
+            errors.append(f"keyed-magenta PPM in active template {template}: {ref} (G01)")
+# G02: no generic magenta-key comparison in production renderer (tests excluded).
+for p in active_files(ROOT / "crates"):
+    if p.suffix != ".rs" or "/tests" in p.as_posix() or p.name.endswith("_test.rs"):
+        continue
+    if "cfg(test)" in p.read_text(errors="ignore") and "mod tests" in p.read_text(errors="ignore"):
+        pass
+    text = p.read_text(errors="ignore")
+    text_nt = re.sub(r"#\[cfg\(test\)\].*?\nmod tests \{.*?\n\}\n", "", text, flags=re.S)
+    if re.search(r"(?i)(magenta.{0,40}key|key.{0,20}magenta|chroma.?key|color.?key.{0,20}transparent|transparent.{0,20}color.?key)", text_nt):
+        if "no magenta" not in text_nt.lower() and "no color-key" not in text_nt.lower():
+            errors.append(f"magenta-key heuristic in production renderer: {p.relative_to(ROOT)} (G02)")
+# G03: shell must not import raw Pulse/NetworkManager provider APIs.
+_shell_text = (read_required("crates/flamewm-shell/src/main.rs") + read_required("crates/flamewm-shell/src/runtime.rs"))
+if re.search(r"use flamewm_integrations_linux::(pulse|network_manager)|use flamewm_platform::system::Pulse|NetworkManagerClient", _shell_text):
+    errors.append("shell imports raw provider API; must use typed SystemAction only (G03)")
+# G04: feature crates must not call XShape/XRender/Xcursor directly.
+for crate in ["crates/flamewm-shell", "crates/flamewm-desktop", "crates/flamewm-settings",
+              "crates/flamewm-platform", "crates/flamewm-api", "crates/flamewm-shell-core",
+              "crates/flamewm-desktop-core"]:
+    base = ROOT / crate
+    if not base.exists():
+        continue
+    for p in active_files(base):
+        if p.suffix != ".rs":
+            continue
+        if re.search(r"\b(XRender|XShape|Xcursor|Xft|XRenderComposite|XShapeCombine)\b", p.read_text(errors="ignore")):
+            errors.append(f"feature crate calls native renderer API: {p.relative_to(ROOT)} (G04)")
+# G05: wm-x11 must not use core image_text8 title path after C14 migration.
+_wm_chrome = read_required("crates/flamewm-wm-x11/src/chrome.rs") + read_required("crates/flamewm-wm-x11/src/wm.rs")
+if re.search(r"image_text8|XDrawString|9x15|TITLE_CHAR_ADVANCE", _wm_chrome):
+    errors.append("wm-x11 still uses core image_text8 title path (G05)")
+# G06: wm-x11 must not hand-sync duplicate chrome color constants.
+if re.search(r"0x272a2d|0x46484b|0xe81123|TITLEBAR_BACKGROUND_RGB|CLOSE_HOVER_RGB", _wm_chrome):
+    errors.append("wm-x11 has hand-synced duplicate chrome color constants (G06)")
+# G07: ordinary active UI controls must not use cursor:pointer.
+_shell_css = read_required("ui/shell/flamewm.css")
+if "cursor:pointer" in _shell_css.replace(" ", ""):
+    errors.append("ordinary UI CSS uses cursor:pointer (G07)")
+# G08: no nmcli/pactl/wpctl subprocess control.
+for p in active_files(ROOT / "crates"):
+    if p.suffix != ".rs":
+        continue
+    if re.search(r'"(nmcli|pactl|wpctl)"|\bCommand::new\(\s*"(nmcli|pactl|wpctl)"', p.read_text(errors="ignore")):
+        errors.append(f"subprocess system control in {p.relative_to(ROOT)} (G08)")
+# G09: no fake KDE desktop identity.
+for base in [ROOT / "crates", ROOT / "scripts"]:
+    for p in active_files(base):
+        text = p.read_text(errors="ignore")
+        if re.search(r'XDG_CURRENT_DESKTOP["\']?\s*[,=]\s*["\']KDE["\']|set_var\(\s*"XDG_CURRENT_DESKTOP",\s*"KDE"\s*\)', text):
+            errors.append(f"fake KDE desktop identity in {p.relative_to(ROOT)} (G09)")
+# G10: architecture guard already rejects broad allow/unsafe suppression; static audit
+# additionally rejects magenta PPM content in compiled-template image roles.

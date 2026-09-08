@@ -1,20 +1,26 @@
+use std::process::Command;
+
 pub mod control;
 pub mod runtime;
 pub mod view;
 
 use flamewm_api::settings::SettingValue;
 use flamewm_control_core::ControlError;
-use flamewm_render_core::RuntimeDocument;
-use flamewm_render_x11::{ActionEvent, ActionPhase, X11Config, X11WindowRole};
 use flamewm_settings_core::{ControlTransport, SettingsClient, SettingsPage};
+use flamewm_ui_x11::{UiActionEvent, UiActionPhase, UiDocumentAccess, UiWindowConfig};
+
+const DONATE_URI: &str = "https://paypal.me/LinsaFTW";
+const SOURCE_URI: &str = "https://github.com/ArkFlame/flamewm";
+const WEBSITE_URI: &str = "https://wm.arkflame.com";
 
 #[must_use]
-pub fn normal_window_config(width: u32, height: u32) -> X11Config {
-    X11Config {
+pub fn normal_window_config(width: u32, height: u32) -> UiWindowConfig {
+    UiWindowConfig {
         width,
         height,
+        x: 0,
+        y: 0,
         title: "System Settings".to_owned(),
-        role: X11WindowRole::Normal,
     }
 }
 
@@ -36,17 +42,17 @@ impl<T: ControlTransport> SettingsApplication<T> {
         &mut self.client
     }
 
-    pub fn refresh(&mut self, document: &mut RuntimeDocument) -> Result<(), String> {
+    pub fn refresh(&mut self, document: &mut impl UiDocumentAccess) -> Result<(), String> {
         self.client.refresh_all().map_err(control_error)?;
         self.sync(document)
     }
 
     pub fn handle_action(
         &mut self,
-        event: &ActionEvent,
-        document: &mut RuntimeDocument,
+        event: &UiActionEvent,
+        document: &mut impl UiDocumentAccess,
     ) -> Result<(), String> {
-        if event.phase != ActionPhase::Release || !event.inside {
+        if event.phase != UiActionPhase::Release || !event.inside {
             return Ok(());
         }
         let action = event.action.as_str();
@@ -95,11 +101,13 @@ impl<T: ControlTransport> SettingsApplication<T> {
             self.client
                 .set_shell_scale(percent)
                 .map_err(control_error)?;
+        } else if let Some(uri) = about_uri(action) {
+            open_uri(uri)?;
         }
         self.sync(document)
     }
 
-    fn sync(&self, document: &mut RuntimeDocument) -> Result<(), String> {
+    fn sync(&self, document: &mut impl UiDocumentAccess) -> Result<(), String> {
         for (name, page) in [
             ("appearance", SettingsPage::Appearance),
             ("desktop", SettingsPage::Desktop),
@@ -109,7 +117,7 @@ impl<T: ControlTransport> SettingsApplication<T> {
             ("hotkeys", SettingsPage::Hotkeys),
             ("about", SettingsPage::About),
         ] {
-            document.set_visible(&format!("page-{name}"), self.client.ui().page == page)?;
+            document.visible(&format!("page-{name}"), self.client.ui().page == page)?;
         }
         for slot in 0..4 {
             let id = format!("display-output-{slot}");
@@ -118,11 +126,11 @@ impl<T: ControlTransport> SettingsApplication<T> {
                 .displays()
                 .and_then(|snapshot| snapshot.outputs.get(slot))
             else {
-                document.set_visible(&id, false)?;
+                document.visible(&id, false)?;
                 continue;
             };
-            document.set_visible(&id, true)?;
-            document.set_text(
+            document.visible(&id, true)?;
+            document.text(
                 &format!("display-output-name-{slot}"),
                 output.connector.clone(),
             )?;
@@ -131,7 +139,7 @@ impl<T: ControlTransport> SettingsApplication<T> {
                 .iter()
                 .find(|mode| mode.id == output.current_mode)
                 .map_or(output.geometry.size(), |mode| mode.resolution);
-            document.set_text(
+            document.text(
                 &format!("display-output-size-{slot}"),
                 format!(
                     "{} x {}  |  {}%",
@@ -139,15 +147,15 @@ impl<T: ControlTransport> SettingsApplication<T> {
                 ),
             )?;
             let selected = self.client.ui().selected_output.as_ref() == Some(&output.id);
-            document.set_visible(&format!("display-output-selected-{slot}"), selected)?;
-            document.set_visible(&format!("display-output-unselected-{slot}"), !selected)?;
+            document.visible(&format!("display-output-selected-{slot}"), selected)?;
+            document.visible(&format!("display-output-unselected-{slot}"), !selected)?;
         }
         if let Some(output) = self.client.ui().selected_output.as_ref().and_then(|id| {
             self.client
                 .displays()
                 .and_then(|snapshot| snapshot.outputs.iter().find(|output| &output.id == id))
         }) {
-            document.set_text(
+            document.text(
                 "display-selected-title",
                 format!("Selected: {}", output.connector),
             )?;
@@ -156,11 +164,11 @@ impl<T: ControlTransport> SettingsApplication<T> {
                 .iter()
                 .find(|mode| mode.id == output.current_mode)
                 .map_or(output.geometry.size(), |mode| mode.resolution);
-            document.set_text(
+            document.text(
                 "display-selected-resolution",
                 format!("{} x {}", resolution.width, resolution.height),
             )?;
-            document.set_text(
+            document.text(
                 "display-selected-scale",
                 format!("{}%", output.shell_scale_percent),
             )?;
@@ -181,8 +189,8 @@ impl<T: ControlTransport> SettingsApplication<T> {
                     SettingValue::Boolean(value) => Some(*value),
                     _ => None,
                 });
-            document.set_visible(on_id, enabled == Some(true))?;
-            document.set_visible(off_id, enabled == Some(false))?;
+            document.visible(on_id, enabled == Some(true))?;
+            document.visible(off_id, enabled == Some(false))?;
         }
         Ok(())
     }
@@ -203,4 +211,21 @@ fn page(value: &str) -> Option<SettingsPage> {
 
 fn control_error(error: ControlError) -> String {
     format!("{}: {}", error.name, error.message)
+}
+
+fn about_uri(action: &str) -> Option<&'static str> {
+    match action {
+        "about.donate" => Some(DONATE_URI),
+        "about.source" => Some(SOURCE_URI),
+        "about.website" => Some(WEBSITE_URI),
+        _ => None,
+    }
+}
+
+fn open_uri(uri: &str) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to open {uri}: {error}"))
 }

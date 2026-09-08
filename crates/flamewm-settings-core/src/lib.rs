@@ -5,7 +5,9 @@
 
 use flamewm_api::display::DisplaySnapshot;
 use flamewm_api::panels::PanelsSnapshot;
-use flamewm_api::settings::{SettingValue, SettingsChange, SettingsSnapshot, SettingsTransaction};
+use flamewm_api::settings::{
+    AppearanceMode, SettingValue, SettingsChange, SettingsSnapshot, SettingsTransaction,
+};
 use flamewm_api::shortcuts::ShortcutSnapshot;
 use flamewm_api::{ModeId, OutputId, PanelEdge, TransactionId};
 use flamewm_control_core::{ControlError, ControlRequest, ControlResponse};
@@ -275,6 +277,7 @@ impl<T: ControlTransport> SettingsClient<T> {
         &mut self,
         accent: impl Into<String>,
         icon_theme: impl Into<String>,
+        appearance: AppearanceMode,
     ) -> Result<(), ControlError> {
         self.apply_changes(vec![
             SettingsChange {
@@ -284,6 +287,10 @@ impl<T: ControlTransport> SettingsClient<T> {
             SettingsChange {
                 key: "iconTheme".to_owned(),
                 value: Some(SettingValue::Text(icon_theme.into())),
+            },
+            SettingsChange {
+                key: "appearance".to_owned(),
+                value: Some(SettingValue::Text(appearance.as_str().to_owned())),
             },
         ])
     }

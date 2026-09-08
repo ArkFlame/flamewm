@@ -1,0 +1,13 @@
+[package]
+name = "flamewm-skin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Renderer-neutral FlameWM visual skin tokens and recipes"
+
+[dependencies]
+
+[lints]
+workspace = true

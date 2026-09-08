@@ -8,6 +8,7 @@ use flamewm_api::ports::EnginePorts;
 use flamewm_api::session::{SessionAction, SessionCapabilities};
 use flamewm_api::settings::{SettingsSnapshot, SettingsTransaction};
 use flamewm_api::shortcuts::{KeyBinding, ShortcutSnapshot};
+use flamewm_api::system::{SystemAction, SystemSnapshot};
 use flamewm_api::wm_features::{
     FeatureAction, FullscreenMonitorSpan, InteractiveMoveResize, RestackMode, WindowFeature,
     WindowFeatureSnapshot,
@@ -26,7 +27,7 @@ use crate::services::settings::SettingsService;
 use crate::services::shortcuts::ShortcutService;
 use crate::services::windows::WindowService;
 use crate::services::workspaces::{NavigationDirection, WorkspaceService};
-use crate::system::SystemService;
+use crate::system::{SystemActionHandler, SystemService};
 
 /// Process composition root for FlameWM product state.
 ///
@@ -111,6 +112,22 @@ impl<E: EnginePorts> PlatformHost<E> {
             let _ = self.panels.reconcile_windows(self.windows.cached());
         }
         Ok(changed)
+    }
+
+    pub fn activate_window(&mut self, window: WindowRef) -> FlameResult<()> {
+        self.windows.activate(&mut self.engine, window)
+    }
+
+    pub fn minimize_window(&mut self, window: WindowRef) -> FlameResult<()> {
+        self.windows.minimize(&mut self.engine, window)
+    }
+
+    pub fn restore_window(&mut self, window: WindowRef) -> FlameResult<()> {
+        self.windows.restore(&mut self.engine, window)
+    }
+
+    pub fn close_window(&mut self, window: WindowRef) -> FlameResult<()> {
+        self.windows.close(&mut self.engine, window)
     }
 
     pub fn workspace_snapshot(&self) -> FlameResult<WorkspaceSnapshot> {
@@ -376,6 +393,23 @@ impl<E: EnginePorts> PlatformHost<E> {
 
     pub fn session_action(&mut self, action: SessionAction) -> FlameResult<()> {
         self.session.perform(&mut self.engine, action)
+    }
+
+    #[must_use]
+    pub fn system_snapshot(&self) -> SystemSnapshot {
+        self.system.snapshot().clone()
+    }
+
+    pub fn set_system_action_handler(&mut self, handler: SystemActionHandler) {
+        self.system.set_action_handler(handler);
+    }
+
+    pub fn system_action(
+        &mut self,
+        action: SystemAction,
+        expected_revision: u64,
+    ) -> FlameResult<()> {
+        self.system.perform_action(action, expected_revision)
     }
 
     #[must_use]

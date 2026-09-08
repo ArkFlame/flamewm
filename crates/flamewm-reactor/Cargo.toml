@@ -9,5 +9,5 @@ repository.workspace = true
 [dependencies]
 calloop.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"

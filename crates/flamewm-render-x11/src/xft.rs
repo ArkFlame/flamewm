@@ -2,17 +2,15 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::ffi::{CStr, CString};
-use std::mem;
-use std::os::raw::{c_char, c_int, c_uchar, c_ulong, c_void};
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int, c_uchar, c_ulong};
 use std::path::Path;
 use std::ptr;
 
 use flamewm_render_core::Color;
 
+use crate::ffi::dynamic_library::DynamicLibrary;
 use crate::xlib::{Colormap, Display, Drawable, Visual};
-
-const RTLD_NOW: c_int = 2;
 
 #[repr(C)]
 struct XftDraw {
@@ -92,55 +90,6 @@ struct FontconfigApi {
     config_build_fonts: FcConfigBuildFontsFn,
 }
 
-struct DynamicLibrary {
-    handle: *mut c_void,
-}
-
-impl DynamicLibrary {
-    unsafe fn open(names: &[&str]) -> Result<Self, String> {
-        for name in names {
-            let c_name = CString::new(*name).expect("library name is static and NUL-free");
-            let handle = dlopen(c_name.as_ptr(), RTLD_NOW);
-            if !handle.is_null() {
-                return Ok(Self { handle });
-            }
-        }
-        Err(format!("unable to load any of: {}", names.join(", ")))
-    }
-
-    unsafe fn symbol<T: Copy>(&self, name: &'static [u8]) -> Result<T, String> {
-        debug_assert_eq!(name.last().copied(), Some(0));
-        dlerror();
-        let raw = dlsym(self.handle, name.as_ptr() as *const c_char);
-        let error = dlerror();
-        if raw.is_null() || !error.is_null() {
-            let message = if error.is_null() {
-                "symbol resolved to NULL".to_string()
-            } else {
-                CStr::from_ptr(error).to_string_lossy().into_owned()
-            };
-            return Err(format!(
-                "{}: {message}",
-                String::from_utf8_lossy(&name[..name.len() - 1])
-            ));
-        }
-        if mem::size_of::<T>() != mem::size_of::<*mut c_void>() {
-            return Err("dynamic function pointer has unexpected size".to_string());
-        }
-        Ok(mem::transmute_copy(&raw))
-    }
-}
-
-impl Drop for DynamicLibrary {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.handle.is_null() {
-                dlclose(self.handle);
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct FontKey {
     pixels: u16,
@@ -162,6 +111,10 @@ pub struct XftBackend {
 }
 
 impl XftBackend {
+    /// # Safety
+    ///
+    /// `display` must be a live Xlib display, `drawable`/`visual`/`colormap`
+    /// valid for that display, and `self` must retain the loaded Xft symbols.
     pub unsafe fn new(
         display: *mut Display,
         screen: c_int,
@@ -170,15 +123,17 @@ impl XftBackend {
         colormap: Colormap,
     ) -> Result<Self, String> {
         let xft_library = DynamicLibrary::open(&["libXft.so.2", "libXft.so"])?;
+        // SAFETY: each name is a static NUL-terminated symbol and `T` is the exact
+        // function-pointer type declared in `XftApi`, matching the C ABI.
         let api = XftApi {
-            draw_create: xft_library.symbol(b"XftDrawCreate\0")?,
-            draw_destroy: xft_library.symbol(b"XftDrawDestroy\0")?,
-            draw_change: xft_library.symbol(b"XftDrawChange\0")?,
-            draw_string_utf8: xft_library.symbol(b"XftDrawStringUtf8\0")?,
-            font_open_name: xft_library.symbol(b"XftFontOpenName\0")?,
-            font_close: xft_library.symbol(b"XftFontClose\0")?,
-            color_alloc_value: xft_library.symbol(b"XftColorAllocValue\0")?,
-            color_free: xft_library.symbol(b"XftColorFree\0")?,
+            draw_create: unsafe { xft_library.symbol(b"XftDrawCreate\0") }?,
+            draw_destroy: unsafe { xft_library.symbol(b"XftDrawDestroy\0") }?,
+            draw_change: unsafe { xft_library.symbol(b"XftDrawChange\0") }?,
+            draw_string_utf8: unsafe { xft_library.symbol(b"XftDrawStringUtf8\0") }?,
+            font_open_name: unsafe { xft_library.symbol(b"XftFontOpenName\0") }?,
+            font_close: unsafe { xft_library.symbol(b"XftFontClose\0") }?,
+            color_alloc_value: unsafe { xft_library.symbol(b"XftColorAllocValue\0") }?,
+            color_free: unsafe { xft_library.symbol(b"XftColorFree\0") }?,
         };
 
         let fontconfig_library = match DynamicLibrary::open(&[
@@ -186,12 +141,16 @@ impl XftBackend {
             "libfontconfig.so",
         ]) {
             Ok(library) => {
+                // SAFETY: same contract as above; targets are the `FontconfigApi` ABI types.
                 let fc = FontconfigApi {
-                    config_get_current: library.symbol(b"FcConfigGetCurrent\0")?,
-                    config_app_font_add_file: library.symbol(b"FcConfigAppFontAddFile\0")?,
-                    config_build_fonts: library.symbol(b"FcConfigBuildFonts\0")?,
+                    config_get_current: unsafe { library.symbol(b"FcConfigGetCurrent\0") }?,
+                    config_app_font_add_file: unsafe {
+                        library.symbol(b"FcConfigAppFontAddFile\0")
+                    }?,
+                    config_build_fonts: unsafe { library.symbol(b"FcConfigBuildFonts\0") }?,
                 };
-                register_application_fonts(fc)?;
+                // SAFETY: `fc` holds live fontconfig symbols; paths are validated inside.
+                unsafe { register_application_fonts(fc) }?;
                 Some(library)
             }
             Err(error) => {
@@ -202,7 +161,7 @@ impl XftBackend {
             }
         };
 
-        let draw = (api.draw_create)(display, drawable, visual, colormap);
+        let draw = unsafe { (api.draw_create)(display, drawable, visual, colormap) };
         if draw.is_null() {
             return Err("XftDrawCreate returned NULL".to_string());
         }
@@ -228,12 +187,15 @@ impl XftBackend {
 
         // Fail early only if *no* usable Xft font exists. IBM Plex Sans remains
         // the preferred face, with conservative system fallbacks for portability.
-        backend.font_for(13.0, 400)?;
+        // SAFETY: `display` is live per `new`'s contract; sentinels probe font availability.
+        unsafe { backend.font_for(13.0, 400) }?;
         Ok(backend)
     }
 
     pub unsafe fn set_drawable(&mut self, drawable: Drawable) {
-        (self.api.draw_change)(self.draw, drawable);
+        // SAFETY: `self.draw` is a live XftDraw and caller guarantees `drawable`
+        // is valid for `display` per this method's contract.
+        unsafe { (self.api.draw_change)(self.draw, drawable) };
     }
 
     pub unsafe fn set_preferred_family(&mut self, family: &str) {
@@ -242,7 +204,8 @@ impl XftBackend {
             return;
         }
         for (_, font) in self.fonts.drain() {
-            (self.api.font_close)(self.display, font);
+            // SAFETY: drained fonts were opened on `self.display` and owned here.
+            unsafe { (self.api.font_close)(self.display, font) };
         }
         self.preferred_family = family.to_string();
     }
@@ -259,19 +222,25 @@ impl XftBackend {
         if text.is_empty() {
             return Ok(());
         }
-        let font = self.font_for(size, weight)?;
-        let xft_color = self.color_for(color)?;
+        // SAFETY: `display` stays live for the backend lifetime; the color cache
+        // above holds only valid Xft allocations returned on this display.
+        let font = unsafe { self.font_for(size, weight) }?;
+        let xft_color = unsafe { self.color_for(color) }?;
         let bytes = text.as_bytes();
         let len = bytes.len().min(i32::MAX as usize) as c_int;
-        (self.api.draw_string_utf8)(
-            self.draw,
-            &xft_color,
-            font,
-            x.round() as c_int,
-            baseline_y.round() as c_int,
-            bytes.as_ptr(),
-            len,
-        );
+        // SAFETY: `self.draw`/`font` are live Xft handles, `xft_color` is a valid
+        // allocated color, and `bytes` outlives the call for `len` bytes.
+        unsafe {
+            (self.api.draw_string_utf8)(
+                self.draw,
+                &xft_color,
+                font,
+                x.round() as c_int,
+                baseline_y.round() as c_int,
+                bytes.as_ptr(),
+                len,
+            )
+        };
         Ok(())
     }
 
@@ -304,7 +273,10 @@ impl XftBackend {
             );
             let c_pattern =
                 CString::new(pattern).map_err(|_| "font pattern contains NUL".to_string())?;
-            let font = (self.api.font_open_name)(self.display, self.screen, c_pattern.as_ptr());
+            // SAFETY: `display` is live per `new`'s contract and `c_pattern` stays
+            // alive for the call; NULL return is handled by trying the next family.
+            let font =
+                unsafe { (self.api.font_open_name)(self.display, self.screen, c_pattern.as_ptr()) };
             if !font.is_null() {
                 self.fonts.insert(key, font);
                 return Ok(font);
@@ -327,13 +299,17 @@ impl XftBackend {
             pixel: 0,
             color: render,
         };
-        if (self.api.color_alloc_value)(
-            self.display,
-            self.visual,
-            self.colormap,
-            &render,
-            &mut allocated,
-        ) == 0
+        // SAFETY: `display`/`visual`/`colormap` are live per the backend contract;
+        // `render`/`allocated` are valid stack references for the duration of the call.
+        if unsafe {
+            (self.api.color_alloc_value)(
+                self.display,
+                self.visual,
+                self.colormap,
+                &render,
+                &mut allocated,
+            )
+        } == 0
         {
             return Err(format!(
                 "XftColorAllocValue failed for rgba({},{},{},{})",
@@ -347,6 +323,8 @@ impl XftBackend {
 
 impl Drop for XftBackend {
     fn drop(&mut self) {
+        // SAFETY: teardown only touches backend-owned Xft handles while `display`
+        // remains live; draining first guarantees each handle is freed once.
         unsafe {
             for (_, mut color) in self.colors.drain() {
                 (self.api.color_free)(self.display, self.visual, self.colormap, &mut color);
@@ -366,7 +344,8 @@ unsafe fn register_application_fonts(api: FontconfigApi) -> Result<(), String> {
     let Some(value) = env::var_os("FLAMEWM_RENDER_FONT_FILES") else {
         return Ok(());
     };
-    let config = (api.config_get_current)();
+    // SAFETY: the config pointer is returned by fontconfig itself; NULL is rejected above.
+    let config = unsafe { (api.config_get_current)() };
     if config.is_null() {
         return Err("FcConfigGetCurrent returned NULL".to_string());
     }
@@ -381,7 +360,10 @@ unsafe fn register_application_fonts(api: FontconfigApi) -> Result<(), String> {
         let bytes = path_bytes(&path)?;
         let c_path = CString::new(bytes)
             .map_err(|_| format!("font path contains NUL: {}", path.display()))?;
-        if (api.config_app_font_add_file)(config, c_path.as_ptr() as *const c_uchar) == 0 {
+        // SAFETY: `config` is non-NULL per the check above; `c_path` stays alive
+        // for the call. A zero return is handled as an error below.
+        if unsafe { (api.config_app_font_add_file)(config, c_path.as_ptr() as *const c_uchar) } == 0
+        {
             return Err(format!(
                 "FcConfigAppFontAddFile rejected {}",
                 path.display()
@@ -389,7 +371,8 @@ unsafe fn register_application_fonts(api: FontconfigApi) -> Result<(), String> {
         }
         added += 1;
     }
-    if added > 0 && (api.config_build_fonts)(config) == 0 {
+    // SAFETY: `config` is the non-NULL fontconfig handle checked above.
+    if added > 0 && unsafe { (api.config_build_fonts)(config) } == 0 {
         return Err("FcConfigBuildFonts failed after adding application fonts".to_string());
     }
     Ok(())
@@ -415,14 +398,6 @@ fn normalize_weight(weight: u16) -> u16 {
         551..=650 => 600,
         _ => 700,
     }
-}
-
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlerror() -> *const c_char;
 }
 
 #[cfg(test)]

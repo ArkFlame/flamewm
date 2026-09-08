@@ -34,9 +34,9 @@ pub struct BusWatch {
     pub events: FdEvents,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageDisposition {
     Handled,
+    Reply(Message),
     Unhandled,
 }
 
@@ -85,15 +85,40 @@ impl BusPump {
                 break;
             };
             visited += 1;
-            if handler(&message) == MessageDisposition::Unhandled {
-                if let Some(reply) = default_reply(&message) {
-                    self.channel.send(reply).map_err(|()| {
-                        FlameError::new(ErrorCode::IoFailure, "D-Bus default reply send failed")
-                    })?;
+            match handler(&message) {
+                MessageDisposition::Handled => {}
+                MessageDisposition::Reply(reply) => {
+                    self.send(reply)?;
+                }
+                MessageDisposition::Unhandled => {
+                    if let Some(reply) = default_reply(&message) {
+                        self.channel.send(reply).map_err(|()| {
+                            FlameError::new(ErrorCode::IoFailure, "D-Bus default reply send failed")
+                        })?;
+                    }
                 }
             }
         }
         Ok(visited)
+    }
+
+    /// Dispatch incoming method calls for one exported object path on this connection. Other
+    /// messages remain available to the general handler, so one pump owns both client and server I/O.
+    pub fn on_ready_with_object_path(
+        &self,
+        object_path: &str,
+        mut object_handler: impl FnMut(&Message) -> MessageDisposition,
+        mut handler: impl FnMut(&Message) -> MessageDisposition,
+    ) -> FlameResult<usize> {
+        self.on_ready(|message| {
+            if message.msg_type() == dbus::MessageType::MethodCall
+                && message.path().map(|path| path.to_string()) == Some(object_path.to_owned())
+            {
+                object_handler(message)
+            } else {
+                handler(message)
+            }
+        })
     }
 
     /// Queue an already-encoded D-Bus message. If libdbus cannot flush it immediately, `watch()`

@@ -26,12 +26,58 @@ pub enum PaintCommand {
         weight: u16,
         text: String,
     },
+    PushClip {
+        rect: Rect,
+    },
+    PopClip,
+    ScrollbarTrack {
+        rect: Rect,
+        horizontal: bool,
+    },
+    ScrollbarThumb {
+        rect: Rect,
+        horizontal: bool,
+    },
+}
+
+/// Viewport clip for a scrollable element: Some(rect) when either axis clips.
+pub fn scroll_clip(style: &Style, viewport: Rect) -> Option<Rect> {
+    let clips_x = matches!(
+        style.overflow_x,
+        Overflow::Hidden | Overflow::Auto | Overflow::Scroll
+    );
+    let clips_y = matches!(
+        style.overflow_y,
+        Overflow::Hidden | Overflow::Auto | Overflow::Scroll
+    );
+    (clips_x || clips_y).then_some(viewport)
+}
+
+/// Scrollbar visibility for one axis: Scroll forces track, Auto shows only
+/// when content overflows, Visible/Hidden never paint scrollbars.
+pub fn scrollbar_visible(mode: Overflow, viewport_len: f32, content_len: f32) -> bool {
+    match mode {
+        Overflow::Scroll => true,
+        Overflow::Auto => content_len > viewport_len,
+        Overflow::Visible | Overflow::Hidden => false,
+    }
 }
 
 pub fn build_paint_commands(
     document: &RuntimeDocument,
     layout: &LayoutResult,
     interaction: InteractionState,
+) -> Vec<PaintCommand> {
+    build_paint_commands_with_scroll(document, layout, interaction, &|_| ScrollState::default())
+}
+
+/// Same as [`build_paint_commands`] but offsets scrollable content by the
+/// retained per-node scroll state and emits clip + scrollbar commands.
+pub fn build_paint_commands_with_scroll(
+    document: &RuntimeDocument,
+    layout: &LayoutResult,
+    interaction: InteractionState,
+    scroll: &dyn Fn(u32) -> ScrollState,
 ) -> Vec<PaintCommand> {
     let mut commands = Vec::with_capacity(document.document.nodes.len() * 2);
     let mut indices: Vec<usize> = (0..document.document.nodes.len()).collect();
@@ -94,14 +140,147 @@ pub fn build_paint_commands(
                     }
                 }
             }
-            NodeKind::Element => {}
+            NodeKind::Element => {
+                emit_scroll_chrome(&mut commands, &style, layout, index as u32, scroll);
+            }
         }
     }
     commands
+}
+
+/// Emit PushClip/PopClip plus scrollbar track/thumb for a scrollable element.
+/// Offsets come from retained per-node state; metrics derive from layout only.
+pub fn emit_scroll_chrome(
+    commands: &mut Vec<PaintCommand>,
+    style: &Style,
+    layout: &LayoutResult,
+    index: u32,
+    scroll: &dyn Fn(u32) -> ScrollState,
+) {
+    use crate::layout::LayoutResult as LR;
+    let viewport = layout
+        .boxes
+        .get(index as usize)
+        .map(|b| b.rect)
+        .unwrap_or_default();
+    let content = layout.content_extent(index);
+    if scroll_clip(style, viewport).is_none() {
+        return;
+    }
+    let offset = scroll(index);
+    let metrics = LR::scroll_metrics(viewport, content, offset);
+    commands.push(PaintCommand::PushClip { rect: viewport });
+    if scrollbar_visible(style.overflow_x, viewport.width, content.width) {
+        let track = Rect {
+            x: viewport.x,
+            y: viewport.y + viewport.height - 8.0,
+            width: viewport.width,
+            height: 8.0,
+        };
+        commands.push(PaintCommand::ScrollbarTrack {
+            rect: track,
+            horizontal: true,
+        });
+        if metrics.thumb_x.width > 0.0 {
+            commands.push(PaintCommand::ScrollbarThumb {
+                rect: metrics.thumb_x,
+                horizontal: true,
+            });
+        }
+    }
+    if scrollbar_visible(style.overflow_y, viewport.height, content.height) {
+        let track = Rect {
+            x: viewport.x + viewport.width - 8.0,
+            y: viewport.y,
+            width: 8.0,
+            height: viewport.height,
+        };
+        commands.push(PaintCommand::ScrollbarTrack {
+            rect: track,
+            horizontal: false,
+        });
+        if metrics.thumb_y.height > 0.0 {
+            commands.push(PaintCommand::ScrollbarThumb {
+                rect: metrics.thumb_y,
+                horizontal: false,
+            });
+        }
+    }
+    commands.push(PaintCommand::PopClip);
 }
 
 fn apply_opacity(mut color: Color, opacity: f32) -> Color {
     let opacity = opacity.clamp(0.0, 1.0);
     color.a = ((color.a as f32) * opacity).round() as u8;
     color
+}
+
+/// Root background corner radius for the current interaction state. Top-level
+/// rounded popup/menu/dropdown surfaces derive their X Shape bounding mask
+/// from this radius plus the surface content bounds.
+pub fn root_corner_radius(document: &RuntimeDocument, interaction: InteractionState) -> f32 {
+    let root = document.document.root;
+    if document.document.nodes.get(root as usize).is_none() {
+        return 0.0;
+    }
+    document
+        .runtime_style(root, interaction)
+        .border_radius
+        .max(0.0)
+}
+
+/// Surface-shape pixels for an X Shape bounding mask: (width, height, radius)
+/// clamped so the radius never exceeds half the smallest side.
+pub fn surface_shape_pixels(width: u32, height: u32, radius: f32) -> (u32, u32, u32) {
+    let clamped = (radius.round().max(0.0) as u32)
+        .min(width / 2)
+        .min(height / 2);
+    (width.max(1), height.max(1), clamped)
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    fn rounded_doc(radius: f32) -> RuntimeDocument {
+        let mut style = Style::default();
+        style.background = ColorValue::Literal(Color::rgb(30, 30, 30));
+        style.border_radius = radius;
+        let node = CompiledNode {
+            kind: NodeKind::Element,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+            id: "root".to_string(),
+            action: String::new(),
+            text: String::new(),
+            image: None,
+            style,
+            hover_style: None,
+            active_style: None,
+        };
+        RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![node],
+        })
+        .expect("fixture validates")
+    }
+
+    #[test]
+    fn root_radius_flows_into_surface_shape() {
+        let doc = rounded_doc(9.0);
+        let radius = root_corner_radius(&doc, InteractionState::default());
+        assert_eq!(radius, 9.0);
+        assert_eq!(surface_shape_pixels(100, 60, radius), (100, 60, 9));
+    }
+
+    #[test]
+    fn surface_shape_clamps_radius_to_half_min_side() {
+        assert_eq!(surface_shape_pixels(8, 8, 99.0), (8, 8, 4));
+        assert_eq!(surface_shape_pixels(0, 0, 4.0), (1, 1, 0));
+        assert_eq!(surface_shape_pixels(10, 6, -3.0), (10, 6, 0));
+    }
 }

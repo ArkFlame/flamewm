@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)"
+cd "$ROOT"
+
+fail() {
+    printf 'ERROR release gate: %s\n' "$1" >&2
+    exit 1
+}
+
+printf '%s\n' 'RELEASE_GATE 0.0.7'
+printf '%s\n' 'GATE native checks: ./scripts/check'
+./scripts/check
+
+version="$(tr -d '[:space:]' < FLAMEWM_VERSION)"
+[[ "$version" == 0.0.7 ]] || fail "FLAMEWM_VERSION must be 0.0.7, got $version"
+grep -Fqx 'version = "0.0.7"' Cargo.toml \
+    || fail 'workspace package version must be 0.0.7'
+printf '%s\n' 'OK metadata: FLAMEWM_VERSION and workspace are 0.0.7'
+
+printf '%s\n' 'GATE package assembly: ./scripts/package'
+./scripts/package
+
+dist="$ROOT/.target/dist"
+checksums="$dist/SHA256SUMS"
+[[ -s "$checksums" ]] || fail "missing package checksum manifest: $checksums"
+(cd "$dist" && sha256sum -c SHA256SUMS >/dev/null) \
+    || fail 'package checksum proof failed'
+
+while IFS='  ' read -r checksum artifact; do
+    [[ -n "$artifact" ]] || fail 'package checksum manifest contains an empty artifact'
+    case "$artifact" in
+        flamewm-0.0.7-source.tar.gz|flamewm-0.0.7-linux-x86_64.tar.gz|flamewm_0.0.7_amd64.deb) ;;
+        *) fail "unexpected package artifact or version: $artifact" ;;
+    esac
+done < "$checksums"
+
+printf '%s\n' 'OK package: 0.0.7 artifacts and SHA256SUMS verified'
+printf '%s\n' 'UNEXECUTED runtime gate: ./scripts/xephyr'
+printf '%s\n' 'UNEXECUTED visual gate: ./scripts/verify-visual'
+printf '%s\n' 'RELEASE_GATE PASS: build, metadata, and package proof only'

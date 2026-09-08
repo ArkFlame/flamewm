@@ -1,0 +1,2 @@
+# Exact path-level exceptions only. Wildcards, globs, and directory-wide
+# exemptions are invalid. Each entry is a ratchet for one current violation.

@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 pub const FORMAT_MAGIC: [u8; 4] = *b"RWRB";
-pub const FORMAT_VERSION: u16 = 2;
+/// Current asset pixel encoding: straight (non-premultiplied) RGBA8.
+/// Version 2 documents carry opaque RGB8 assets; the codec upconverts them
+/// to RGBA8 with alpha=255 so PPM build inputs keep working.
+pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION_RGB8_LEGACY: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Color {
@@ -136,6 +140,82 @@ pub enum Position {
     Absolute,
 }
 
+/// Raw X button translated once at the native boundary (ui-x11 input).
+/// Wheel buttons never act as press/release; Button4/5 map to scroll delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerButton {
+    Primary,
+    Middle,
+    Secondary,
+    WheelUp,
+    WheelDown,
+    Other(u32),
+}
+
+impl PointerButton {
+    #[must_use]
+    pub const fn from_raw_x(button: u32) -> Self {
+        match button {
+            1 => Self::Primary,
+            2 => Self::Middle,
+            3 => Self::Secondary,
+            4 => Self::WheelUp,
+            5 => Self::WheelDown,
+            other => Self::Other(other),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_wheel(self) -> bool {
+        matches!(self, Self::WheelUp | Self::WheelDown)
+    }
+}
+
+/// Overflow behavior per axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Auto,
+    Scroll,
+}
+
+/// Retained scroll offset for one scrollable node.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollState {
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
+impl ScrollState {
+    #[must_use]
+    pub fn clamped(self, max_x: f32, max_y: f32) -> Self {
+        Self {
+            offset_x: self.offset_x.clamp(0.0, max_x.max(0.0)),
+            offset_y: self.offset_y.clamp(0.0, max_y.max(0.0)),
+        }
+    }
+}
+
+/// Semantic scroll delta (Button4/5, wheel, thumb drag all funnel here).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollDelta {
+    pub dx: f32,
+    pub dy: f32,
+}
+
+/// Viewport/content geometry for one scrollable node.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollMetrics {
+    pub viewport: Rect,
+    pub content: Rect,
+    pub max_x: f32,
+    pub max_y: f32,
+    pub thumb_x: Rect,
+    pub thumb_y: Rect,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CursorKind {
     #[default]
@@ -179,6 +259,8 @@ pub struct Style {
     pub font_weight: u16,
     pub opacity: f32,
     pub cursor: CursorKind,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
 }
 
 impl Default for Style {
@@ -212,6 +294,8 @@ impl Default for Style {
             font_weight: 400,
             opacity: 1.0,
             cursor: CursorKind::Default,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
         }
     }
 }
@@ -249,8 +333,16 @@ pub struct ImageAsset {
     pub source: String,
     pub width: u32,
     pub height: u32,
-    /// Opaque RGB8 pixels in row-major order. Rasterization is a build-time concern.
+    /// Straight (non-premultiplied) RGBA8 pixels in row-major order.
+    /// Opaque PPM build inputs convert to alpha=255 at compile time.
     pub pixels: Vec<u8>,
+}
+
+impl ImageAsset {
+    #[must_use]
+    pub fn is_fully_opaque(&self) -> bool {
+        self.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -280,7 +372,7 @@ impl CompiledDocument {
             let expected = asset
                 .width
                 .checked_mul(asset.height)
-                .and_then(|pixels| pixels.checked_mul(3))
+                .and_then(|pixels| pixels.checked_mul(4))
                 .ok_or_else(|| format!("image asset {index} dimensions overflow"))?
                 as usize;
             if asset.pixels.len() != expected {
@@ -352,6 +444,8 @@ pub struct RuntimeStyleOverride {
     pub flex_direction: Option<FlexDirection>,
     pub font_size: Option<f32>,
     pub font_weight: Option<u16>,
+    pub overflow_x: Option<Overflow>,
+    pub overflow_y: Option<Overflow>,
 }
 
 #[derive(Clone, Debug)]
@@ -360,6 +454,7 @@ pub struct RuntimeDocument {
     pub variable_values: Vec<Color>,
     pub text_overrides: HashMap<u32, String>,
     hidden_nodes: HashSet<u32>,
+    image_revision: HashMap<u16, u64>,
     geometry_overrides: HashMap<u32, GeometryOverride>,
     style_overrides: HashMap<u32, RuntimeStyleOverride>,
     z_index_overrides: HashMap<u32, i32>,
@@ -393,6 +488,7 @@ impl RuntimeDocument {
             variable_values,
             text_overrides: HashMap::new(),
             hidden_nodes: HashSet::new(),
+            image_revision: HashMap::new(),
             geometry_overrides: HashMap::new(),
             style_overrides: HashMap::new(),
             z_index_overrides: HashMap::new(),
@@ -439,6 +535,58 @@ impl RuntimeDocument {
             self.hidden_nodes.insert(index);
         }
         Ok(())
+    }
+
+    pub fn replace_image_for_node(
+        &mut self,
+        node_id: &str,
+        source: String,
+        width: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    ) -> Result<(), String> {
+        let index = self
+            .node_by_id(node_id)
+            .ok_or_else(|| format!("no node with id '{node_id}'"))?;
+        let node = &self.document.nodes[index as usize];
+        if node.kind != NodeKind::Image {
+            return Err(format!("node '{node_id}' is not an image node"));
+        }
+        let asset_id = node
+            .image
+            .ok_or_else(|| format!("image node '{node_id}' has no image asset"))?;
+        if width == 0 || height == 0 {
+            return Err("image replacement dimensions must be non-zero".to_string());
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "image replacement dimensions overflow".to_string())?;
+        if rgba8.len() != expected {
+            return Err(format!(
+                "image replacement has {} bytes; expected {expected}",
+                rgba8.len()
+            ));
+        }
+        let asset = self
+            .document
+            .assets
+            .get_mut(asset_id as usize)
+            .ok_or_else(|| {
+                format!("image node '{node_id}' references invalid image asset {asset_id}")
+            })?;
+        asset.source = source;
+        asset.width = width;
+        asset.height = height;
+        asset.pixels = rgba8;
+        let revision = self.image_revision.get(&asset_id).copied().unwrap_or(0);
+        self.image_revision
+            .insert(asset_id, revision.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn image_revision(&self, asset_id: u16) -> u64 {
+        self.image_revision.get(&asset_id).copied().unwrap_or(0)
     }
 
     pub fn is_visible(&self, index: u32) -> bool {
@@ -565,6 +713,16 @@ impl RuntimeDocument {
         Ok(())
     }
 
+    pub fn set_overflow(&mut self, id: &str, x: Overflow, y: Overflow) -> Result<(), String> {
+        let index = self
+            .node_by_id(id)
+            .ok_or_else(|| format!("no node with id '{id}'"))?;
+        let entry = self.style_overrides.entry(index).or_default();
+        entry.overflow_x = Some(x);
+        entry.overflow_y = Some(y);
+        Ok(())
+    }
+
     pub fn set_font_size_px(&mut self, id: &str, size: f32) -> Result<(), String> {
         if !size.is_finite() || size <= 0.0 {
             return Err("runtime font size must be finite and positive".to_string());
@@ -678,6 +836,12 @@ impl RuntimeDocument {
             if let Some(font_weight) = override_style.font_weight {
                 style.font_weight = font_weight;
             }
+            if let Some(overflow_x) = override_style.overflow_x {
+                style.overflow_x = overflow_x;
+            }
+            if let Some(overflow_y) = override_style.overflow_y {
+                style.overflow_y = overflow_y;
+            }
         }
         style.font_size = (style.font_size + self.ui_font_size_offset).max(6.0);
         if self.ui_font_bold && style.font_weight < 600 {
@@ -724,5 +888,128 @@ impl InteractionState {
             }
         }
         &node.style
+    }
+}
+
+#[cfg(test)]
+mod image_replace_tests {
+    use super::*;
+
+    fn image_doc() -> RuntimeDocument {
+        let asset = ImageAsset {
+            source: "old".to_string(),
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        let image_node = CompiledNode {
+            kind: NodeKind::Image,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+            id: "icon".to_string(),
+            action: String::new(),
+            text: String::new(),
+            image: Some(0),
+            style: Style::default(),
+            hover_style: None,
+            active_style: None,
+        };
+        let text_node = CompiledNode {
+            kind: NodeKind::Text,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+            id: "label".to_string(),
+            action: String::new(),
+            text: "hi".to_string(),
+            image: None,
+            style: Style::default(),
+            hover_style: None,
+            active_style: None,
+        };
+        RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: vec![asset],
+            nodes: vec![image_node, text_node],
+        })
+        .expect("fixture document validates")
+    }
+
+    #[test]
+    fn success_replaces_and_bumps_revision() {
+        let mut doc = image_doc();
+        doc.replace_image_for_node("icon", "new".to_string(), 1, 1, vec![1, 2, 3, 200])
+            .expect("replace succeeds");
+        assert_eq!(doc.document.assets[0].source, "new");
+        assert_eq!(doc.document.assets[0].width, 1);
+        assert_eq!(doc.document.assets[0].height, 1);
+        assert_eq!(doc.document.assets[0].pixels, vec![1, 2, 3, 200]);
+        assert_eq!(doc.image_revision(0), 1);
+    }
+
+    #[test]
+    fn second_replace_bumps_again() {
+        let mut doc = image_doc();
+        doc.replace_image_for_node("icon", "a".to_string(), 1, 1, vec![1, 2, 3, 255])
+            .expect("first replace");
+        doc.replace_image_for_node("icon", "b".to_string(), 2, 1, vec![4u8; 8])
+            .expect("second replace");
+        assert_eq!(doc.document.assets[0].source, "b");
+        assert_eq!(doc.image_revision(0), 2);
+    }
+
+    #[test]
+    fn wrong_kind_errs() {
+        let mut doc = image_doc();
+        let err = doc
+            .replace_image_for_node("label", "x".to_string(), 1, 1, vec![0, 0, 0, 255])
+            .expect_err("text node must fail");
+        assert!(err.contains("not an image node"), "unexpected: {err}");
+        assert_eq!(doc.image_revision(0), 0);
+    }
+
+    #[test]
+    fn zero_dims_err() {
+        let mut doc = image_doc();
+        assert!(
+            doc.replace_image_for_node("icon", "x".to_string(), 0, 1, vec![0, 0, 0, 255])
+                .is_err()
+        );
+        assert!(
+            doc.replace_image_for_node("icon", "x".to_string(), 1, 0, Vec::new())
+                .is_err()
+        );
+        assert_eq!(doc.image_revision(0), 0);
+    }
+
+    #[test]
+    fn byte_count_mismatch_errs() {
+        let mut doc = image_doc();
+        let err = doc
+            .replace_image_for_node("icon", "x".to_string(), 2, 2, vec![0u8; 8])
+            .expect_err("must fail");
+        assert!(err.contains("expected 16"), "unexpected: {err}");
+        assert_eq!(doc.image_revision(0), 0);
+    }
+
+    #[test]
+    fn unknown_id_errs() {
+        let mut doc = image_doc();
+        assert!(
+            doc.replace_image_for_node("missing", "x".to_string(), 1, 1, vec![0, 0, 0, 255])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn opaque_rgba_fixture_reports_fully_opaque() {
+        let mut doc = image_doc();
+        assert!(doc.document.assets[0].is_fully_opaque());
+        doc.replace_image_for_node("icon", "t".to_string(), 1, 1, vec![10, 20, 30, 0])
+            .expect("transparent replace");
+        assert!(!doc.document.assets[0].is_fully_opaque());
     }
 }

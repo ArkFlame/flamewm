@@ -1,0 +1,162 @@
+// Render-owned X Shape (libXext) bounding-mask bridge for rounded popup/menu
+// surfaces. Loaded dynamically like the XRender bridge: when libXext or the
+// Shape symbols are unavailable, construction fails and callers log an
+// explicit degraded mode (no silent transparency claim).
+
+use std::os::raw::{c_int, c_ulong};
+
+use crate::ffi::dynamic_library::DynamicLibrary;
+use crate::xlib::{Display, Window};
+
+pub(crate) const SHAPE_BOUNDING: c_int = 0;
+pub(crate) const SHAPE_SET: c_int = 0;
+pub(crate) const SHAPE_YX_SORTED: c_int = 1;
+type ShapeRectanglesFn = unsafe extern "C" fn(
+    *mut Display,
+    c_ulong,
+    c_int,
+    c_int,
+    c_int,
+    *const XRectangle,
+    c_int,
+    c_int,
+    c_int,
+);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct XRectangle {
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+pub(crate) struct XShapeBridge {
+    display: *mut Display,
+    shape_rectangles: ShapeRectanglesFn,
+    _library: DynamicLibrary,
+}
+
+impl XShapeBridge {
+    /// # Safety
+    ///
+    /// `display` must be a live Xlib display that outlives the bridge.
+    pub(crate) unsafe fn new(display: *mut Display) -> Result<Self, String> {
+        let library = DynamicLibrary::open(&["libXext.so.6", "libXext.so"])?;
+        let shape_rectangles =
+            unsafe { library.symbol::<ShapeRectanglesFn>(b"XShapeCombineRectangles\0") }?;
+        Ok(Self {
+            display,
+            shape_rectangles,
+            _library: library,
+        })
+    }
+
+    /// Apply a rounded-rect bounding mask built from row spans.
+    /// `spans` are (y, x_start, x_end_exclusive) in window pixels.
+    ///
+    /// # Safety
+    ///
+    /// `window` must be a live X window on this bridge's display.
+    pub(crate) unsafe fn apply_rounded_mask(
+        &self,
+        window: Window,
+        spans: &[(u32, u32, u32)],
+    ) -> Result<(), String> {
+        let rects: Vec<XRectangle> = spans
+            .iter()
+            .filter(|(_, start, end)| end > start)
+            .filter_map(|(y, start, end)| {
+                let width = end.checked_sub(*start)?;
+                Some(XRectangle {
+                    x: (*start).min(i16::MAX as u32) as i16,
+                    y: (*y).min(i16::MAX as u32) as i16,
+                    width: width.min(u16::MAX as u32) as u16,
+                    height: 1,
+                })
+            })
+            .collect();
+        if rects.is_empty() {
+            return Err("rounded shape mask has no visible rows".to_string());
+        }
+        // SAFETY: display is live per `new`; rects is a valid slice for the call.
+        unsafe {
+            (self.shape_rectangles)(
+                self.display,
+                window,
+                SHAPE_BOUNDING,
+                0,
+                0,
+                rects.as_ptr(),
+                rects.len().min(c_int::MAX as usize) as c_int,
+                SHAPE_SET,
+                SHAPE_YX_SORTED,
+            )
+        };
+        Ok(())
+    }
+}
+
+/// Pure geometry shared with the `flamewm-ui-x11` span tests: row spans
+/// (y, x_start, x_end_exclusive) for a rounded rect of `width`x`height`
+/// with corner radius `radius` (already clamped to half the min side).
+pub(crate) fn rounded_mask_spans(width: u32, height: u32, radius: u32) -> Vec<(u32, u32, u32)> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    if radius <= 1 {
+        return (0..height).map(|row| (row, 0, width)).collect();
+    }
+    let mut spans = Vec::with_capacity(height as usize);
+    for row in 0..height {
+        // Outer-edge distance folds top/bottom corners symmetrically.
+        let corner_row = row.min(height - 1 - row);
+        let inset = if corner_row >= radius {
+            0
+        } else {
+            let r = f64::from(radius);
+            let dy = r - (f64::from(corner_row) + 0.5);
+            let dx = (r * r - dy * dy).max(0.0).sqrt();
+            // Floor matches the `XRenderBackend`/`fill_rounded_rect` corner
+            // rasterization: mask spans and painted pixels use one formula.
+            (r - dx).floor().clamp(0.0, r) as u32
+        };
+        let start = inset.min(width);
+        let end = width.saturating_sub(inset).max(start);
+        spans.push((row, start, end));
+    }
+    spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_mask_geometry_matches_quarter_circle_cut() {
+        // Floor of (r - dx) at pixel-row centers, matching the render-side
+        // corner rasterization. 8x8 r=4: row 0 cuts 2px per side, rows 1..6
+        // are full width under floor (row-1 grazing coverage rounds to 0),
+        // row 7 mirrors row 0.
+        assert_eq!(
+            rounded_mask_spans(8, 8, 4),
+            vec![
+                (0, 2, 6),
+                (1, 0, 8),
+                (2, 0, 8),
+                (3, 0, 8),
+                (4, 0, 8),
+                (5, 0, 8),
+                (6, 0, 8),
+                (7, 2, 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn small_radius_degrades_to_full_rect_rows() {
+        assert_eq!(rounded_mask_spans(4, 2, 0), vec![(0, 0, 4), (1, 0, 4)]);
+        assert!(rounded_mask_spans(0, 8, 4).is_empty());
+    }
+}

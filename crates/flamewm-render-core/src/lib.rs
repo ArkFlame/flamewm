@@ -6,7 +6,10 @@ pub mod paint;
 pub use codec::{decode, encode};
 pub use layout::{LayoutBox, LayoutEngine, LayoutResult};
 pub use model::*;
-pub use paint::{PaintCommand, build_paint_commands};
+pub use paint::{
+    PaintCommand, build_paint_commands, build_paint_commands_with_scroll, emit_scroll_chrome,
+    scroll_clip, scrollbar_visible,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionPhase {

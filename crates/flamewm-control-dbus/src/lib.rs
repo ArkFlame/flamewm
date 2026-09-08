@@ -10,7 +10,8 @@ use flamewm_api::ports::EnginePorts;
 use flamewm_api::{ErrorCode, FlameError, FlameResult};
 use flamewm_control_core::{ControlError, ControlRequest, Dispatcher, OBJECT_PATH};
 use flamewm_control_wire::{
-    WireCall, WireReply, WireValue, decode_call, decode_reply, encode_call, encode_reply,
+    ControlSignal, WireCall, WireReply, WireValue, decode_call, decode_reply, encode_call,
+    encode_reply, encode_signal,
 };
 use flamewm_dbus_reactor::{BusKind, BusPump, MessageDisposition};
 use flamewm_platform::host::PlatformHost;
@@ -68,6 +69,21 @@ impl ControlServer {
     #[must_use]
     pub fn watch(&self) -> flamewm_dbus_reactor::BusWatch {
         self.pump.watch()
+    }
+
+    pub fn emit_signal(&self, signal: &ControlSignal) -> FlameResult<()> {
+        let signal = encode_signal(signal);
+        let mut message = Message::new_signal(OBJECT_PATH, &signal.interface, &signal.member)
+            .map_err(|error| invalid(&error))?;
+        message.append_items(
+            &signal
+                .args
+                .iter()
+                .map(to_item)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| invalid(&error))?,
+        );
+        self.pump.send(message).map(|_| ())
     }
 }
 
@@ -191,6 +207,7 @@ fn array(values: Vec<MessageItem>, signature: &str) -> Result<MessageItem, Strin
 }
 
 fn from_item(item: MessageItem) -> Result<WireValue, FlameError> {
+    let signature = item.signature().to_string();
     match item {
         MessageItem::Variant(value) => from_item(*value),
         MessageItem::Bool(v) => Ok(WireValue::Bool(v)),
@@ -200,12 +217,13 @@ fn from_item(item: MessageItem) -> Result<WireValue, FlameError> {
         MessageItem::Int64(v) => Ok(WireValue::I64(v)),
         MessageItem::Str(v) => Ok(WireValue::String(v)),
         MessageItem::Array(values) => {
+            let string_array = signature == "as";
             let values = values
                 .into_vec()
                 .into_iter()
                 .map(from_item)
                 .collect::<Result<Vec<_>, _>>()?;
-            if values.iter().all(|v| matches!(v, WireValue::String(_))) {
+            if string_array {
                 Ok(WireValue::StringArray(
                     values
                         .into_iter()

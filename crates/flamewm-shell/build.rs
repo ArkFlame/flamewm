@@ -10,20 +10,58 @@ fn main() {
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");
-    let ui = root.join("ui/shell/index.html");
     let css = root.join("ui/shell/flamewm.css");
     let raster = root.join("assets/raster");
+    let sources = [
+        "panel.html",
+        "start.html",
+        "start-apps.html",
+        "task-menu.html",
+        "media.html",
+        "audio.html",
+        "network.html",
+        "calendar.html",
+    ];
+    let artifacts = [
+        ("flamewm-panel.rwr", "panel.html"),
+        ("flamewm-start.rwr", "start.html"),
+        ("flamewm-start-submenu.rwr", "start-apps.html"),
+        ("flamewm-task-menu.rwr", "task-menu.html"),
+        ("flamewm-media.rwr", "media.html"),
+        ("flamewm-audio.rwr", "audio.html"),
+        ("flamewm-network.rwr", "network.html"),
+        ("flamewm-calendar.rwr", "calendar.html"),
+    ];
 
-    println!("cargo:rerun-if-changed={}", ui.display());
     println!("cargo:rerun-if-changed={}", css.display());
     println!("cargo:rerun-if-changed={}", raster.display());
+    for source in sources {
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join("ui/shell").join(source).display()
+        );
+    }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let staged_ui = out_dir.join("shell");
     let staged_assets = staged_ui.join("assets");
     fs::create_dir_all(&staged_assets).expect("create staged shell assets");
-    fs::copy(&ui, staged_ui.join("index.html")).expect("stage shell UI");
+    for source in sources {
+        let path = root.join("ui/shell").join(source);
+        fs::copy(&path, staged_ui.join(source)).expect("stage shell UI source");
+    }
     fs::copy(&css, staged_ui.join("flamewm.css")).expect("stage shell CSS");
+    // Keyed PPM refs are retired: stage true-alpha SVG/Breeze + branding
+    // paths so compiled templates resolve local build inputs only.
+    let shell_assets = root.join("ui/shell/assets");
+    stage_tree(
+        &shell_assets.join("web/breeze"),
+        &staged_assets.join("breeze"),
+    );
+    stage_tree(
+        &shell_assets.join("branding"),
+        &staged_assets.join("branding"),
+    );
     for entry in fs::read_dir(&raster).expect("read shell raster assets") {
         let entry = entry.expect("read shell raster asset entry");
         let asset = entry.path();
@@ -33,9 +71,25 @@ fn main() {
         }
     }
 
-    let staged_html = staged_ui.join("index.html");
-    let compiled = compile_file(&staged_html, &[], CompileOptions::default())
-        .unwrap_or_else(|error| panic!("failed to compile {}: {error}", ui.display()));
+    for (artifact, source) in artifacts {
+        compile_to(&staged_ui.join(source), &out_dir.join(artifact));
+    }
+}
+
+fn stage_tree(source: &Path, dest: &Path) {
+    fs::create_dir_all(dest).expect("create staged asset dir");
+    for entry in fs::read_dir(source).expect("read staged asset dir") {
+        let entry = entry.expect("read staged asset entry");
+        let path = entry.path();
+        if path.is_file() {
+            fs::copy(&path, dest.join(entry.file_name())).expect("stage asset file");
+        }
+    }
+}
+
+fn compile_to(source: &Path, output: &Path) {
+    let compiled = compile_file(source, &[], CompileOptions::default())
+        .unwrap_or_else(|error| panic!("failed to compile {}: {error}", source.display()));
     let bytes = encode(&compiled.document).expect("compiled FlameWM UI must encode");
-    fs::write(out_dir.join("flamewm-shell.rwr"), bytes).expect("write compiled FlameWM UI");
+    fs::write(output, bytes).expect("write compiled FlameWM UI artifact");
 }

@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use flamewm_api::settings::AppearanceMode;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPaths {
     pub bindir: PathBuf,
@@ -62,6 +64,30 @@ pub fn build_launch_plan(
     existing_env: &BTreeMap<String, String>,
 ) -> SessionLaunchPlan {
     build_launch_plan_with_cursor_library_path(paths, wm_passthrough, existing_env, None)
+}
+
+#[must_use]
+pub fn build_launch_plan_with_appearance(
+    paths: &SessionPaths,
+    wm_passthrough: &[String],
+    existing_env: &BTreeMap<String, String>,
+    cursor_library_path: Option<&str>,
+    appearance: AppearanceMode,
+    toolkit: ToolkitThemeAvailability,
+) -> SessionLaunchPlan {
+    let mut plan = build_launch_plan_with_cursor_library_path(
+        paths,
+        wm_passthrough,
+        existing_env,
+        cursor_library_path,
+    );
+    let overlay = appearance_environment(appearance, toolkit, existing_env);
+    for process in &mut plan.processes {
+        for (key, value) in &overlay {
+            process.environment.insert(key.clone(), value.clone());
+        }
+    }
+    plan
 }
 
 #[must_use]
@@ -129,6 +155,15 @@ fn flame_environment(
         "FLAMEWM_CONFIG_DIR".to_owned(),
         paths.config_dir().display().to_string(),
     );
+    environment.insert("FLAMEWM_DESKTOP".to_owned(), "FlameWM".to_owned());
+    environment.insert(
+        "XDG_CURRENT_DESKTOP".to_owned(),
+        existing_env
+            .get("XDG_CURRENT_DESKTOP")
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "FlameWM".to_owned()),
+    );
 
     let cursor_path = paths.cursor_path().display().to_string();
     let inherited_path = existing_env
@@ -140,6 +175,61 @@ fn flame_environment(
         format!("{cursor_path}:{existing}")
     });
     environment.insert("XCURSOR_PATH".to_owned(), combined_cursor_path);
+    environment
+}
+
+/// Guarded toolkit theme availability for the appearance env overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolkitThemeAvailability {
+    pub gtk_theme_available: bool,
+    pub qt_style_available: bool,
+}
+
+impl Default for ToolkitThemeAvailability {
+    fn default() -> Self {
+        Self {
+            gtk_theme_available: false,
+            qt_style_available: false,
+        }
+    }
+}
+
+/// Appearance overlay for the env producer side only.
+/// GTK_THEME/QT_STYLE_OVERRIDE are set only when the matching toolkit theme is
+/// installed; callers pass availability discovered from the filesystem.
+#[must_use]
+pub fn appearance_environment(
+    appearance: AppearanceMode,
+    toolkit: ToolkitThemeAvailability,
+    existing_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    let dark = appearance.prefers_dark();
+    environment.insert(
+        "FLAMEWM_APPEARANCE".to_owned(),
+        appearance.as_str().to_owned(),
+    );
+    environment.insert(
+        "FLAMEWM_DARK_MODE".to_owned(),
+        if dark { "1".to_owned() } else { "0".to_owned() },
+    );
+    let (gtk_theme, qt_style) = if dark {
+        ("Flame-Dark", "Flame-Dark")
+    } else {
+        ("Flame-Light", "Flame-Light")
+    };
+    if toolkit.gtk_theme_available
+        && !existing_env.contains_key("GTK_THEME")
+        && appearance != AppearanceMode::System
+    {
+        environment.insert("GTK_THEME".to_owned(), gtk_theme.to_owned());
+    }
+    if toolkit.qt_style_available
+        && !existing_env.contains_key("QT_STYLE_OVERRIDE")
+        && appearance != AppearanceMode::System
+    {
+        environment.insert("QT_STYLE_OVERRIDE".to_owned(), qt_style.to_owned());
+    }
     environment
 }
 
@@ -312,6 +402,60 @@ mod tests {
     }
 
     #[test]
+    fn appearance_overlay_guards_toolkit_themes_and_marks_identity() {
+        let existing = BTreeMap::new();
+        let overlay = appearance_environment(
+            AppearanceMode::Dark,
+            ToolkitThemeAvailability {
+                gtk_theme_available: true,
+                qt_style_available: true,
+            },
+            &existing,
+        );
+        assert_eq!(
+            overlay.get("FLAMEWM_APPEARANCE").map(String::as_str),
+            Some("dark")
+        );
+        assert_eq!(
+            overlay.get("FLAMEWM_DARK_MODE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            overlay.get("GTK_THEME").map(String::as_str),
+            Some("Flame-Dark")
+        );
+        assert_eq!(
+            overlay.get("QT_STYLE_OVERRIDE").map(String::as_str),
+            Some("Flame-Dark")
+        );
+        let guarded = appearance_environment(
+            AppearanceMode::Dark,
+            ToolkitThemeAvailability::default(),
+            &existing,
+        );
+        assert!(!guarded.contains_key("GTK_THEME"));
+        assert!(!guarded.contains_key("QT_STYLE_OVERRIDE"));
+        let paths = default_paths_from_home("/usr/bin", "/home/test");
+        let plan = build_launch_plan_with_appearance(
+            &paths,
+            &[],
+            &existing,
+            None,
+            AppearanceMode::Dark,
+            ToolkitThemeAvailability::default(),
+        );
+        let environment = &plan.processes[0].environment;
+        assert_eq!(
+            environment.get("FLAMEWM_DESKTOP").map(String::as_str),
+            Some("FlameWM")
+        );
+        assert_eq!(
+            environment.get("FLAMEWM_APPEARANCE").map(String::as_str),
+            Some("dark")
+        );
+    }
+
+    #[test]
     fn restart_policy_is_bounded() {
         let mut supervisor = ProcessSupervisorPolicy::default();
         let mut delays = Vec::new();
@@ -327,5 +471,17 @@ mod tests {
             supervisor.child_exited(ChildExit::ExitCode(1)),
             SupervisorDecision::GiveUp
         );
+    }
+}
+
+/// Apply computed session environment to the current process. Centralizes
+/// the single `std::env::set_var` owner (Rust 2024 marks it `unsafe`
+/// because it races with `getenv` on other threads; call before spawning
+/// threads/children, matching long-standing launcher practice).
+#[allow(unsafe_code)]
+pub fn apply_current_process_env(vars: &std::collections::BTreeMap<String, String>) {
+    for (key, value) in vars {
+        // SAFETY: launcher single-threaded setup before thread spawn.
+        unsafe { std::env::set_var(key, value) };
     }
 }

@@ -8,15 +8,38 @@ command -v xdpyinfo >/dev/null || { echo 'xdpyinfo is required (x11-utils)' >&2;
 [[ -n "${DISPLAY:-}" ]] || { echo 'Host DISPLAY is unset; Xephyr needs the current X desktop.' >&2; exit 1; }
 
 SCREEN="${FLAMEWM_XEPHYR_SCREEN:-1350x641}"
+CANARY="${FLAMEWM_XEPHYR_CANARY:-0}"
+CANARY_SECS="${FLAMEWM_XEPHYR_CANARY_SECS:-10}"
+# Canary harness (flamewm-x11-canary): scenario selection for CANARY mode.
+# Default runs all four: SR05 first-present, SR07 popup matrix, SR08 black-pixel, SR15 input matrix.
+CANARY_SCENARIOS="${FLAMEWM_XEPHYR_CANARY_SCENARIOS:-sr05,sr07,sr08,sr15}"
+CANARY_NAME="${FLAMEWM_XEPHYR_CANARY_NAME:-flame}"
+CANARY_JSON="${FLAMEWM_XEPHYR_CANARY_JSON:-0}"
+# Off by default: when enabled, run FlameWM children with crash-debug friendly
+# Rust env so a segfault produces a full backtrace. Does not change normal runs.
+DEBUG_CRASH="${FLAMEWM_XEPHYR_DEBUG_CRASH:-0}"
+CRASH_ENV_EXTRA=()
+if [[ "$DEBUG_CRASH" == 1 ]]; then
+  CRASH_ENV_EXTRA=(RUST_BACKTRACE=full RUST_BACKTRACE_ON_ABORT=1 RUST_MIN_STACK=8m)
+  echo '[debug-crash] running FlameWM children with RUST_BACKTRACE=full (FLAMEWM_XEPHYR_DEBUG_CRASH=1)' >&2
+fi
 export RWR_UI_FONT="${RWR_UI_FONT:-IBM Plex Sans}"
 if [[ -z "${RWR_FONT_FILES:-}" ]]; then
   files="$(./scripts/prepare-ibm-plex || true)"
   [[ -n "$files" ]] && export RWR_FONT_FILES="$files"
 fi
+VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+VERSION="${VERSION:-0.0.7}"
 
-echo '[1/4] Building release-optimized independent FlameWM + WebRender shell'
-cargo build --quiet --release -p flamewm-wm -p flamewm-shell
+echo "[1/5] Building FlameWM WM + desktop + shell"
+cargo build --quiet --release -p flamewm-wm -p flamewm-desktop -p flamewm-shell
 mkdir -p .target/flamewm
+WM_BIN=./.target/release/flamewm
+DESKTOP_BIN=./.target/release/flamewm-desktop
+SHELL_BIN=./.target/release/flamewm-shell
+[[ -x "$WM_BIN" ]] || { echo "missing $WM_BIN" >&2; exit 1; }
+[[ -x "$DESKTOP_BIN" ]] || { echo "missing $DESKTOP_BIN" >&2; exit 1; }
+[[ -x "$SHELL_BIN" ]] || { echo "missing $SHELL_BIN" >&2; exit 1; }
 
 if [[ -n "${FLAMEWM_XEPHYR_DISPLAY:-}" ]]; then
   nested="${FLAMEWM_XEPHYR_DISPLAY}"
@@ -33,50 +56,287 @@ if DISPLAY="$nested" xdpyinfo >/dev/null 2>&1; then echo "$nested is already in 
 
 xephyr_log=.target/flamewm/xephyr.log
 wm_log=.target/flamewm/wm.log
+desktop_log=.target/flamewm/desktop.log
 shell_log=.target/flamewm/shell.log
-: >"$xephyr_log"; : >"$wm_log"; : >"$shell_log"
+: >"$xephyr_log"; : >"$wm_log"; : >"$desktop_log"; : >"$shell_log"
 
-echo "[2/4] Starting Xephyr $nested ($SCREEN)"
-Xephyr "$nested" -screen "$SCREEN" -dpi 96 -ac -br -noreset -nolisten tcp >"$xephyr_log" 2>&1 &
-xephyr_pid=$!
+xephyr_pid=''
 wm_pid=''
+desktop_pid=''
 shell_pid=''
 cleanup(){
-  [[ -n "$shell_pid" ]] && kill "$shell_pid" 2>/dev/null || true
-  [[ -n "$wm_pid" ]] && kill "$wm_pid" 2>/dev/null || true
-  kill "$xephyr_pid" 2>/dev/null || true
-  [[ -n "$shell_pid" ]] && wait "$shell_pid" 2>/dev/null || true
-  [[ -n "$wm_pid" ]] && wait "$wm_pid" 2>/dev/null || true
-  wait "$xephyr_pid" 2>/dev/null || true
+  [[ -n "${shell_pid:-}" ]] && kill "$shell_pid" 2>/dev/null || true
+  [[ -n "${desktop_pid:-}" ]] && kill "$desktop_pid" 2>/dev/null || true
+  [[ -n "${wm_pid:-}" ]] && kill "$wm_pid" 2>/dev/null || true
+  [[ -n "${xephyr_pid:-}" ]] && kill "$xephyr_pid" 2>/dev/null || true
+  [[ -n "${shell_pid:-}" ]] && wait "$shell_pid" 2>/dev/null || true
+  [[ -n "${desktop_pid:-}" ]] && wait "$desktop_pid" 2>/dev/null || true
+  [[ -n "${wm_pid:-}" ]] && wait "$wm_pid" 2>/dev/null || true
+  [[ -n "${xephyr_pid:-}" ]] && wait "$xephyr_pid" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+
+fail(){
+  echo "FLAMEWM_XEPHYR_FAIL: $*" >&2
+  for f in "$xephyr_log" "$wm_log" "$desktop_log" "$shell_log"; do
+    echo "--- tail $f ---" >&2
+    tail -n 30 "$f" >&2 || true
+  done
+  exit 1
+}
+
+# Non-blocking core-collection hint. Only prints command paths when the tooling
+# exists; never waits on the user and never changes the supervised run outcome.
+crash_collection_hint(){
+  local pid="$1" name="$2"
+  if command -v gdb >/dev/null 2>&1; then
+    echo "crash-collect: gdb available; attach for backtrace (non-interactive guidance):" >&2
+    echo "  gdb -p $pid -batch -ex bt" >&2
+  fi
+  if command -v coredumpctl >/dev/null 2>&1; then
+    echo "crash-collect: coredumpctl available; collect core with:" >&2
+    echo "  coredumpctl gdb $name" >&2
+  fi
+  if ! command -v gdb >/dev/null 2>&1 && ! command -v coredumpctl >/dev/null 2>&1; then
+    echo "crash-collect: no gdb/coredumpctl found; set FLAMEWM_XEPHYR_DEBUG_CRASH=1 and rerun for RUST_BACKTRACE" >&2
+  fi
+}
+
+# Classify the first supervised child that has exited. Each child is waited
+# once (binaries kill 0 cannot reap), so the pid -> status -> signal mapping is
+# exact and is NOT confused with the later Xephyr teardown during cleanup.
+first_dead_child(){
+  local rec name pid status sig
+  for rec in "wm:$wm_pid" "desktop:$desktop_pid" "shell:$shell_pid" "xephyr:$xephyr_pid"; do
+    name="${rec%%:*}"
+    pid="${rec##*:}"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      status='?'
+      if wait "$pid" 2>/dev/null; then
+        status=0
+      else
+        status=$?
+      fi
+      sig='none'
+      if [[ "$status" -gt 128 ]] && command -v kill >/dev/null 2>&1; then
+        sig="$(kill -l "$((status-128))" 2>/dev/null || echo "signal $((status-128))")"
+      fi
+      echo "FIRST-DEAD-CHILD pid=$pid name=$name exit_status=$status signal=$sig" >&2
+      if [[ "$name" == xephyr ]]; then
+        echo "NOTE: Xephyr itself exited; remaining clients will report the display connection broken during cleanup (secondary, expected)." >&2
+      else
+        echo "NOTE: primary child ($name) died; any 'X connection to :.. broken' that follows during cleanup is secondary/expected teardown, not the root cause." >&2
+        crash_collection_hint "$pid" "$name"
+      fi
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_alive(){
+  local name="$1" pid="$2" log="$3"
+  kill -0 "$pid" 2>/dev/null || fail "$name exited early; see $log"
+}
+
+# Nested X11 app env: force clients onto the Xephyr display and off the host
+# Wayland compositor; identify the session as an X11 FlameWM session.
+# J11 production appearance/session consumer: same env the flamewm launcher
+# applies — FlameWM identity (never KDE), XCURSOR_* cursor theme, and the
+# guarded Breeze toolkit theme (GTK only if Breeze-Dark installed, Qt only
+# if a Breeze style plugin exists). Explicit user values always win.
+session_appearance_env(){
+  : "${FLAMEWM_APPEARANCE:=dark}"
+  export FLAMEWM_APPEARANCE
+  case "$FLAMEWM_APPEARANCE" in
+    dark|Dark|DARK) export FLAMEWM_DARK_MODE=1 ;;
+    light|Light|LIGHT) export FLAMEWM_DARK_MODE=0 ;;
+    *) export FLAMEWM_DARK_MODE=1 ;;
+  esac
+  export XCURSOR_THEME="${XCURSOR_THEME:-Breeze}"
+  export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+  export XCURSOR_THEME_CORE="${XCURSOR_THEME_CORE:-1}"
+  if [[ "${XDG_CURRENT_DESKTOP:-}" == [Kk][Dd][Ee] ]] || [[ -z "${XDG_CURRENT_DESKTOP:-}" ]]; then
+    export XDG_CURRENT_DESKTOP=FlameWM
+  fi
+  export FLAMEWM_DESKTOP=FlameWM
+  if [[ "$FLAMEWM_APPEARANCE" != [Ss][Yy][Ss][Tt][Ee][Mm] ]]; then
+    if [[ -z "${GTK_THEME:-}" && -d /usr/share/themes/Breeze-Dark/gtk-3.0 ]]; then
+      export GTK_THEME=Breeze-Dark
+    fi
+    if [[ -z "${QT_STYLE_OVERRIDE:-}" ]] && ls /usr/lib/x86_64-linux-gnu/qt*/plugins/styles/breeze*.so >/dev/null 2>&1; then
+      export QT_STYLE_OVERRIDE=Breeze
+    fi
+  fi
+}
+nested_env(){
+  session_appearance_env
+  if [[ "$DEBUG_CRASH" == 1 ]]; then
+    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY="$nested" XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP" \
+      FLAMEWM_DESKTOP="$FLAMEWM_DESKTOP" FLAMEWM_APPEARANCE="$FLAMEWM_APPEARANCE" FLAMEWM_DARK_MODE="$FLAMEWM_DARK_MODE" \
+      XCURSOR_THEME="$XCURSOR_THEME" XCURSOR_SIZE="$XCURSOR_SIZE" XCURSOR_THEME_CORE="$XCURSOR_THEME_CORE" \
+      ${GTK_THEME:+GTK_THEME="$GTK_THEME"} ${QT_STYLE_OVERRIDE:+QT_STYLE_OVERRIDE="$QT_STYLE_OVERRIDE"} \
+      "${CRASH_ENV_EXTRA[@]}" "$@"
+  else
+    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY="$nested" XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP" \
+      FLAMEWM_DESKTOP="$FLAMEWM_DESKTOP" FLAMEWM_APPEARANCE="$FLAMEWM_APPEARANCE" FLAMEWM_DARK_MODE="$FLAMEWM_DARK_MODE" \
+      XCURSOR_THEME="$XCURSOR_THEME" XCURSOR_SIZE="$XCURSOR_SIZE" XCURSOR_THEME_CORE="$XCURSOR_THEME_CORE" \
+      ${GTK_THEME:+GTK_THEME="$GTK_THEME"} ${QT_STYLE_OVERRIDE:+QT_STYLE_OVERRIDE="$QT_STYLE_OVERRIDE"} "$@"
+  fi
+}
+
+echo "[2/5] Starting Xephyr $nested ($SCREEN)"
+Xephyr "$nested" -screen "$SCREEN" -dpi 96 -ac -br -noreset -nolisten tcp >"$xephyr_log" 2>&1 &
+xephyr_pid=$!
 for _ in $(seq 1 100); do
-  kill -0 "$xephyr_pid" 2>/dev/null || { cat "$xephyr_log" >&2; exit 1; }
+  kill -0 "$xephyr_pid" 2>/dev/null || fail "Xephyr exited during startup"
   DISPLAY="$nested" xdpyinfo >/dev/null 2>&1 && break
   sleep 0.05
 done
-DISPLAY="$nested" xdpyinfo >/dev/null 2>&1 || { cat "$xephyr_log" >&2; echo 'Xephyr readiness failed' >&2; exit 1; }
+DISPLAY="$nested" xdpyinfo >/dev/null 2>&1 || fail "Xephyr readiness failed"
 
-echo '[3/4] Starting FlameWM native Rust window manager'
-DISPLAY="$nested" ./.target/release/flamewm >"$wm_log" 2>&1 &
+echo '[3/5] Starting FlameWM window manager (EWMH gate)'
+nested_env "$WM_BIN" >"$wm_log" 2>&1 &
 wm_pid=$!
+wm_ready=0
 for _ in $(seq 1 100); do
-  kill -0 "$wm_pid" 2>/dev/null || { cat "$wm_log" >&2; exit 1; }
+  require_alive wm "$wm_pid" "$wm_log"
   if command -v xprop >/dev/null 2>&1 && DISPLAY="$nested" xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q '#'; then
+    wm_ready=1
     break
   fi
   sleep 0.05
 done
-kill -0 "$wm_pid" 2>/dev/null || { cat "$wm_log" >&2; exit 1; }
-
-echo '[4/4] Starting compiled FlameWM WebRender desktop shell'
-DISPLAY="$nested" ./.target/release/flamewm-shell >"$shell_log" 2>&1 &
-shell_pid=$!
-
-if [[ "${FLAMEWM_XEPHYR_TEST_APPS:-0}" == 1 ]] && command -v xterm >/dev/null 2>&1; then
-  DISPLAY="$nested" xterm -geometry 80x24+90+90 >/dev/null 2>&1 &
+require_alive wm "$wm_pid" "$wm_log"
+if command -v xprop >/dev/null 2>&1; then
+  [[ "$wm_ready" == 1 ]] || fail "WM EWMH readiness failed (_NET_SUPPORTING_WM_CHECK not published)"
+else
+  echo 'WARN: xprop missing; EWMH gate degraded to WM liveness only' >&2
 fi
 
-echo "FlameWM Rust WebRender 0.0.4 running on $nested"
-echo "logs: $xephyr_log $wm_log $shell_log"
-wait "$shell_pid"
+echo '[4/5] Starting FlameWM desktop'
+nested_env "$DESKTOP_BIN" >"$desktop_log" 2>&1 &
+desktop_pid=$!
+sleep 1
+require_alive desktop "$desktop_pid" "$desktop_log"
+require_alive wm "$wm_pid" "$wm_log"
+
+echo '[5/5] Starting FlameWM shell'
+nested_env "$SHELL_BIN" >"$shell_log" 2>&1 &
+shell_pid=$!
+sleep 1
+require_alive shell "$shell_pid" "$shell_log"
+require_alive desktop "$desktop_pid" "$desktop_log"
+require_alive wm "$wm_pid" "$wm_log"
+
+if [[ "${FLAMEWM_XEPHYR_TEST_APPS:-0}" == 1 ]] && command -v xterm >/dev/null 2>&1; then
+  nested_env xterm -geometry 80x24+90+90 >/dev/null 2>&1 &
+fi
+
+canary_checks(){
+  CANARY_BIN="${CANARY_BIN:-./.target/release/flamewm-x11-canary}"
+  if [[ ! -x "$CANARY_BIN" ]]; then
+    echo '[canary] building flamewm-x11-canary harness' >&2
+    cargo build --quiet --release -p flamewm-x11-canary || fail "canary harness build failed"
+  fi
+  [[ -x "$CANARY_BIN" ]] || fail "canary harness missing ($CANARY_BIN)"
+  json_flag=''
+  [[ "$CANARY_JSON" == 1 ]] && json_flag='--json'
+  # SR05 first-present: named Flame surface must be mapped/viewable.
+  if [[ ",$CANARY_SCENARIOS," == *,sr05,* ]]; then
+    # shellcheck disable=SC2086
+    DISPLAY="$nested" "$CANARY_BIN" sr05 --name "$CANARY_NAME" --timeout-secs "$CANARY_SECS" $json_flag \
+      || fail "canary SR05 first-present failed (name=$CANARY_NAME)"
+  fi
+  # SR07 popup matrix: enumerate small/top-level candidate popups.
+  if [[ ",$CANARY_SCENARIOS," == *,sr07,* ]]; then
+    # shellcheck disable=SC2086
+    DISPLAY="$nested" "$CANARY_BIN" sr07 $json_flag \
+      || fail "canary SR07 popup matrix failed"
+  fi
+  if command -v xprop >/dev/null 2>&1; then
+    clients="$(DISPLAY="$nested" xprop -root _NET_CLIENT_LIST 2>/dev/null || true)"
+    if echo "$clients" | grep -q '#'; then
+      echo "canary: _NET_CLIENT_LIST present: $clients"
+    else
+      echo 'WARN: canary viewability skipped (_NET_CLIENT_LIST empty or unsupported)' >&2
+    fi
+  elif command -v xwininfo >/dev/null 2>&1; then
+    tree="$(DISPLAY="$nested" xwininfo -root -tree 2>/dev/null || true)"
+    [[ -n "$tree" ]] || fail "canary viewability failed (empty root tree)"
+    echo 'canary: root window tree is non-empty'
+  else
+    echo 'WARN: canary viewability skipped (need xprop or xwininfo)' >&2
+  fi
+  # Screenshot black-frame rejection: canary sampler first (SR08),
+  # then legacy shell-tool capture as a second opinion.
+  # shellcheck disable=SC2086
+  if [[ ",$CANARY_SCENARIOS," == *,sr08,* ]]; then
+    DISPLAY="$nested" "$CANARY_BIN" sr08 $json_flag \
+      || fail "canary SR08 black-pixel sampling failed"
+  fi
+  # SR15 input matrix: synthetic motion+click grid on the named surface.
+  if [[ ",$CANARY_SCENARIOS," == *,sr15,* ]]; then
+    if DISPLAY="$nested" "$CANARY_BIN" list --name "$CANARY_NAME" >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      DISPLAY="$nested" "$CANARY_BIN" sr15 --name "$CANARY_NAME" $json_flag \
+        || echo 'WARN: canary SR15 input delivery reported failures' >&2
+    else
+      echo "WARN: canary SR15 skipped (no window matches $CANARY_NAME)" >&2
+    fi
+  fi
+  shot=.target/flamewm/canary-root.png
+  if command -v import >/dev/null 2>&1; then
+    DISPLAY="$nested" import -window root "$shot" 2>/dev/null || fail "canary screenshot failed (import)"
+    [[ -s "$shot" ]] || fail "canary screenshot failed (empty file)"
+    size="$(wc -c <"$shot" | tr -d ' ')"
+    [[ "$size" -gt 8192 ]] || fail "canary screenshot rejected (suspiciously small: ${size}B, likely black frame)"
+    if command -v identify >/dev/null 2>&1; then
+      mean="$(identify -format '%[mean]' "$shot" 2>/dev/null || echo '')"
+      echo "canary: screenshot ${size}B mean=${mean:-unknown}"
+      if [[ "$mean" == "0" ]]; then
+        fail "canary screenshot rejected (all-black frame, mean=0)"
+      fi
+    else
+      echo "canary: screenshot ${size}B (mean check skipped, identify missing)"
+    fi
+  elif command -v xwd >/dev/null 2>&1; then
+    DISPLAY="$nested" xwd -root -out .target/flamewm/canary-root.xwd 2>/dev/null || fail "canary screenshot failed (xwd)"
+    size="$(wc -c <.target/flamewm/canary-root.xwd | tr -d ' ')"
+    [[ "$size" -gt 8192 ]] || fail "canary screenshot rejected (suspiciously small: ${size}B, likely black frame)"
+    echo "canary: xwd dump ${size}B"
+  else
+    echo 'WARN: canary screenshot skipped (need import or xwd)' >&2
+  fi
+}
+
+if [[ "$CANARY" == 1 ]]; then
+  echo "CANARY mode: bounded run ${CANARY_SECS}s on $nested"
+  sleep "$CANARY_SECS"
+  require_alive wm "$wm_pid" "$wm_log"
+  require_alive desktop "$desktop_pid" "$desktop_log"
+  require_alive shell "$shell_pid" "$shell_log"
+  canary_checks
+  require_alive wm "$wm_pid" "$wm_log"
+  require_alive desktop "$desktop_pid" "$desktop_log"
+  require_alive shell "$shell_pid" "$shell_log"
+  echo "FLAMEWM_XEPHYR_CANARY_PASS display=$nested version=$VERSION"
+  echo "logs: $xephyr_log $wm_log $desktop_log $shell_log"
+  exit 0
+fi
+
+echo "FlameWM $VERSION running on $nested (wm -> desktop -> shell)"
+echo "logs: $xephyr_log $wm_log $desktop_log $shell_log"
+# Supervise: fail visibly if any required child exits. Fail-fast is preserved:
+# no `|| true` masks on the required children, and now the FIRST dead child is
+# classified (pid/name/status/signal) so a child segfault is never mislabeled as
+# the later, expected `X connection broken` that follows Xephyr teardown.
+while true; do
+  if ! wait -n "$xephyr_pid" "$wm_pid" "$desktop_pid" "$shell_pid" 2>/dev/null; then
+    : # reaped child failed; classification below does not hide the failure
+  fi
+  # wait -n reaped one exited child; classify exactly which one (never masked).
+  if first_dead_child; then
+    fail "first-dead-child reported above (see logs)"
+  fi
+done

@@ -1,7 +1,29 @@
 <!doctype html>
 <html><head><title>FlameWM Desktop</title></head>
 <body id="desktop" data-action="desktop.surface">
-  <div id="desktop-selection" class="selection"></div>
-  <div id="sticky-note" class="sticky" data-action="sticky.move"><div id="sticky-title">Sticky Note</div><div id="sticky-text"></div></div>
+  <img id="desktop-wallpaper-selection" class="wallpaper" src="assets/wallpaper.ppm">
+  <img id="desktop-watermark" class="watermark" src="assets/watermark.ppm">
   <!--ITEMS-->
+  <div id="desktop-selection" class="selection"></div>
+  <div id="sticky-note" class="sticky" data-action="sticky.move"><div id="sticky-title">Sticky Note</div><div id="sticky-text">&#8203;</div></div>
+  <section id="desktop-menu" class="desktop-menu" data-action="desktop.menu.surface">
+    <button id="menu-row-terminal" data-action="menu.terminal">Open Terminal</button>
+    <button id="menu-row-folder" data-action="menu.folder">Create New Folder</button>
+    <button id="menu-row-note" data-action="menu.note">New Sticky Note</button>
+    <button id="menu-row-desktop" data-action="menu.desktop">Add Virtual Desktop</button>
+    <button id="menu-row-settings" data-action="menu.settings">Desktop and Wallpaper</button>
+  </section>
+  <section id="desktop-entry-menu" class="desktop-menu" data-action="desktop.entry-menu.surface">
+    <button id="menu-row-empty-trash" data-action="entry.empty-trash">Empty Trash</button>
+    <button id="menu-row-shortcut" data-action="entry.shortcut">Create Shortcut</button>
+    <button id="menu-row-delete" data-action="entry.delete">Delete</button>
+  </section>
+  <section id="desktop-confirm" class="desktop-confirm" data-action="desktop.confirm.surface">
+    <div id="confirm-text">Delete permanently?</div>
+    <button id="confirm-delete" data-action="confirm.delete">Delete</button>
+    <button id="confirm-cancel" data-action="confirm.cancel">Cancel</button>
+  </section>
+  <section id="sticky-menu" class="sticky-menu" data-action="sticky.menu.surface">
+    <button data-action="sticky.menu.delete">Delete Note</button>
+  </section>
 </body></html>

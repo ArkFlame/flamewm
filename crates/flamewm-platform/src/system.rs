@@ -1,7 +1,10 @@
 use flamewm_api::system::{
     AudioSnapshot, MediaSnapshot, NetworkKind, NetworkSnapshot, PlaybackState, ServiceAvailability,
-    SystemSnapshot,
+    SystemAction, SystemSnapshot,
 };
+use flamewm_api::{ErrorCode, FlameError, FlameResult};
+
+pub type SystemActionHandler = Box<dyn FnMut(SystemAction, SystemSnapshot) -> FlameResult<()>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconnectBackoff {
@@ -37,10 +40,11 @@ impl ReconnectBackoff {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct SystemService {
     snapshot: SystemSnapshot,
     pulse_backoff: ReconnectBackoff,
+    action_handler: Option<SystemActionHandler>,
 }
 
 impl SystemService {
@@ -49,15 +53,15 @@ impl SystemService {
         &self.snapshot
     }
 
-    pub fn update_network(&mut self, mut update: NetworkSnapshot) -> bool {
+    pub fn update_network(&mut self, update: NetworkSnapshot) -> bool {
         if update.generation < self.snapshot.network.generation {
             return false;
         }
-        update.strength_percent = update.strength_percent.min(100);
-        for access_point in &mut update.access_points {
-            access_point.strength_percent = access_point.strength_percent.min(100);
+        if update == self.snapshot.network {
+            return false;
         }
         self.snapshot.network = update;
+        self.bump_revision();
         true
     }
 
@@ -65,54 +69,134 @@ impl SystemService {
         if update.generation < self.snapshot.media.generation {
             return false;
         }
+        if update == self.snapshot.media {
+            return false;
+        }
         self.snapshot.media = update;
+        self.bump_revision();
         true
     }
 
-    pub fn update_audio(&mut self, mut update: AudioSnapshot) -> bool {
+    pub fn update_audio(&mut self, update: AudioSnapshot) -> bool {
         if update.generation < self.snapshot.audio.generation
             || update.server_generation < self.snapshot.audio.server_generation
         {
             return false;
         }
-        update.volume_percent = update.volume_percent.min(100);
         if update.availability == ServiceAvailability::Available {
             self.pulse_backoff.reset();
         }
+        if update == self.snapshot.audio {
+            return false;
+        }
         self.snapshot.audio = update;
+        self.bump_revision();
         true
     }
 
     pub fn network_owner_lost(&mut self) {
         let generation = self.snapshot.network.generation.saturating_add(1);
-        self.snapshot.network = NetworkSnapshot {
+        let update = NetworkSnapshot {
             availability: ServiceAvailability::Unavailable,
             generation,
             kind: NetworkKind::Unavailable,
             ..NetworkSnapshot::default()
         };
+        if update != self.snapshot.network {
+            self.snapshot.network = update;
+            self.bump_revision();
+        }
     }
 
     pub fn mpris_owner_lost(&mut self) {
         let generation = self.snapshot.media.generation.saturating_add(1);
-        self.snapshot.media = MediaSnapshot {
+        let update = MediaSnapshot {
             availability: ServiceAvailability::Unavailable,
             generation,
             playback: PlaybackState::Unavailable,
             ..MediaSnapshot::default()
         };
+        if update != self.snapshot.media {
+            self.snapshot.media = update;
+            self.bump_revision();
+        }
     }
 
     pub fn pulse_disconnected(&mut self) -> u64 {
         let generation = self.snapshot.audio.generation.saturating_add(1);
         let server_generation = self.snapshot.audio.server_generation.saturating_add(1);
-        self.snapshot.audio = AudioSnapshot {
+        let update = AudioSnapshot {
             availability: ServiceAvailability::Unavailable,
             generation,
             server_generation,
             ..AudioSnapshot::default()
         };
+        if update != self.snapshot.audio {
+            self.snapshot.audio = update;
+            self.bump_revision();
+        }
         self.pulse_backoff.next_delay_ms()
+    }
+
+    pub fn set_action_handler(&mut self, handler: SystemActionHandler) {
+        self.action_handler = Some(handler);
+    }
+
+    pub fn perform_action(
+        &mut self,
+        action: SystemAction,
+        expected_revision: u64,
+    ) -> FlameResult<()> {
+        if expected_revision != self.snapshot.revision {
+            return Err(FlameError::stale("stale system snapshot revision"));
+        }
+        match &action {
+            SystemAction::SetVolume(action) => {
+                if action.percent > 150 {
+                    return Err(FlameError::new(
+                        ErrorCode::InvalidArgument,
+                        "audio volume must be in 0..=150",
+                    ));
+                }
+                self.validate_audio_generation(action.generation, action.server_generation)?;
+            }
+            SystemAction::SetMute(action) => {
+                self.validate_audio_generation(action.generation, action.server_generation)?;
+            }
+            SystemAction::ConnectWifi { generation, .. }
+            | SystemAction::SubmitNetworkSecret { generation, .. }
+            | SystemAction::CancelNetworkSecret { generation, .. } => {
+                if *generation != self.snapshot.network.generation {
+                    return Err(FlameError::stale("stale NetworkManager service generation"));
+                }
+            }
+            _ => {}
+        }
+        let snapshot = self.snapshot.clone();
+        let Some(handler) = self.action_handler.as_mut() else {
+            return Err(FlameError::new(
+                ErrorCode::Unsupported,
+                "system action provider is unavailable",
+            ));
+        };
+        handler(action, snapshot)
+    }
+
+    fn bump_revision(&mut self) {
+        self.snapshot.revision = self.snapshot.revision.saturating_add(1).max(1);
+    }
+
+    fn validate_audio_generation(
+        &self,
+        generation: u64,
+        server_generation: u64,
+    ) -> FlameResult<()> {
+        if generation != self.snapshot.audio.generation
+            || server_generation != self.snapshot.audio.server_generation
+        {
+            return Err(FlameError::stale("stale PulseAudio generation"));
+        }
+        Ok(())
     }
 }
 
@@ -142,5 +226,27 @@ mod tests {
             last = backoff.next_delay_ms();
         }
         assert_eq!(last, 30_000);
+    }
+
+    #[test]
+    fn revision_changes_only_for_logical_snapshot_changes() {
+        let mut service = SystemService::default();
+        let update = NetworkSnapshot {
+            generation: 1,
+            ..NetworkSnapshot::default()
+        };
+        assert!(service.update_network(update.clone()));
+        assert_eq!(service.snapshot().revision, 1);
+        assert!(!service.update_network(update));
+        assert_eq!(service.snapshot().revision, 1);
+    }
+
+    #[test]
+    fn action_rejects_stale_revision_before_missing_provider() {
+        let mut service = SystemService::default();
+        let error = service
+            .perform_action(SystemAction::Scan, 1)
+            .expect_err("stale action must fail");
+        assert_eq!(error.code, ErrorCode::StaleRevision);
     }
 }

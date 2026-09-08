@@ -1,0 +1,18 @@
+[package]
+name = "flamewm-integrations-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dbus = { version = "=0.9.12", default-features = false }
+flamewm-api = { path = "../flamewm-api" }
+flamewm-dbus-reactor = { path = "../flamewm-dbus-reactor" }
+flamewm-image-core = { path = "../flamewm-image-core" }
+flamewm-integrations-core = { path = "../flamewm-integrations-core" }
+pulse = { package = "libpulse-binding", version = "=2.30.1", default-features = true }
+
+[lints]
+workspace = true

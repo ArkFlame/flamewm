@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use flamewm_api::settings::AppearanceMode;
 use flamewm_api::shortcuts::{
     ACTION_TOGGLE_START_MENU, ACTION_WINDOW_CLOSE, ACTION_WINDOW_MAXIMIZE, ACTION_WINDOW_MINIMIZE,
     ACTION_WORKSPACE_DOWN, ACTION_WORKSPACE_LEFT, ACTION_WORKSPACE_RIGHT, ACTION_WORKSPACE_UP,
@@ -25,6 +26,7 @@ pub struct ProductSettings {
     pub revision: u64,
     pub accent: String,
     pub icon_theme: String,
+    pub appearance: AppearanceMode,
     /// Empty means use the desktop/theme default wallpaper.
     pub wallpaper: String,
     pub desktop_selection_fill_opacity: u8,
@@ -49,6 +51,7 @@ impl Default for ProductSettings {
             revision: 1,
             accent: "#EF4048".to_owned(),
             icon_theme: "*:-HighContrast".to_owned(),
+            appearance: AppearanceMode::Dark,
             wallpaper: String::new(),
             desktop_selection_fill_opacity: 20,
             window_snap_preview_fill_opacity: 20,
@@ -155,6 +158,10 @@ impl ConfigStore {
                 "revision" => snapshot.revision = parse(value, "revision")?,
                 "accent" => snapshot.accent = value.to_owned(),
                 "iconTheme" => snapshot.icon_theme = value.to_owned(),
+                "appearance" => {
+                    snapshot.appearance = AppearanceMode::parse(value)
+                        .ok_or_else(|| FlameError::invalid("bad appearance"))?;
+                }
                 "wallpaper" => snapshot.wallpaper = value.to_owned(),
                 "DesktopSelectionFillOpacity" => {
                     snapshot.desktop_selection_fill_opacity = parse(value, key)?;
@@ -210,6 +217,7 @@ impl ConfigStore {
             format!("revision={}", snapshot.revision),
             format!("accent={}", snapshot.accent),
             format!("iconTheme={}", snapshot.icon_theme),
+            format!("appearance={}", snapshot.appearance.as_str()),
             format!("wallpaper={}", snapshot.wallpaper),
             format!(
                 "DesktopSelectionFillOpacity={}",
@@ -331,6 +339,7 @@ fn is_stable_key(key: &str) -> bool {
         "revision"
             | "accent"
             | "iconTheme"
+            | "appearance"
             | "wallpaper"
             | "DesktopSelectionFillOpacity"
             | "WindowSnapPreviewFillOpacity"
@@ -375,6 +384,32 @@ mod tests {
         assert_eq!(settings.taskbar_height, 44);
         assert_eq!(settings.desktop_selection_fill_opacity, 20);
         assert_eq!(settings.window_snap_preview_fill_opacity, 20);
+        assert_eq!(settings.appearance, AppearanceMode::Dark);
+    }
+
+    #[test]
+    fn appearance_snapshot_round_trip_defaults_to_dark() {
+        let store = ConfigStore::default();
+        let parsed = store
+            .parse_snapshot("revision=2\n")
+            .expect("valid snapshot");
+        assert_eq!(parsed.appearance, AppearanceMode::Dark);
+        let text = ConfigStore::serialize(&ProductSettings::default());
+        assert!(text.contains("appearance=dark\n"));
+        let reparsed = store.parse_snapshot(&text).expect("round trip");
+        assert_eq!(reparsed.appearance, AppearanceMode::Dark);
+    }
+
+    #[test]
+    fn invalid_appearance_value_is_rejected() {
+        let store = ConfigStore::default();
+        assert_eq!(
+            store
+                .parse_snapshot("revision=2\nappearance=neon\n")
+                .expect_err("bad appearance")
+                .code,
+            ErrorCode::InvalidArgument
+        );
     }
 
     #[test]

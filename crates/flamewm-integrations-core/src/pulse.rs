@@ -1,4 +1,7 @@
-use flamewm_api::system::{AudioSnapshot, ServiceAvailability};
+use flamewm_api::system::{
+    AudioEndpointSnapshot, AudioMuteAction, AudioSnapshot, AudioStreamSnapshot, AudioTarget,
+    AudioVolumeAction, ServiceAvailability,
+};
 use flamewm_api::{ErrorCode, FlameError, FlameResult};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -13,27 +16,25 @@ pub enum PulseState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PulseStatus {
     pub state: PulseState,
-    pub sink_name: String,
-    pub volume_percent: u8,
-    pub muted: bool,
+    pub endpoints: Vec<AudioEndpointSnapshot>,
+    pub streams: Vec<AudioStreamSnapshot>,
 }
 
 impl Default for PulseStatus {
     fn default() -> Self {
         Self {
             state: PulseState::Unavailable,
-            sink_name: String::new(),
-            volume_percent: 0,
-            muted: false,
+            endpoints: Vec::new(),
+            streams: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PulseIntent {
-    SetVolume(u8),
-    SetMute(bool),
-    ReconcileSink,
+    SetVolume(AudioVolumeAction),
+    SetMute(AudioMuteAction),
+    Reconcile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +62,7 @@ pub struct PulseController {
     reconnect_attempts: u8,
     reconnect_pending: bool,
     backoff: BackoffConfig,
-    sink_reconcile_pending: bool,
+    reconcile_pending: bool,
 }
 
 impl Default for PulseController {
@@ -73,7 +74,7 @@ impl Default for PulseController {
             reconnect_attempts: 0,
             reconnect_pending: false,
             backoff: BackoffConfig::default(),
-            sink_reconcile_pending: false,
+            reconcile_pending: false,
         }
     }
 }
@@ -108,15 +109,14 @@ impl PulseController {
         self.generation = self.generation.saturating_add(1).max(1);
         self.server_generation = self.server_generation.saturating_add(1).max(1);
         self.status = PulseStatus::default();
-        self.sink_reconcile_pending = false;
+        self.reconcile_pending = false;
         self.reconnect_pending = true;
     }
 
-    pub fn sink_info(
+    pub fn reconcile(
         &mut self,
-        sink_name: &str,
-        volume_percent: u8,
-        muted: bool,
+        endpoints: Vec<AudioEndpointSnapshot>,
+        streams: Vec<AudioStreamSnapshot>,
         captured_generation: u64,
         captured_server_generation: u64,
     ) -> bool {
@@ -127,38 +127,45 @@ impl PulseController {
         }
         self.status = PulseStatus {
             state: PulseState::Ready,
-            sink_name: sink_name.to_owned(),
-            volume_percent: volume_percent.min(100),
-            muted,
+            endpoints,
+            streams,
         };
-        self.sink_reconcile_pending = false;
+        self.reconcile_pending = false;
         true
     }
 
     pub fn subscription_event(&mut self, captured_generation: u64) -> bool {
-        if captured_generation != self.generation || self.sink_reconcile_pending {
+        if captured_generation != self.generation || self.reconcile_pending {
             return false;
         }
-        self.sink_reconcile_pending = true;
+        self.reconcile_pending = true;
         true
     }
 
     pub fn take_reconcile_intent(&mut self, captured_generation: u64) -> Option<PulseIntent> {
-        if captured_generation != self.generation || !self.sink_reconcile_pending {
+        if captured_generation != self.generation || !self.reconcile_pending {
             return None;
         }
-        self.sink_reconcile_pending = false;
-        Some(PulseIntent::ReconcileSink)
+        self.reconcile_pending = false;
+        Some(PulseIntent::Reconcile)
     }
 
-    pub fn set_volume(&self, percent: u8, caller_generation: u64) -> FlameResult<PulseIntent> {
-        self.validate_ready(caller_generation)?;
-        Ok(PulseIntent::SetVolume(percent.min(100)))
+    pub fn set_volume(&self, action: AudioVolumeAction) -> FlameResult<PulseIntent> {
+        self.validate_ready(action.generation, action.server_generation)?;
+        if action.percent > 150 {
+            return Err(FlameError::new(
+                ErrorCode::InvalidArgument,
+                "audio volume must be in 0..=150",
+            ));
+        }
+        self.validate_target(action.target)?;
+        Ok(PulseIntent::SetVolume(action))
     }
 
-    pub fn set_mute(&self, muted: bool, caller_generation: u64) -> FlameResult<PulseIntent> {
-        self.validate_ready(caller_generation)?;
-        Ok(PulseIntent::SetMute(muted))
+    pub fn set_mute(&self, action: AudioMuteAction) -> FlameResult<PulseIntent> {
+        self.validate_ready(action.generation, action.server_generation)?;
+        self.validate_target(action.target)?;
+        Ok(PulseIntent::SetMute(action))
     }
 
     pub fn next_reconnect_delay_ms(&mut self) -> Option<u64> {
@@ -181,6 +188,11 @@ impl PulseController {
 
     #[must_use]
     pub fn snapshot(&self) -> AudioSnapshot {
+        let default_sink = self
+            .status
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.is_default);
         AudioSnapshot {
             availability: if self.status.state == PulseState::Ready {
                 ServiceAvailability::Available
@@ -189,14 +201,16 @@ impl PulseController {
             },
             generation: self.generation,
             server_generation: self.server_generation,
-            sink_name: self.status.sink_name.clone(),
-            volume_percent: self.status.volume_percent,
-            muted: self.status.muted,
+            sink_name: default_sink.map_or_else(String::new, |sink| sink.name.clone()),
+            volume_percent: default_sink.map_or(0, |sink| sink.volume_percent),
+            muted: default_sink.is_some_and(|sink| sink.muted),
+            ..AudioSnapshot::default()
         }
+        .with_items(self.status.endpoints.clone(), self.status.streams.clone())
     }
 
-    fn validate_ready(&self, caller_generation: u64) -> FlameResult<()> {
-        if caller_generation != self.generation {
+    fn validate_ready(&self, generation: u64, server_generation: u64) -> FlameResult<()> {
+        if generation != self.generation || server_generation != self.server_generation {
             return Err(FlameError::new(
                 ErrorCode::StaleRevision,
                 "stale PulseAudio generation",
@@ -209,6 +223,25 @@ impl PulseController {
             ));
         }
         Ok(())
+    }
+
+    fn validate_target(&self, target: AudioTarget) -> FlameResult<()> {
+        let found = match target {
+            AudioTarget::Endpoint { id, kind } => self
+                .status
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.id == id && endpoint.kind == kind),
+            AudioTarget::Stream { id } => self.status.streams.iter().any(|stream| stream.id == id),
+        };
+        if found {
+            Ok(())
+        } else {
+            Err(FlameError::new(
+                ErrorCode::NotFound,
+                "audio target no longer exists",
+            ))
+        }
     }
 }
 
@@ -223,7 +256,7 @@ mod tests {
         let generation = pulse.generation();
         let server_generation = pulse.server_generation();
         pulse.server_restarted();
-        assert!(!pulse.sink_info("old", 90, false, generation, server_generation));
+        assert!(!pulse.reconcile(Vec::new(), Vec::new(), generation, server_generation));
     }
 
     #[test]
@@ -235,7 +268,52 @@ mod tests {
         assert!(!pulse.subscription_event(generation));
         assert_eq!(
             pulse.take_reconcile_intent(generation),
-            Some(PulseIntent::ReconcileSink)
+            Some(PulseIntent::Reconcile)
+        );
+    }
+
+    #[test]
+    fn target_actions_reject_stale_server_and_unknown_id() {
+        let mut pulse = PulseController::default();
+        pulse.connect_started();
+        let generation = pulse.generation();
+        assert!(pulse.ready(generation));
+        assert!(pulse.reconcile(
+            vec![AudioEndpointSnapshot {
+                id: 4,
+                kind: flamewm_api::system::AudioEndpointKind::Sink,
+                name: "sink".to_owned(),
+                description: String::new(),
+                volume_percent: 100,
+                muted: false,
+                is_default: true,
+            }],
+            Vec::new(),
+            generation,
+            pulse.server_generation(),
+        ));
+        let stale = pulse.set_volume(AudioVolumeAction {
+            target: AudioTarget::Endpoint {
+                id: 4,
+                kind: flamewm_api::system::AudioEndpointKind::Sink,
+            },
+            percent: 100,
+            generation,
+            server_generation: 1,
+        });
+        assert_eq!(
+            stale.expect_err("stale server").code,
+            ErrorCode::StaleRevision
+        );
+        let missing = pulse.set_mute(AudioMuteAction {
+            target: AudioTarget::Stream { id: 9 },
+            muted: true,
+            generation,
+            server_generation: pulse.server_generation(),
+        });
+        assert_eq!(
+            missing.expect_err("missing stream").code,
+            ErrorCode::NotFound
         );
     }
 }

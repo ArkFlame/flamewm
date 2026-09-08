@@ -1,6 +1,7 @@
 //! Desktop presentation contracts learned from the current native desktop renderer.
 
-use flamewm_api::Rect;
+use flamewm_api::{Point, Rect, Size};
+use flamewm_ui_core::popover::{PopoverEdge, PopoverGeometry};
 
 pub const WATERMARK_WIDTH: i32 = 220;
 pub const WATERMARK_HEIGHT: i32 = 73;
@@ -38,6 +39,96 @@ pub fn desktop_item_visual_rect(item: Rect) -> Rect {
     )
 }
 
+/// Split a desktop icon label into at most two renderer-neutral text lines.
+///
+/// Defaults observed in the native desktop renderer: `width_px = 76.0`,
+/// `font_size = 13.0`. Capacity per line is
+/// `floor(width_px / (font_size * 0.56))` clamped to a minimum of 8 chars.
+/// Counting and slicing are Unicode-safe (`chars`, never bytes). Word
+/// boundaries (whitespace) are preferred; a single over-long token is hard
+/// split by chars and the final line is truncated to `capacity - 1` chars
+/// plus `'…'`. Centering and ellipsis styling remain the CSS/renderer job.
+#[must_use]
+pub fn desktop_label_lines(text: &str, width_px: f32, font_size: f32) -> [String; 2] {
+    let capacity = {
+        let per_char = font_size * 0.56_f32;
+        if per_char > 0.0_f32 && width_px > 0.0_f32 {
+            (width_px / per_char).floor() as usize
+        } else {
+            8_usize
+        }
+        .max(8_usize)
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return [String::new(), String::new()];
+    }
+    let char_len = |s: &str| s.chars().count();
+    let take_chars = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    let skip_chars = |s: &str, n: usize| s.chars().skip(n).collect::<String>();
+    let truncate_final = |s: &str| {
+        if char_len(s) <= capacity {
+            s.to_owned()
+        } else {
+            let mut out = take_chars(s, capacity.saturating_sub(1));
+            out.push('…');
+            out
+        }
+    };
+
+    if char_len(trimmed) <= capacity {
+        return [trimmed.to_owned(), String::new()];
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.is_empty() {
+        return [String::new(), String::new()];
+    }
+    // Single unbroken token: hard split across both lines.
+    if words.len() == 1 {
+        let word = words[0];
+        let first = take_chars(word, capacity);
+        let rest = skip_chars(word, capacity);
+        return [first, truncate_final(&rest)];
+    }
+
+    // Greedy word-boundary pack for the first line.
+    let mut first_len = 0_usize;
+    let mut first_count = 0_usize;
+    for word in &words {
+        let word_len = char_len(word);
+        if word_len > capacity {
+            break;
+        }
+        let needed = if first_count == 0 {
+            word_len
+        } else {
+            first_len + 1 + word_len
+        };
+        if needed <= capacity {
+            first_len = needed;
+            first_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if first_count == 0 {
+        // Leading token exceeds capacity: hard split it, remainder goes to line two.
+        let first = take_chars(words[0], capacity);
+        let mut rest = skip_chars(words[0], capacity);
+        if words.len() > 1 {
+            rest.push(' ');
+            rest.push_str(&words[1..].join(" "));
+        }
+        return [first, truncate_final(&rest)];
+    }
+
+    let first_line = words[..first_count].join(" ");
+    let rest = words[first_count..].join(" ");
+    [first_line, truncate_final(&rest)]
+}
+
 #[must_use]
 pub fn watermark_geometry(
     work_area: Rect,
@@ -72,6 +163,7 @@ pub enum BlankDesktopAction {
     OpenTerminal,
     CreateNewFolder,
     NewStickyNote,
+    AddVirtualDesktop,
     DesktopAndWallpaper,
 }
 impl BlankDesktopAction {
@@ -81,6 +173,7 @@ impl BlankDesktopAction {
             Self::OpenTerminal => "Open Terminal",
             Self::CreateNewFolder => "Create New Folder",
             Self::NewStickyNote => "New Sticky Note",
+            Self::AddVirtualDesktop => "Add Virtual Desktop",
             Self::DesktopAndWallpaper => "Desktop and Wallpaper",
         }
     }
@@ -95,8 +188,39 @@ pub fn blank_context_menu(sticky_enabled: bool) -> Vec<BlankDesktopAction> {
     if sticky_enabled {
         actions.push(BlankDesktopAction::NewStickyNote);
     }
+    actions.push(BlankDesktopAction::AddVirtualDesktop);
     actions.push(BlankDesktopAction::DesktopAndWallpaper);
     actions
+}
+
+/// Fixed context-menu footprint used for work-area clamping.
+pub const CONTEXT_MENU_WIDTH: i32 = 220;
+pub const CONTEXT_MENU_ROW_HEIGHT: i32 = 32;
+
+/// Clamp a menu anchor so the menu rect stays inside the work area.
+#[must_use]
+pub fn clamp_menu_anchor(work_area: Rect, anchor: Rect, menu_size: (i32, i32)) -> Rect {
+    let width = menu_size.0.max(0).min(work_area.width.max(0));
+    let height = menu_size.1.max(0).min(work_area.height.max(0));
+    Rect::new(anchor.x, anchor.y, width, height).clamp_inside(work_area)
+}
+
+/// Menu height for a row count at the fixed row height.
+#[must_use]
+pub fn menu_height_for_rows(rows: usize) -> i32 {
+    (rows as i32).saturating_mul(CONTEXT_MENU_ROW_HEIGHT).max(0)
+}
+
+/// Canonical popover placement for a context menu anchored at a pointer.
+/// The pointer is treated as a 1px source rect; the menu prefers opening
+/// below/right of the press and clamps into the work area through the
+/// canonical `PopoverGeometry` owner. Returns the placed rect.
+#[must_use]
+pub fn context_menu_rect(work_area: Rect, anchor: Point, rows: usize) -> Rect {
+    let size = Size::new(CONTEXT_MENU_WIDTH, menu_height_for_rows(rows));
+    let source = Rect::new(anchor.x, anchor.y, 1, 1);
+    let placed = PopoverGeometry::place(source, size, PopoverEdge::Below, work_area, 0);
+    Rect::from_parts(placed.origin, size)
 }
 
 pub const SELECTION_ACCENT_RGB: u32 = 0xff5533;
@@ -153,11 +277,46 @@ mod tests {
     }
     #[test]
     fn sticky_menu_item_is_conditional() {
-        assert_eq!(blank_context_menu(false).len(), 3);
+        assert_eq!(blank_context_menu(false).len(), 4);
         assert_eq!(
             blank_context_menu(true)[2],
             BlankDesktopAction::NewStickyNote
         );
+        let without = blank_context_menu(false);
+        assert!(without.contains(&BlankDesktopAction::AddVirtualDesktop));
+        assert_eq!(
+            without.last(),
+            Some(&BlankDesktopAction::DesktopAndWallpaper)
+        );
+    }
+    #[test]
+    fn menu_anchor_clamps_inside_work_area() {
+        let work_area = Rect::new(0, 0, 1920, 1040);
+        let clamped = clamp_menu_anchor(work_area, Rect::new(1900, 1020, 220, 160), (220, 160));
+        assert_eq!(clamped, Rect::new(1700, 880, 220, 160));
+        assert_eq!(menu_height_for_rows(4), 128);
+    }
+    #[test]
+    fn menu_rows_map_to_fixed_row_geometry() {
+        assert_eq!(CONTEXT_MENU_WIDTH, 220);
+        assert_eq!(CONTEXT_MENU_ROW_HEIGHT, 32);
+        assert_eq!(menu_height_for_rows(1), 32);
+        assert_eq!(menu_height_for_rows(2), 64);
+        assert_eq!(menu_height_for_rows(5), 160);
+    }
+    #[test]
+    fn blank_menu_row_visibility_follows_sticky_flag() {
+        // 4 rows without sticky, 5 with: hidden rows stay display:none.
+        assert_eq!(menu_height_for_rows(blank_context_menu(false).len()), 128);
+        assert_eq!(menu_height_for_rows(blank_context_menu(true).len()), 160);
+        assert!(!blank_context_menu(false).contains(&BlankDesktopAction::NewStickyNote));
+        assert!(blank_context_menu(true).contains(&BlankDesktopAction::NewStickyNote));
+    }
+    #[test]
+    fn menu_anchor_clamps_zero_sized_menu_inside_work_area() {
+        let work_area = Rect::new(0, 0, 1920, 1040);
+        let clamped = clamp_menu_anchor(work_area, Rect::new(100, 100, 220, 0), (220, 0));
+        assert_eq!(clamped, Rect::new(100, 100, 220, 0));
     }
     #[test]
     fn material_blend_matches_native_integer_blend() {
@@ -196,6 +355,46 @@ mod tests {
         assert_eq!(
             desktop_item_visual_rect(Rect::new(10, 10, 80, 96)),
             Rect::new(14, 14, 72, 72)
+        );
+    }
+    #[test]
+    fn label_splits_backup_downloads_on_word_boundary() {
+        assert_eq!(
+            desktop_label_lines("BACKUP DOWNLOADS", 76.0, 13.0),
+            ["BACKUP".to_owned(), "DOWNLOADS".to_owned()]
+        );
+    }
+    #[test]
+    fn label_keeps_single_short_name_on_first_line() {
+        assert_eq!(
+            desktop_label_lines("Docs", 76.0, 13.0),
+            ["Docs".to_owned(), String::new()]
+        );
+    }
+    #[test]
+    fn label_truncates_long_unbroken_token_with_ellipsis() {
+        let [first, second] = desktop_label_lines("Superlongfilenamewithoutspaces", 76.0, 13.0);
+        assert_eq!(first, "Superlongf");
+        assert_eq!(second, "ilenamewi…");
+        assert!(second.chars().count() <= 10);
+        assert!(second.ends_with('…'));
+    }
+    #[test]
+    fn label_counts_unicode_chars_not_bytes() {
+        let [first, second] = desktop_label_lines("café résumé naïve", 76.0, 13.0);
+        assert_eq!(first, "café");
+        assert_eq!(second, "résumé na…");
+        assert!(second.chars().count() <= 10);
+    }
+    #[test]
+    fn label_empty_returns_two_empty_lines() {
+        assert_eq!(
+            desktop_label_lines("", 76.0, 13.0),
+            [String::new(), String::new()]
+        );
+        assert_eq!(
+            desktop_label_lines("   ", 76.0, 13.0),
+            [String::new(), String::new()]
         );
     }
 }

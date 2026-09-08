@@ -156,6 +156,45 @@ pub fn group_drag_transaction(
     Ok(result)
 }
 
+/// Pixel drag threshold before a pointer motion becomes a cell drag.
+pub const DRAG_THRESHOLD_PX: f32 = 5.0;
+
+/// Renderer-neutral pointer displacement in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerDelta {
+    pub dx: f32,
+    pub dy: f32,
+}
+
+impl PointerDelta {
+    #[must_use]
+    pub const fn new(dx: f32, dy: f32) -> Self {
+        Self { dx, dy }
+    }
+}
+
+/// Convert a pixel displacement into whole-cell drag steps (nearest-cell rounding).
+#[must_use]
+pub fn drag_cell_delta(pixel_dx: f32, pixel_dy: f32, cell_w: i32, cell_h: i32) -> Cell {
+    let columns = if cell_w > 0 {
+        (pixel_dx / cell_w as f32).round() as i32
+    } else {
+        0
+    };
+    let rows = if cell_h > 0 {
+        (pixel_dy / cell_h as f32).round() as i32
+    } else {
+        0
+    };
+    Cell::new(columns, rows)
+}
+
+/// True once pointer motion reaches the drag threshold.
+#[must_use]
+pub fn threshold_passed(dx: f32, dy: f32) -> bool {
+    dx.hypot(dy) >= DRAG_THRESHOLD_PX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +243,20 @@ mod tests {
             group_drag_transaction(&selected, &occupied, Cell::new(1, 0), grid),
             Err(GroupDragError::Occupied(Cell::new(1, 0)))
         );
+    }
+
+    #[test]
+    fn drag_cell_delta_rounds_to_nearest_cell() {
+        assert_eq!(drag_cell_delta(96.0, 48.0, 96, 96), Cell::new(1, 1));
+        assert_eq!(drag_cell_delta(50.0, -140.0, 96, 96), Cell::new(1, -1));
+        assert_eq!(drag_cell_delta(0.0, 0.0, 96, 96), Cell::new(0, 0));
+    }
+
+    #[test]
+    fn drag_threshold_gates_pointer_motion() {
+        assert_eq!(DRAG_THRESHOLD_PX, 5.0);
+        assert!(!threshold_passed(3.0, 4.0 - 0.1));
+        assert!(threshold_passed(3.0, 4.0));
+        assert!(threshold_passed(-6.0, 0.0));
     }
 }

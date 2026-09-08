@@ -1,6 +1,8 @@
 //! Flame Shell view models. No X11 widget/window owns product state here.
 
+pub mod clock;
 pub mod quickswitch;
+pub mod status;
 
 use flamewm_api::applications::DesktopApplication;
 use flamewm_api::display::DisplaySnapshot;

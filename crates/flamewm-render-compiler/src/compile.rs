@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use flamewm_render_core::{
     fnv1a64, AlignItems, Color, ColorValue, ColorVariable, CompiledDocument, CompiledNode,
     CursorKind, Display, Edges, FlexDirection, ImageAsset, JustifyContent, Length, NodeKind,
-    Position, Style,
+    Overflow, Position, Style,
 };
 
 use crate::css::{parse_declarations, parse_stylesheet, Declaration, PseudoState, Rule};
@@ -272,16 +272,40 @@ impl<'a> Compiler<'a> {
         let path = base.join(src);
         let bytes = fs::read(&path)
             .map_err(|error| format!("failed to read image {}: {error}", path.display()))?;
-        let (width, height, pixels) = parse_ppm_p6(&bytes)
-            .map_err(|error| format!("failed to decode image {}: {error}", path.display()))?;
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let image = match extension.as_str() {
+            "ppm" => flamewm_image_core::ppm::decode(&bytes),
+            "svg" => {
+                let (width, height) =
+                    flamewm_image_core::svg::natural_size(&bytes).map_err(|error| {
+                        format!("failed to decode image {}: {error}", path.display())
+                    })?;
+                flamewm_image_core::svg::render(&bytes, width, height)
+            }
+            "png" => flamewm_image_core::png::decode(&bytes),
+            _ => {
+                return Err(format!(
+                    "unsupported image format for {} (expected ppm, svg, or png)",
+                    path.display()
+                ));
+            }
+        }
+        .map_err(|error| format!("failed to decode image {}: {error}", path.display()))?;
+        // Opaque PPM build assets arrive with alpha=255 from image-core;
+        // SVG/PNG preserve alpha. The RWRB v3 asset contract is 4 bytes/px.
+        let pixels = image.pixels;
         if self.assets.len() >= u16::MAX as usize {
             return Err("too many image assets".to_string());
         }
         let index = self.assets.len() as u16;
         self.assets.push(ImageAsset {
             source: src.to_string(),
-            width,
-            height,
+            width: image.width,
+            height: image.height,
             pixels,
         });
         self.asset_index.insert(src.to_string(), index);
@@ -431,7 +455,23 @@ impl<'a> Compiler<'a> {
                 }
             }
             "box-sizing" if value == "border-box" => {}
-            "overflow" | "overflow-x" | "overflow-y" if matches!(value, "hidden" | "visible") => {}
+            "overflow" | "overflow-x" | "overflow-y" => {
+                let overflow = match value {
+                    "visible" => Overflow::Visible,
+                    "hidden" => Overflow::Hidden,
+                    "auto" => Overflow::Auto,
+                    "scroll" => Overflow::Scroll,
+                    other => return self.unsupported(format!("overflow: {other}")),
+                };
+                match declaration.name.as_str() {
+                    "overflow" => {
+                        style.overflow_x = overflow;
+                        style.overflow_y = overflow;
+                    }
+                    "overflow-x" => style.overflow_x = overflow,
+                    _ => style.overflow_y = overflow,
+                }
+            }
             "user-select" if matches!(value, "none" | "text" | "auto") => {}
             property => return self.unsupported(format!("unsupported CSS property '{property}'")),
         }
@@ -700,71 +740,6 @@ fn apply_border(
     Ok(())
 }
 
-fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let mut cursor = 0usize;
-    let magic = ppm_token(bytes, &mut cursor)?.ok_or_else(|| "missing PPM magic".to_string())?;
-    if magic != b"P6" {
-        return Err("FlameWM Render 0.0.9 image input must be binary PPM (P6)".to_string());
-    }
-    let width = parse_ppm_u32(ppm_token(bytes, &mut cursor)?, "width")?;
-    let height = parse_ppm_u32(ppm_token(bytes, &mut cursor)?, "height")?;
-    let max = parse_ppm_u32(ppm_token(bytes, &mut cursor)?, "max value")?;
-    if width == 0 || height == 0 {
-        return Err("PPM dimensions must be non-zero".to_string());
-    }
-    if max != 255 {
-        return Err(format!("PPM max value must be 255, found {max}"));
-    }
-    if cursor >= bytes.len() || !bytes[cursor].is_ascii_whitespace() {
-        return Err("PPM header is not terminated by whitespace".to_string());
-    }
-    cursor += 1;
-    let expected = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| "PPM dimensions overflow".to_string())? as usize;
-    if bytes.len().saturating_sub(cursor) != expected {
-        return Err(format!(
-            "PPM pixel payload has {} bytes; expected {expected}",
-            bytes.len().saturating_sub(cursor)
-        ));
-    }
-    Ok((width, height, bytes[cursor..].to_vec()))
-}
-
-fn ppm_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<Option<&'a [u8]>, String> {
-    loop {
-        while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
-            *cursor += 1;
-        }
-        if *cursor >= bytes.len() {
-            return Ok(None);
-        }
-        if bytes[*cursor] == b'#' {
-            while *cursor < bytes.len() && bytes[*cursor] != b'\n' {
-                *cursor += 1;
-            }
-            continue;
-        }
-        break;
-    }
-    let start = *cursor;
-    while *cursor < bytes.len() && !bytes[*cursor].is_ascii_whitespace() && bytes[*cursor] != b'#' {
-        *cursor += 1;
-    }
-    if start == *cursor {
-        return Err("invalid empty PPM token".to_string());
-    }
-    Ok(Some(&bytes[start..*cursor]))
-}
-
-fn parse_ppm_u32(token: Option<&[u8]>, field: &str) -> Result<u32, String> {
-    let token = token.ok_or_else(|| format!("missing PPM {field}"))?;
-    let text = std::str::from_utf8(token).map_err(|_| format!("PPM {field} is not ASCII"))?;
-    text.parse::<u32>()
-        .map_err(|_| format!("invalid PPM {field} '{text}'"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +791,39 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_ui_css_uses_default_arrow_cursor() {
+        // C-CURSOR-ARROW: ordinary buttons/menu rows/desktop entries/titlebar
+        // buttons -> default arrow; text/password entry -> text; explicit
+        // resize edges only -> resize. Deferred follow-up lines (owned by
+        // parallel jobs this wave): ui/desktop/desktop.css `.desktop-item
+        // cursor:pointer`, ui/shell/flamewm.css `.desktop-icon cursor:move`.
+        let files = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/settings.css"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/desktop/desktop.css"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/shell/flamewm.css"),
+        ];
+        for path in files {
+            let css = std::fs::read_to_string(path).expect("read active UI CSS");
+            assert!(
+                !css.contains("cursor:pointer"),
+                "ordinary UI CSS must not use cursor:pointer: {path}"
+            );
+        }
+        // Cascade-safe: legitimate text/move roles must still exist in the
+        // active cascade (checked here so the guard fails closed if a
+        // future edit strips them globally).
+        let shell = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../ui/shell/flamewm.css"
+        ))
+        .expect("read shell UI CSS");
+        assert!(
+            shell.contains("cursor:text") && shell.contains("cursor:move"),
+            "active cascade must keep legitimate text/move cursor roles"
+        );
+    }
+
+    #[test]
     fn zero_width_seed_keeps_runtime_text_slot_mutable() {
         let output = compile_str(
             r#"<body><div id="slot">&#8203;</div></body>"#,
@@ -839,7 +847,41 @@ mod tests {
     fn parses_binary_ppm_asset_payload() {
         let mut bytes = b"P6\n1 1\n255\n".to_vec();
         bytes.extend_from_slice(&[0x12, 0x34, 0x56]);
-        let parsed = parse_ppm_p6(&bytes).unwrap();
-        assert_eq!(parsed, (1, 1, vec![0x12, 0x34, 0x56]));
+        let parsed = flamewm_image_core::ppm::decode(&bytes).unwrap();
+        assert_eq!(parsed.width, 1);
+        assert_eq!(parsed.height, 1);
+        assert_eq!(parsed.pixels, vec![0x12, 0x34, 0x56, 255]);
+    }
+
+    #[test]
+    fn opaque_ppm_asset_compiles_to_fully_opaque_rgba8() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "flamewm-j05-ppm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ppm = dir.join("icon.ppm");
+        let mut bytes = b"P6\n1 1\n255\n".to_vec();
+        bytes.extend_from_slice(&[0x11, 0x22, 0x33]);
+        std::fs::write(&ppm, &bytes).expect("temp ppm");
+        let html = dir.join("doc.html");
+        let mut file = std::fs::File::create(&html).expect("temp html");
+        write!(
+            file,
+            "<html><body><img id=\"i\" src=\"icon.ppm\"></body></html>"
+        )
+        .expect("write html");
+        let output = compile_file(&html, &[], CompileOptions::default()).expect("compile");
+        assert_eq!(output.document.assets.len(), 1);
+        assert_eq!(
+            output.document.assets[0].pixels,
+            vec![0x11, 0x22, 0x33, 255]
+        );
+        assert!(output.document.assets[0].is_fully_opaque());
     }
 }

@@ -1,7 +1,7 @@
-use flamewm_render_core::{RuntimeDocument, decode};
+use flamewm_ui_x11::{UiDocument, decode_document};
 
 const COMPILED_UI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flamewm-settings.rwr"));
 
-pub fn document() -> Result<RuntimeDocument, String> {
-    RuntimeDocument::new(decode(COMPILED_UI)?)
+pub fn document() -> Result<UiDocument, String> {
+    decode_document(COMPILED_UI)
 }

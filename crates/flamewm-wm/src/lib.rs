@@ -1,15 +1,5 @@
-//! FlameWM's independent X11 window manager.
+//! FlameWM window-manager facade.
 //!
-//! This crate is the product-owned native X11 window manager.
-//! Historical implementations under `.vendor/` are reference material only.
+//! Native X11 authority lives in `flamewm-wm-x11`.
 
-mod atoms;
-mod chrome;
-mod classifier;
-mod client;
-mod geometry;
-mod runtime;
-mod wm;
-
-pub use runtime::run;
-pub use wm::WmConfig;
+pub use flamewm_wm_x11::{WmConfig, run};

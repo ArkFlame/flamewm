@@ -59,11 +59,19 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
         return Err("not a FlameWM Render compiled document".to_string());
     }
     let version = reader.u16()?;
-    if version != FORMAT_VERSION {
-        return Err(format!(
-            "unsupported FlameWM Render format version {version}; expected {FORMAT_VERSION}"
-        ));
-    }
+    // Pixel-format decision: v3 is straight RGBA8 (4 bytes/px). v2 legacy
+    // documents carry opaque RGB8 (3 bytes/px) and upconvert to alpha=255 so
+    // existing PPM build artifacts keep decoding. Unknown versions are
+    // rejected explicitly; no silent reinterpretation of pixel bytes.
+    let bytes_per_pixel: u32 = match version {
+        FORMAT_VERSION => 4,
+        FORMAT_VERSION_RGB8_LEGACY => 3,
+        other => {
+            return Err(format!(
+                "unsupported FlameWM Render format version {other}; expected {FORMAT_VERSION} (legacy {FORMAT_VERSION_RGB8_LEGACY} accepted with RGB8-to-RGBA8 upconversion)"
+            ));
+        }
+    };
     let _flags = reader.u16()?;
     let source_fingerprint = reader.u64()?;
     let root = reader.u32()?;
@@ -97,7 +105,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
         let byte_count = reader.u32()? as usize;
         let expected = width
             .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(3))
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
             .ok_or_else(|| "compiled image dimensions overflow".to_string())?
             as usize;
         if byte_count != expected {
@@ -105,7 +113,16 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
                 "compiled image has {byte_count} bytes; expected {expected}"
             ));
         }
-        let pixels = reader.take(byte_count)?.to_vec();
+        let raw = reader.take(byte_count)?.to_vec();
+        let pixels = if bytes_per_pixel == 3 {
+            let mut rgba = Vec::with_capacity(raw.len() / 3 * 4);
+            for rgb in raw.chunks_exact(3) {
+                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            rgba
+        } else {
+            raw
+        };
         assets.push(ImageAsset {
             source,
             width,
@@ -129,7 +146,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
         let action = reader.string()?;
         let text = reader.string()?;
         let image = reader.opt_u16()?;
-        let style = reader.style()?;
+        let style = reader.style_versioned(version)?;
         let hover_style = if reader.u8()? != 0 {
             Some(reader.style()?)
         } else {
@@ -309,6 +326,18 @@ impl Writer {
         self.f32(style.font_size);
         self.u16(style.font_weight);
         self.f32(style.opacity);
+        self.u8(match style.overflow_x {
+            Overflow::Visible => 0,
+            Overflow::Hidden => 1,
+            Overflow::Auto => 2,
+            Overflow::Scroll => 3,
+        });
+        self.u8(match style.overflow_y {
+            Overflow::Visible => 0,
+            Overflow::Hidden => 1,
+            Overflow::Auto => 2,
+            Overflow::Scroll => 3,
+        });
     }
 }
 
@@ -403,6 +432,10 @@ impl<'a> Reader<'a> {
         })
     }
     fn style(&mut self) -> Result<Style, String> {
+        self.style_versioned(FORMAT_VERSION)
+    }
+
+    fn style_versioned(&mut self, version: u16) -> Result<Style, String> {
         let display = match self.u8()? {
             0 => Display::None,
             1 => Display::Block,
@@ -473,6 +506,29 @@ impl<'a> Reader<'a> {
             font_weight: self.u16()?,
             opacity: self.f32()?,
             cursor,
+            // Post-v3 addition: v2 legacy documents predate overflow bytes.
+            overflow_x: if version == FORMAT_VERSION_RGB8_LEGACY {
+                Overflow::Visible
+            } else {
+                match self.u8()? {
+                    0 => Overflow::Visible,
+                    1 => Overflow::Hidden,
+                    2 => Overflow::Auto,
+                    3 => Overflow::Scroll,
+                    v => return Err(format!("invalid overflow {v}")),
+                }
+            },
+            overflow_y: if version == FORMAT_VERSION_RGB8_LEGACY {
+                Overflow::Visible
+            } else {
+                match self.u8()? {
+                    0 => Overflow::Visible,
+                    1 => Overflow::Hidden,
+                    2 => Overflow::Auto,
+                    3 => Overflow::Scroll,
+                    v => return Err(format!("invalid overflow {v}")),
+                }
+            },
         })
     }
 }
@@ -494,7 +550,7 @@ mod tests {
                 source: "pixel.ppm".into(),
                 width: 1,
                 height: 1,
-                pixels: vec![255, 0, 0],
+                pixels: vec![255, 0, 0, 255],
             }],
             nodes: vec![CompiledNode {
                 kind: NodeKind::Element,
@@ -513,5 +569,101 @@ mod tests {
         let bytes = encode(&document).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, document);
+    }
+
+    #[test]
+    fn legacy_rgb8_document_upconverts_to_opaque_rgba8() {
+        // Hand-build a v2 document: same layout as encode() but version=2
+        // with 3-byte RGB pixels. The v3 decoder must accept it explicitly
+        // and convert each pixel to alpha=255.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FORMAT_MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION_RGB8_LEGACY.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let source = b"legacy.ppm";
+        bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(source);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[10, 20, 30]);
+        // Minimal root element node to pass validate().
+        bytes.push(0);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        for _ in 0..3 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        // Default style encoding: display=Block(1), then 5 single-byte enums.
+        bytes.extend_from_slice(&[1, 0, 0, 3, 0, 0]);
+        for _ in 0..10 {
+            bytes.extend_from_slice(&[0]);
+            bytes.extend_from_slice(&0f32.to_le_bytes());
+        }
+        for _ in 0..2 {
+            bytes.extend_from_slice(
+                &[0f32; 4]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0, 0, 0, 255, 0, 0]);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&14f32.to_le_bytes());
+        bytes.extend_from_slice(&400u16.to_le_bytes());
+        bytes.extend_from_slice(&1f32.to_le_bytes());
+        // v2 legacy style ends here: opacity f32, no overflow bytes.
+        // hover/active presence flags (both absent).
+        bytes.push(0);
+        bytes.push(0);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.assets[0].pixels, vec![10, 20, 30, 255]);
+        assert!(decoded.assets[0].is_fully_opaque());
+    }
+
+    #[test]
+    fn unknown_version_is_rejected_explicitly() {
+        let document = CompiledDocument {
+            source_fingerprint: 1,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![CompiledNode {
+                kind: NodeKind::Element,
+                parent: None,
+                first_child: None,
+                next_sibling: None,
+                id: String::new(),
+                action: String::new(),
+                text: String::new(),
+                image: None,
+                style: Style::default(),
+                hover_style: None,
+                active_style: None,
+            }],
+        };
+        let mut bytes = encode(&document).unwrap();
+        bytes[4..6].copy_from_slice(&9u16.to_le_bytes());
+        let error = decode(&bytes).expect_err("version 9 must fail");
+        assert!(
+            error.contains("unsupported FlameWM Render format version 9"),
+            "unexpected: {error}"
+        );
     }
 }

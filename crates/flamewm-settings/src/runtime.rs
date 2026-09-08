@@ -1,4 +1,4 @@
-use flamewm_render_x11::{ControllerEvent, X11Config, run_with_controller_events};
+use flamewm_ui_x11::{UiControllerEvent, UiWindowRole, run_with_controller_events_role};
 
 use crate::SettingsApplication;
 use crate::control::SettingsControl;
@@ -10,13 +10,13 @@ pub fn run() -> Result<(), String> {
     );
     let mut document = view::document()?;
     application.refresh(&mut document)?;
-    run_with_controller_events(
+    run_with_controller_events_role(
         document,
-        super::normal_window_config(1350, 641),
+        super::normal_window_config(720, 480),
+        UiWindowRole::Normal,
         move |event, document| {
-            if let ControllerEvent::Action(action) = event {
-                application.handle_action(action, document)?;
-            }
+            let UiControllerEvent::Action(action) = event;
+            application.handle_action(action, document)?;
             Ok(())
         },
     )

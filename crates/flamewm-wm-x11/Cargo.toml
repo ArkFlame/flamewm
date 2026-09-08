@@ -1,0 +1,23 @@
+[package]
+name = "flamewm-wm-x11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+calloop.workspace = true
+flamewm-api = { path = "../flamewm-api" }
+flamewm-applications = { path = "../flamewm-applications" }
+flamewm-integrations-linux = { path = "../flamewm-integrations-linux" }
+flamewm-window-core = { path = "../flamewm-window-core" }
+flamewm-platform = { path = "../flamewm-platform" }
+flamewm-control-dbus = { path = "../flamewm-control-dbus" }
+flamewm-control-wire = { path = "../flamewm-control-wire" }
+flamewm-reactor = { path = "../flamewm-reactor" }
+flamewm-skin = { path = "../flamewm-skin" }
+x11rb.workspace = true
+
+[lints]
+workspace = true

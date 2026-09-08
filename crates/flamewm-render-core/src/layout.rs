@@ -8,9 +8,56 @@ pub struct LayoutBox {
 #[derive(Clone, Debug)]
 pub struct LayoutResult {
     pub boxes: Vec<LayoutBox>,
+    /// Content extent per node in surface coordinates (viewport origin +
+    /// intrinsic content size). Viewport is `boxes[index].rect`.
+    pub contents: Vec<Rect>,
 }
 
 impl LayoutResult {
+    pub fn content_extent(&self, index: u32) -> Rect {
+        self.contents
+            .get(index as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Pure viewport/content/offset -> metrics (thumb geometry included).
+    /// Thumb minimum is 12px; no thumb when content fits.
+    pub fn scroll_metrics(viewport: Rect, content: Rect, offset: ScrollState) -> ScrollMetrics {
+        let max_x = (content.width - viewport.width).max(0.0);
+        let max_y = (content.height - viewport.height).max(0.0);
+        let offset = offset.clamped(max_x, max_y);
+        ScrollMetrics {
+            viewport,
+            content,
+            max_x,
+            max_y,
+            thumb_x: thumb_rect(
+                viewport,
+                content.width,
+                viewport.width,
+                offset.offset_x,
+                true,
+            ),
+            thumb_y: thumb_rect(
+                viewport,
+                content.height,
+                viewport.height,
+                offset.offset_y,
+                false,
+            ),
+        }
+    }
+
+    pub fn metrics_for(&self, index: u32, offset: ScrollState) -> ScrollMetrics {
+        let viewport = self
+            .boxes
+            .get(index as usize)
+            .map(|b| b.rect)
+            .unwrap_or_default();
+        Self::scroll_metrics(viewport, self.content_extent(index), offset)
+    }
+
     pub fn hit_test_action(&self, document: &RuntimeDocument, x: f32, y: f32) -> Option<u32> {
         let mut indices: Vec<usize> = (0..document.document.nodes.len()).collect();
         indices.sort_by_key(|index| (document.effective_z_index(*index as u32), *index as i64));
@@ -38,7 +85,10 @@ impl LayoutEngine {
     ) -> LayoutResult {
         let mut boxes = vec![LayoutBox::default(); document.document.nodes.len()];
         if document.document.nodes.is_empty() {
-            return LayoutResult { boxes };
+            return LayoutResult {
+                boxes,
+                contents: Vec::new(),
+            };
         }
         let mut engine = Engine {
             document,
@@ -54,7 +104,57 @@ impl LayoutEngine {
             Some(viewport_width.max(0.0)),
             Some(viewport_height.max(0.0)),
         );
-        LayoutResult { boxes }
+        // Content extent: intrinsic measure unconstrained on the scroll axis.
+        let mut contents = vec![Rect::default(); document.document.nodes.len()];
+        for (index, entry) in boxes.iter().enumerate() {
+            let style = document.runtime_style(index as u32, interaction);
+            let scrolls_x = matches!(
+                style.overflow_x,
+                Overflow::Auto | Overflow::Scroll | Overflow::Hidden
+            );
+            let scrolls_y = matches!(
+                style.overflow_y,
+                Overflow::Auto | Overflow::Scroll | Overflow::Hidden
+            );
+            if !scrolls_x && !scrolls_y {
+                contents[index] = entry.rect;
+                continue;
+            }
+            let mut empty: Vec<LayoutBox> = Vec::new();
+            let probe = Engine {
+                document,
+                interaction,
+                boxes: &mut empty,
+            };
+            let avail_w = if scrolls_x {
+                f32::MAX / 1024.0
+            } else {
+                entry.rect.width.max(0.0)
+            };
+            let avail_h = if scrolls_y {
+                f32::MAX / 1024.0
+            } else {
+                entry.rect.height.max(0.0)
+            };
+            let measured = probe.measure_node(index as u32, avail_w, avail_h);
+            let content_w = if scrolls_x {
+                measured.0.max(entry.rect.width)
+            } else {
+                entry.rect.width
+            };
+            let content_h = if scrolls_y {
+                measured.1.max(entry.rect.height)
+            } else {
+                entry.rect.height
+            };
+            contents[index] = Rect {
+                x: entry.rect.x,
+                y: entry.rect.y,
+                width: content_w,
+                height: content_h,
+            };
+        }
+        LayoutResult { boxes, contents }
     }
 }
 
@@ -490,6 +590,42 @@ fn clamp_length(value: f32, min: Length, max: Length, available: f32) -> f32 {
         result = result.min(maximum);
     }
     result
+}
+
+fn thumb_rect(
+    viewport: Rect,
+    content_len: f32,
+    viewport_len: f32,
+    offset: f32,
+    horizontal: bool,
+) -> Rect {
+    if content_len <= viewport_len || viewport_len <= 0.0 || content_len <= 0.0 {
+        return Rect::default();
+    }
+    let track = if horizontal {
+        viewport.width
+    } else {
+        viewport.height
+    };
+    let thumb_len = (viewport_len / content_len * track).clamp(12.0, track);
+    let travel = (track - thumb_len).max(0.0);
+    let max_offset = (content_len - viewport_len).max(1.0);
+    let pos = (offset.clamp(0.0, max_offset) / max_offset) * travel;
+    if horizontal {
+        Rect {
+            x: viewport.x + pos,
+            y: viewport.y + viewport.height - 8.0,
+            width: thumb_len,
+            height: 8.0,
+        }
+    } else {
+        Rect {
+            x: viewport.x + viewport.width - 8.0,
+            y: viewport.y + pos,
+            width: 8.0,
+            height: thumb_len,
+        }
+    }
 }
 
 #[cfg(test)]

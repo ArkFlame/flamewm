@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use flamewm_api::ports::ShortcutPort;
+use flamewm_api::settings::AppearanceMode;
 use flamewm_api::settings::{SettingValue, SettingsSnapshot, SettingsTransaction};
 use flamewm_api::shortcuts::KeyBinding;
 use flamewm_api::{ErrorCode, FlameError, FlameResult};
@@ -105,6 +106,10 @@ pub fn to_api_snapshot(settings: &ProductSettings) -> SettingsSnapshot {
             SettingValue::Text(settings.icon_theme.clone()),
         ),
         (
+            "appearance".to_owned(),
+            SettingValue::Text(settings.appearance.as_str().to_owned()),
+        ),
+        (
             "wallpaper".to_owned(),
             SettingValue::Text(settings.wallpaper.clone()),
         ),
@@ -180,6 +185,11 @@ fn apply_change(
     match key {
         "accent" => settings.accent = text_or(value, defaults.accent)?,
         "iconTheme" => settings.icon_theme = text_or(value, defaults.icon_theme)?,
+        "appearance" => {
+            let raw = text_or(value, defaults.appearance.as_str().to_owned())?;
+            settings.appearance =
+                AppearanceMode::parse(&raw).ok_or_else(|| FlameError::invalid("bad appearance"))?;
+        }
         "wallpaper" => settings.wallpaper = text_or(value, defaults.wallpaper)?,
         "DesktopSelectionFillOpacity" => {
             settings.desktop_selection_fill_opacity =
@@ -258,6 +268,7 @@ fn reset_section(settings: &mut ProductSettings, section: &str) -> FlameResult<(
         "appearance" => {
             settings.accent = defaults.accent;
             settings.icon_theme = defaults.icon_theme;
+            settings.appearance = defaults.appearance;
         }
         "desktop" => {
             settings.wallpaper = defaults.wallpaper;

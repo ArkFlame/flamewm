@@ -9,6 +9,45 @@ pub enum SettingValue {
     Text(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppearanceMode {
+    System,
+    Light,
+    Dark,
+}
+
+impl Default for AppearanceMode {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
+impl AppearanceMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn prefers_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsSnapshot {
     pub revision: u64,

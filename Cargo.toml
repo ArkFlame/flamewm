@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.7"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-2.0-only"
@@ -12,6 +12,7 @@ authors = ["ArkFlame Studios"]
 
 [workspace.dependencies]
 calloop = "=0.14.4"
+inotify = { version = "=0.11.4", default-features = false }
 x11rb = { version = "=0.14.0", default-features = false, features = ["randr", "shape", "xkb"] }
 
 [workspace.lints.rust]
