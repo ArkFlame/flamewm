@@ -61,10 +61,10 @@ pub fn persist_to_xdg(store: &StickyNoteStore) -> FlameResult<()> {
 }
 
 pub fn serialize(store: &StickyNoteStore) -> String {
-    let mut output = format!("v1\t{}\n", if store.enabled() { 1 } else { 0 });
+    let mut output = format!("v2\t{}\n", if store.enabled() { 1 } else { 0 });
     for note in store.notes() {
         output.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             hex(note.id.as_bytes()),
             note.workspace,
             hex(note.output.as_str().as_bytes()),
@@ -79,7 +79,8 @@ pub fn serialize(store: &StickyNoteStore) -> String {
             note.foreground.red,
             note.foreground.green,
             note.foreground.blue,
-            note.text_size
+            note.text_size,
+            if note.bold { 1 } else { 0 }
         ));
     }
     output
@@ -88,9 +89,11 @@ pub fn serialize(store: &StickyNoteStore) -> String {
 pub fn parse(text: &str) -> FlameResult<StickyNoteStore> {
     let mut lines = text.lines();
     let header = lines.next().ok_or_else(|| invalid("empty sticky state"))?;
-    let enabled = match header {
-        "v1\t0" => false,
-        "v1\t1" => true,
+    let (version, enabled) = match header {
+        "v1\t0" => (1_u8, false),
+        "v1\t1" => (1_u8, true),
+        "v2\t0" => (2_u8, false),
+        "v2\t1" => (2_u8, true),
         _ => return Err(invalid("invalid sticky state header")),
     };
     let mut notes = Vec::new();
@@ -99,9 +102,19 @@ pub fn parse(text: &str) -> FlameResult<StickyNoteStore> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 15 {
+        let expected = if version == 1 { 15 } else { 16 };
+        if fields.len() != expected {
             return Err(invalid("invalid sticky state note"));
         }
+        let bold = if version == 1 {
+            false
+        } else {
+            match fields[15] {
+                "0" => false,
+                "1" => true,
+                _ => return Err(invalid("invalid sticky state bold flag")),
+            }
+        };
         let note = StickyNote {
             id: string(&fields[0])?,
             workspace: number(&fields[1])?,
@@ -116,6 +129,7 @@ pub fn parse(text: &str) -> FlameResult<StickyNoteStore> {
             background: Rgb::new(byte(&fields[8])?, byte(&fields[9])?, byte(&fields[10])?),
             foreground: Rgb::new(byte(&fields[11])?, byte(&fields[12])?, byte(&fields[13])?),
             text_size: number(&fields[14])?,
+            bold,
         };
         if note.id.is_empty()
             || note.output.as_str().is_empty()

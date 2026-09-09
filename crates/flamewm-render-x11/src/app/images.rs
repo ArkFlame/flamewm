@@ -1,13 +1,14 @@
-//! Straight RGBA8 -> premultiplied ARGB32 depth-32 image upload.
-//! Cache key: (asset, revision, size). When XRender is available no 1-bit
-//! mask is ever created; the depth-32 pixmap composites via PictOpOver.
-//! A degraded 1-bit clip mask is built only when XRender is unavailable,
-//! logged once per process.
+//! Image cache {pixmap,picture,mask} keyed by {node,asset,revision,w,h,treatment,foreground}.
+//! SymbolicForeground premul math: eff_a=round(sa*fa/255),
+//! premul=round(fg*eff_a/255). No feature-specific icon branches.
+//! Runtime per-node overrides are never keyed by compiled asset_id alone:
+//! the node index plus the node-local revision are part of every key.
 
 use std::sync::Once;
 
 use super::color::rgb_to_pixel;
 use super::*;
+use flamewm_render_core::ImageTreatment;
 
 static MASK_LOG_ONCE: Once = Once::new();
 
@@ -19,38 +20,63 @@ fn log_degraded_mask_once(asset_id: u16) {
     });
 }
 
-pub(crate) fn premultiplied_argb32(asset: &ImageAsset, width: u32, height: u32) -> Vec<u32> {
-    crate::native::image::scale_and_premultiply(
-        &asset.pixels,
-        asset.width,
-        asset.height,
+pub(crate) fn image_cache_key(
+    node: u32,
+    asset_id: u16,
+    width: u32,
+    height: u32,
+    revision: u64,
+    treatment: ImageTreatment,
+    fg: Color,
+) -> ImageCacheKey {
+    let treatment_byte = match treatment {
+        ImageTreatment::Original => 0u8,
+        ImageTreatment::SymbolicForeground => 1u8,
+    };
+    ImageCacheKey {
+        node,
+        asset: asset_id,
         width,
         height,
-    )
+        revision,
+        treatment: treatment_byte,
+        fg_r: fg.r,
+        fg_g: fg.g,
+        fg_b: fg.b,
+        fg_a: fg.a,
+    }
 }
 
 impl X11App {
     pub(super) unsafe fn image_pixmap(
         &mut self,
+        node: u32,
         asset_id: u16,
-        asset: &ImageAsset,
+        pixels: &[u8],
+        src_width: u32,
+        src_height: u32,
         revision: u64,
         width: u32,
         height: u32,
+        treatment: ImageTreatment,
+        tint: Option<Color>,
     ) -> Result<CachedImage, String> {
-        let key = ImageCacheKey {
-            asset: asset_id,
-            width,
-            height,
-            revision,
-        };
+        let fg = tint.unwrap_or(Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        });
+        let key = image_cache_key(node, asset_id, width, height, revision, treatment, fg);
         if let Some(cached) = self.images.get(&key).copied() {
             return Ok(cached);
         }
         let stale_keys: Vec<ImageCacheKey> = self
             .images
             .keys()
-            .filter(|cached| cached.asset == asset_id && cached.revision != revision)
+            .filter(|cached| {
+                cached.node == node && cached.asset == asset_id && cached.revision != revision
+            })
             .copied()
             .collect();
         for stale_key in stale_keys {
@@ -58,7 +84,14 @@ impl X11App {
                 unsafe { free_cached_image(self.display, stale) };
             }
         }
-        let argb = premultiplied_argb32(asset, width, height);
+        let argb = match treatment {
+            ImageTreatment::Original => crate::native::image::scale_and_premultiply(
+                pixels, src_width, src_height, width, height,
+            ),
+            ImageTreatment::SymbolicForeground => {
+                super::symbolic_foreground_argb32(pixels, src_width, src_height, width, height, fg)
+            }
+        };
         if self.xrender.is_some() {
             // True-alpha path: 32-bit TrueColor visual pixmap + XPutImage of
             // ARGB32 words. XCreatePixmap against the (24-bit default) window
@@ -80,7 +113,11 @@ impl X11App {
                     unsafe { XFreePixmap(self.display, pixmap) };
                     return Err(error);
                 }
-                let cached = CachedImage { pixmap, mask: 0 };
+                let cached = CachedImage {
+                    pixmap,
+                    picture: 1,
+                    mask: 0,
+                };
                 self.images.insert(key, cached);
                 return Ok(cached);
             }
@@ -95,12 +132,20 @@ impl X11App {
         if pixmap == 0 {
             return Err(format!("XCreatePixmap failed for image asset {asset_id}"));
         }
-        if let Err(error) = unsafe { self.upload_opaque_fallback(pixmap, asset, width, height) } {
+        if let Err(error) = unsafe {
+            self.upload_opaque_fallback(pixmap, pixels, src_width, src_height, width, height)
+        } {
             unsafe { XFreePixmap(self.display, pixmap) };
             return Err(error);
         }
-        let mask = unsafe { self.build_threshold_mask(asset, width, height, asset_id)? };
-        let cached = CachedImage { pixmap, mask };
+        let mask = unsafe {
+            self.build_threshold_mask(pixels, src_width, src_height, width, height, asset_id)?
+        };
+        let cached = CachedImage {
+            pixmap,
+            picture: 0,
+            mask,
+        };
         self.images.insert(key, cached);
         Ok(cached)
     }
@@ -186,7 +231,9 @@ impl X11App {
     unsafe fn upload_opaque_fallback(
         &mut self,
         pixmap: Pixmap,
-        asset: &ImageAsset,
+        pixels: &[u8],
+        src_width: u32,
+        src_height: u32,
         width: u32,
         height: u32,
     ) -> Result<(), String> {
@@ -227,14 +274,14 @@ impl X11App {
         unsafe { ptr::write_bytes(data as *mut u8, 0, total) };
         head.data = data as *mut _;
         for y in 0..height {
-            let sy = ((y as u64 * asset.height as u64) / height as u64) as u32;
+            let sy = ((y as u64 * src_height as u64) / height as u64) as u32;
             for x in 0..width {
-                let sx = ((x as u64 * asset.width as u64) / width as u64) as u32;
-                let offset = ((sy as usize * asset.width as usize) + sx as usize) * 4;
+                let sx = ((x as u64 * src_width as u64) / width as u64) as u32;
+                let offset = ((sy as usize * src_width as usize) + sx as usize) * 4;
                 let pixel = rgb_to_pixel(
-                    asset.pixels[offset],
-                    asset.pixels[offset + 1],
-                    asset.pixels[offset + 2],
+                    pixels[offset],
+                    pixels[offset + 1],
+                    pixels[offset + 2],
                     head.red_mask as u64,
                     head.green_mask as u64,
                     head.blue_mask as u64,
@@ -262,17 +309,19 @@ impl X11App {
 
     unsafe fn build_threshold_mask(
         &mut self,
-        asset: &ImageAsset,
+        pixels: &[u8],
+        src_width: u32,
+        src_height: u32,
         width: u32,
         height: u32,
         asset_id: u16,
     ) -> Result<Pixmap, String> {
         let mut transparent = vec![false; (width as usize) * (height as usize)];
         for y in 0..height {
-            let sy = ((y as u64 * asset.height as u64) / height as u64) as u32;
+            let sy = ((y as u64 * src_height as u64) / height as u64) as u32;
             for x in 0..width {
-                let sx = ((x as u64 * asset.width as u64) / width as u64) as u32;
-                let a = asset.pixels[((sy as usize * asset.width as usize) + sx as usize) * 4 + 3];
+                let sx = ((x as u64 * src_width as u64) / width as u64) as u32;
+                let a = pixels[((sy as usize * src_width as usize) + sx as usize) * 4 + 3];
                 transparent[(y as usize) * (width as usize) + x as usize] = a < 128;
             }
         }
@@ -322,5 +371,32 @@ impl X11App {
         }
         unsafe { XFreeGC(self.display, mask_gc) };
         Ok(mask)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_node_overrides_never_collide_on_asset_alone() {
+        let fg = Color::rgb(255, 255, 255);
+        let a = image_cache_key(0, 0, 10, 10, 1, ImageTreatment::Original, fg);
+        let b = image_cache_key(1, 0, 10, 10, 1, ImageTreatment::Original, fg);
+        assert_ne!(a, b, "sibling nodes sharing asset must key separately");
+        let a2 = image_cache_key(0, 0, 10, 10, 2, ImageTreatment::Original, fg);
+        assert_ne!(a, a2, "revision advance must change the key");
+        let a_resized = image_cache_key(0, 0, 12, 10, 2, ImageTreatment::Original, fg);
+        assert_ne!(a2, a_resized, "size is part of the key");
+        let a_tinted = image_cache_key(
+            0,
+            0,
+            12,
+            10,
+            2,
+            ImageTreatment::SymbolicForeground,
+            Color::rgb(10, 20, 30),
+        );
+        assert_ne!(a_resized, a_tinted, "treatment+palette are part of the key");
     }
 }

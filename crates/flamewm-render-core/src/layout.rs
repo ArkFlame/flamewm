@@ -11,6 +11,10 @@ pub struct LayoutResult {
     /// Content extent per node in surface coordinates (viewport origin +
     /// intrinsic content size). Viewport is `boxes[index].rect`.
     pub contents: Vec<Rect>,
+    /// Document revision the retained boxes were computed from.
+    pub revision: u64,
+    /// Cached z-order (ascending) for paint + hit-test walks. No re-sort.
+    pub z_order: Vec<u32>,
 }
 
 impl LayoutResult {
@@ -59,9 +63,8 @@ impl LayoutResult {
     }
 
     pub fn hit_test_action(&self, document: &RuntimeDocument, x: f32, y: f32) -> Option<u32> {
-        let mut indices: Vec<usize> = (0..document.document.nodes.len()).collect();
-        indices.sort_by_key(|index| (document.effective_z_index(*index as u32), *index as i64));
-        for index in indices.into_iter().rev() {
+        for index in self.z_order.iter().copied().rev() {
+            let index = index as usize;
             let node = &document.document.nodes[index];
             if node.action.is_empty() || !document.is_effectively_visible(index as u32) {
                 continue;
@@ -88,6 +91,8 @@ impl LayoutEngine {
             return LayoutResult {
                 boxes,
                 contents: Vec::new(),
+                revision: document.revision(),
+                z_order: Vec::new(),
             };
         }
         let mut engine = Engine {
@@ -154,7 +159,14 @@ impl LayoutEngine {
                 height: content_h,
             };
         }
-        LayoutResult { boxes, contents }
+        let mut z_order: Vec<u32> = (0..document.document.nodes.len() as u32).collect();
+        z_order.sort_by_key(|index| (document.effective_z_index(*index), *index as i64));
+        LayoutResult {
+            boxes,
+            contents,
+            revision: document.revision(),
+            z_order,
+        }
     }
 }
 
@@ -599,7 +611,20 @@ fn thumb_rect(
     offset: f32,
     horizontal: bool,
 ) -> Rect {
-    if content_len <= viewport_len || viewport_len <= 0.0 || content_len <= 0.0 {
+    // C01: never panic on nonfinite/zero/negative/tiny geometry.
+    if !viewport_len.is_finite()
+        || !content_len.is_finite()
+        || viewport_len <= 0.0
+        || content_len <= 0.0
+        || content_len <= viewport_len
+    {
+        return Rect::default();
+    }
+    if !viewport.x.is_finite()
+        || !viewport.y.is_finite()
+        || !viewport.width.is_finite()
+        || !viewport.height.is_finite()
+    {
         return Rect::default();
     }
     let track = if horizontal {
@@ -607,10 +632,28 @@ fn thumb_rect(
     } else {
         viewport.height
     };
-    let thumb_len = (viewport_len / content_len * track).clamp(12.0, track);
+    if !track.is_finite() || track <= 0.0 {
+        return Rect::default();
+    }
+    let raw = viewport_len / content_len * track;
+    if !raw.is_finite() {
+        return Rect::default();
+    }
+    let min_thumb = 12.0f32.min(track);
+    let thumb_len = raw.clamp(min_thumb, track);
+    if !thumb_len.is_finite() {
+        return Rect::default();
+    }
     let travel = (track - thumb_len).max(0.0);
     let max_offset = (content_len - viewport_len).max(1.0);
+    if !max_offset.is_finite() || max_offset <= 0.0 {
+        return Rect::default();
+    }
+    let offset = if offset.is_finite() { offset } else { 0.0 };
     let pos = (offset.clamp(0.0, max_offset) / max_offset) * travel;
+    if !pos.is_finite() {
+        return Rect::default();
+    }
     if horizontal {
         Rect {
             x: viewport.x + pos,
@@ -708,5 +751,47 @@ mod tests {
         let runtime = RuntimeDocument::new(document).unwrap();
         let layout = LayoutEngine::compute(&runtime, 100.0, 40.0, InteractionState::default());
         assert!((layout.boxes[1].rect.width - 80.0).abs() < 0.01);
+    }
+
+    fn metrics(viewport_w: f32, content_w: f32) -> ScrollMetrics {
+        LayoutResult::scroll_metrics(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: viewport_w,
+                height: 20.0,
+            },
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: content_w,
+                height: 40.0,
+            },
+            ScrollState::default(),
+        )
+    }
+
+    #[test]
+    fn thumb_tiny_tracks_never_panic() {
+        for track in [1.0f32, 11.0, 12.0, 100.0] {
+            let m = metrics(track, track * 4.0);
+            assert!(m.thumb_x.width.is_finite());
+            assert!(m.thumb_x.width <= track + 0.001);
+            if track < 12.0 {
+                assert!((m.thumb_x.width - track).abs() < 0.01);
+            }
+        }
+        // Nonfinite / zero / non-scrollable all yield default thumb.
+        for (vw, cw) in [
+            (f32::NAN, 100.0),
+            (100.0, f32::INFINITY),
+            (0.0, 100.0),
+            (100.0, 50.0),
+            (100.0, 100.0),
+            (-10.0, 100.0),
+        ] {
+            let m = metrics(vw, cw);
+            assert_eq!(m.thumb_x, Rect::default());
+        }
     }
 }

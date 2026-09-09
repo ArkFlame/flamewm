@@ -17,7 +17,7 @@ pub use input::{
 pub use popup::PopupState;
 pub use reconcile::{reconcile, update};
 pub use surface_runtime::{
-    SurfaceConfig, SurfaceHandle, SurfaceRole, SurfaceRuntime, UiBackendError,
+    SurfaceConfig, SurfaceHandle, SurfaceInputMode, SurfaceRole, SurfaceRuntime, UiBackendError,
 };
 pub use template::{
     RuntimeImage, UiColor, UiDocument, UiDocumentAccess, UiDocumentView, UiTemplate,
@@ -25,7 +25,12 @@ pub use template::{
 };
 
 use flamewm_reactor::Reactor;
+
 pub use flamewm_render_core::{ActionPhase, Overflow, PointerButton};
+pub use flamewm_render_x11::{
+    ExternalDrawableSession, ExternalDrawableTarget, SurfaceInputMode as RenderSurfaceInputMode,
+    SurfaceRole as RenderSurfaceRole,
+};
 pub use flamewm_ui::{UiAction, UiEvent};
 
 #[derive(Clone, Debug, PartialEq)]

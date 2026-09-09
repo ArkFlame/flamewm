@@ -3,6 +3,13 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IconSource {
     pub path: &'static str,
+    pub treatment: IconTreatment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconTreatment {
+    Original,
+    SymbolicForeground,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +54,16 @@ pub enum IconRole {
 
 impl IconRole {
     #[must_use]
+    pub const fn treatment(self) -> IconTreatment {
+        match self {
+            Self::Start | Self::Browser | Self::Terminal | Self::Files | Self::Code => {
+                IconTreatment::Original
+            }
+            _ => IconTreatment::SymbolicForeground,
+        }
+    }
+
+    #[must_use]
     pub const fn source(self) -> IconSource {
         let path = match self {
             Self::Start => "assets/web/flamewm-icon.svg",
@@ -86,6 +103,9 @@ impl IconRole {
             Self::Reboot => "assets/web/breeze/system-reboot.svg",
             Self::Shutdown => "assets/web/breeze/system-shutdown.svg",
         };
-        IconSource { path }
+        IconSource {
+            path,
+            treatment: self.treatment(),
+        }
     }
 }

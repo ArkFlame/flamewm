@@ -2,9 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 pub const FORMAT_MAGIC: [u8; 4] = *b"RWRB";
 /// Current asset pixel encoding: straight (non-premultiplied) RGBA8.
-/// Version 2 documents carry opaque RGB8 assets; the codec upconverts them
-/// to RGBA8 with alpha=255 so PPM build inputs keep working.
-pub const FORMAT_VERSION: u16 = 3;
+/// Version 4 appends one image-treatment byte per style; version 3 is
+/// identical RGBA8 without that byte. Version 2 documents carry opaque
+/// RGB8 assets; the codec upconverts them to RGBA8 with alpha=255 so PPM
+/// build inputs keep working.
+pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION_RGBA8_LEGACY: u16 = 3;
 pub const FORMAT_VERSION_RGB8_LEGACY: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -198,6 +201,44 @@ impl ScrollState {
     }
 }
 
+/// Damage for one surface frame: None skips redraw, Region is bounding-box
+/// repaint bookkeeping, Full rebuilds layout+paint. Merge takes max coverage.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SurfaceDamage {
+    #[default]
+    None,
+    Region(Rect),
+    Full,
+}
+
+impl SurfaceDamage {
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, b) => b,
+            (a, Self::None) => a,
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Region(a), Self::Region(b)) => {
+                let x0 = a.x.min(b.x);
+                let y0 = a.y.min(b.y);
+                let x1 = (a.x + a.width.max(0.0)).max(b.x + b.width.max(0.0));
+                let y1 = (a.y + a.height.max(0.0)).max(b.y + b.height.max(0.0));
+                Self::Region(Rect {
+                    x: x0,
+                    y: y0,
+                    width: (x1 - x0).max(0.0),
+                    height: (y1 - y0).max(0.0),
+                })
+            }
+        }
+    }
+}
+
 /// Semantic scroll delta (Button4/5, wheel, thumb drag all funnel here).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScrollDelta {
@@ -227,6 +268,13 @@ pub enum CursorKind {
     ResizeVertical,
     ResizeNorthWestSouthEast,
     ResizeNorthEastSouthWest,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageTreatment {
+    #[default]
+    Original,
+    SymbolicForeground,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -261,6 +309,7 @@ pub struct Style {
     pub cursor: CursorKind,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
+    pub image_treatment: ImageTreatment,
 }
 
 impl Default for Style {
@@ -296,6 +345,7 @@ impl Default for Style {
             cursor: CursorKind::Default,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
+            image_treatment: ImageTreatment::Original,
         }
     }
 }
@@ -439,6 +489,7 @@ pub struct GeometryOverride {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RuntimeStyleOverride {
     pub background: Option<ColorValue>,
+    pub color: Option<ColorValue>,
     pub border_color: Option<ColorValue>,
     pub opacity: Option<f32>,
     pub flex_direction: Option<FlexDirection>,
@@ -448,6 +499,15 @@ pub struct RuntimeStyleOverride {
     pub overflow_y: Option<Overflow>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeImageOverride {
+    pub source: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: Vec<u8>,
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeDocument {
     pub document: CompiledDocument,
@@ -455,9 +515,13 @@ pub struct RuntimeDocument {
     pub text_overrides: HashMap<u32, String>,
     hidden_nodes: HashSet<u32>,
     image_revision: HashMap<u16, u64>,
+    node_image_overrides: HashMap<u32, RuntimeImageOverride>,
     geometry_overrides: HashMap<u32, GeometryOverride>,
     style_overrides: HashMap<u32, RuntimeStyleOverride>,
     z_index_overrides: HashMap<u32, i32>,
+    scroll_offsets: HashMap<u32, ScrollState>,
+    pending_damage: SurfaceDamage,
+    revision: u64,
     id_index: HashMap<String, u32>,
     variable_index: HashMap<String, u16>,
     ui_font_family: String,
@@ -489,9 +553,13 @@ impl RuntimeDocument {
             text_overrides: HashMap::new(),
             hidden_nodes: HashSet::new(),
             image_revision: HashMap::new(),
+            node_image_overrides: HashMap::new(),
             geometry_overrides: HashMap::new(),
             style_overrides: HashMap::new(),
             z_index_overrides: HashMap::new(),
+            scroll_offsets: HashMap::new(),
+            pending_damage: SurfaceDamage::Full,
+            revision: 0,
             id_index,
             variable_index,
             ui_font_family: "IBM Plex Sans".to_string(),
@@ -499,6 +567,86 @@ impl RuntimeDocument {
             ui_font_bold: false,
             ui_scale: 1.0,
         })
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.pending_damage = self.pending_damage.merge(SurfaceDamage::Full);
+    }
+
+    fn touch_light(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Retained-cache key: layout/paint caches are valid while this is
+    /// unchanged for a given viewport size + interaction state.
+
+    /// Damage bookkeeping: merge coverage (max), take clears the latch.
+    pub fn mark_dirty(&mut self, damage: SurfaceDamage) {
+        self.pending_damage = self.pending_damage.merge(damage);
+    }
+
+    pub fn mark_full(&mut self) {
+        self.pending_damage = SurfaceDamage::Full;
+    }
+
+    pub fn take_damage(&mut self) -> SurfaceDamage {
+        let damage = self.pending_damage;
+        self.pending_damage = SurfaceDamage::None;
+        damage
+    }
+
+    pub fn peek_damage(&self) -> SurfaceDamage {
+        self.pending_damage
+    }
+
+    /// Retained scroll offset for one node (dead state fixed: render-owned).
+    pub fn scroll_offset(&self, index: u32) -> ScrollState {
+        self.scroll_offsets.get(&index).copied().unwrap_or_default()
+    }
+
+    /// Node-local rect for damage marks (viewport box, unscaled doc coords).
+    pub fn node_rect_for_damage(
+        &self,
+        index: u32,
+        layout: &crate::layout::LayoutResult,
+    ) -> Option<Rect> {
+        layout.boxes.get(index as usize).map(|b| b.rect)
+    }
+
+    pub fn apply_scroll_delta(
+        &mut self,
+        index: u32,
+        delta: ScrollDelta,
+        max: (f32, f32),
+    ) -> ScrollState {
+        let cur = self.scroll_offset(index);
+        let next = ScrollState {
+            offset_x: cur.offset_x + delta.dx,
+            offset_y: cur.offset_y + delta.dy,
+        }
+        .clamped(max.0, max.1);
+        self.scroll_offsets.insert(index, next);
+        self.touch_light();
+        self.mark_dirty(SurfaceDamage::Full);
+        next
+    }
+
+    pub fn set_scroll_offset(
+        &mut self,
+        index: u32,
+        offset: ScrollState,
+        max: (f32, f32),
+    ) -> ScrollState {
+        let next = offset.clamped(max.0, max.1);
+        self.scroll_offsets.insert(index, next);
+        self.touch_light();
+        self.mark_dirty(SurfaceDamage::Full);
+        next
     }
 
     pub fn node_by_id(&self, id: &str) -> Option<u32> {
@@ -522,6 +670,7 @@ impl RuntimeDocument {
             first
         };
         self.text_overrides.insert(target, text.into());
+        self.touch();
         Ok(())
     }
 
@@ -534,6 +683,7 @@ impl RuntimeDocument {
         } else {
             self.hidden_nodes.insert(index);
         }
+        self.touch();
         Ok(())
     }
 
@@ -548,13 +698,14 @@ impl RuntimeDocument {
         let index = self
             .node_by_id(node_id)
             .ok_or_else(|| format!("no node with id '{node_id}'"))?;
-        let node = &self.document.nodes[index as usize];
+        let node = self
+            .document
+            .nodes
+            .get(index as usize)
+            .ok_or_else(|| format!("no node with id '{node_id}'"))?;
         if node.kind != NodeKind::Image {
             return Err(format!("node '{node_id}' is not an image node"));
         }
-        let asset_id = node
-            .image
-            .ok_or_else(|| format!("image node '{node_id}' has no image asset"))?;
         if width == 0 || height == 0 {
             return Err("image replacement dimensions must be non-zero".to_string());
         }
@@ -568,21 +719,68 @@ impl RuntimeDocument {
                 rgba8.len()
             ));
         }
-        let asset = self
-            .document
-            .assets
-            .get_mut(asset_id as usize)
-            .ok_or_else(|| {
-                format!("image node '{node_id}' references invalid image asset {asset_id}")
-            })?;
-        asset.source = source;
-        asset.width = width;
-        asset.height = height;
-        asset.pixels = rgba8;
-        let revision = self.image_revision.get(&asset_id).copied().unwrap_or(0);
-        self.image_revision
-            .insert(asset_id, revision.wrapping_add(1));
+        let revision = self
+            .node_image_overrides
+            .get(&index)
+            .map(|entry| entry.revision)
+            .unwrap_or(0)
+            .wrapping_add(1);
+        self.node_image_overrides.insert(
+            index,
+            RuntimeImageOverride {
+                source,
+                width,
+                height,
+                rgba8,
+                revision,
+            },
+        );
+        self.touch();
         Ok(())
+    }
+
+    /// Node-local override pixels (no per-call copies beyond borrow).
+    pub fn node_image_override(&self, index: u32) -> Option<&RuntimeImageOverride> {
+        self.node_image_overrides.get(&index)
+    }
+
+    /// Effective image for a node: node-local override wins, else compiled asset.
+    pub fn image_for_node(&self, index: u32) -> Option<(Option<u16>, u32, u32, &str, &[u8])> {
+        if let Some(entry) = self.node_image_overrides.get(&index) {
+            return Some((
+                self.document
+                    .nodes
+                    .get(index as usize)
+                    .and_then(|node| node.image),
+                entry.width,
+                entry.height,
+                entry.source.as_str(),
+                entry.rgba8.as_slice(),
+            ));
+        }
+        let node = self.document.nodes.get(index as usize)?;
+        let asset_id = node.image?;
+        let asset = self.document.assets.get(asset_id as usize)?;
+        Some((
+            Some(asset_id),
+            asset.width,
+            asset.height,
+            asset.source.as_str(),
+            asset.pixels.as_slice(),
+        ))
+    }
+
+    /// Per-node image revision: node-local counter when overridden, else legacy asset revision.
+    pub fn image_revision_for_node(&self, index: u32) -> u64 {
+        if let Some(entry) = self.node_image_overrides.get(&index) {
+            return entry.revision;
+        }
+        self.document
+            .nodes
+            .get(index as usize)
+            .and_then(|node| node.image)
+            .map(|asset_id| self.image_revision(asset_id))
+            .unwrap_or(0)
     }
 
     pub fn image_revision(&self, asset_id: u16) -> u64 {
@@ -687,6 +885,24 @@ impl RuntimeDocument {
             .ok_or_else(|| format!("no node with id '{id}'"))?;
         if let Some(override_style) = self.style_overrides.get_mut(&index) {
             override_style.border_color = None;
+        }
+        Ok(())
+    }
+
+    pub fn set_foreground_color(&mut self, id: &str, color: ColorValue) -> Result<(), String> {
+        let index = self
+            .node_by_id(id)
+            .ok_or_else(|| format!("no node with id '{id}'"))?;
+        self.style_overrides.entry(index).or_default().color = Some(color);
+        Ok(())
+    }
+
+    pub fn clear_foreground_color(&mut self, id: &str) -> Result<(), String> {
+        let index = self
+            .node_by_id(id)
+            .ok_or_else(|| format!("no node with id '{id}'"))?;
+        if let Some(override_style) = self.style_overrides.get_mut(&index) {
+            override_style.color = None;
         }
         Ok(())
     }
@@ -821,6 +1037,9 @@ impl RuntimeDocument {
             if let Some(background) = override_style.background {
                 style.background = background;
             }
+            if let Some(color) = override_style.color {
+                style.color = color;
+            }
             if let Some(border_color) = override_style.border_color {
                 style.border_color = border_color;
             }
@@ -941,13 +1160,17 @@ mod image_replace_tests {
     #[test]
     fn success_replaces_and_bumps_revision() {
         let mut doc = image_doc();
+        let before = doc.document.assets[0].clone();
         doc.replace_image_for_node("icon", "new".to_string(), 1, 1, vec![1, 2, 3, 200])
             .expect("replace succeeds");
-        assert_eq!(doc.document.assets[0].source, "new");
-        assert_eq!(doc.document.assets[0].width, 1);
-        assert_eq!(doc.document.assets[0].height, 1);
-        assert_eq!(doc.document.assets[0].pixels, vec![1, 2, 3, 200]);
-        assert_eq!(doc.image_revision(0), 1);
+        // Compiled assets stay immutable; override is node-local.
+        assert_eq!(doc.document.assets[0], before);
+        let entry = doc.node_image_override(0).expect("override stored");
+        assert_eq!(entry.source, "new");
+        assert_eq!((entry.width, entry.height), (1, 1));
+        assert_eq!(entry.rgba8, vec![1, 2, 3, 200]);
+        assert_eq!(doc.image_revision_for_node(0), 1);
+        assert_eq!(doc.image_revision(0), 0);
     }
 
     #[test]
@@ -957,8 +1180,10 @@ mod image_replace_tests {
             .expect("first replace");
         doc.replace_image_for_node("icon", "b".to_string(), 2, 1, vec![4u8; 8])
             .expect("second replace");
-        assert_eq!(doc.document.assets[0].source, "b");
-        assert_eq!(doc.image_revision(0), 2);
+        let entry = doc.node_image_override(0).expect("override stored");
+        assert_eq!(entry.source, "b");
+        assert_eq!(doc.image_revision_for_node(0), 2);
+        assert_eq!(doc.document.assets[0].source, "old");
     }
 
     #[test]
@@ -968,7 +1193,7 @@ mod image_replace_tests {
             .replace_image_for_node("label", "x".to_string(), 1, 1, vec![0, 0, 0, 255])
             .expect_err("text node must fail");
         assert!(err.contains("not an image node"), "unexpected: {err}");
-        assert_eq!(doc.image_revision(0), 0);
+        assert_eq!(doc.image_revision_for_node(1), 0);
     }
 
     #[test]
@@ -982,7 +1207,7 @@ mod image_replace_tests {
             doc.replace_image_for_node("icon", "x".to_string(), 1, 0, Vec::new())
                 .is_err()
         );
-        assert_eq!(doc.image_revision(0), 0);
+        assert!(doc.node_image_override(0).is_none());
     }
 
     #[test]
@@ -992,7 +1217,7 @@ mod image_replace_tests {
             .replace_image_for_node("icon", "x".to_string(), 2, 2, vec![0u8; 8])
             .expect_err("must fail");
         assert!(err.contains("expected 16"), "unexpected: {err}");
-        assert_eq!(doc.image_revision(0), 0);
+        assert!(doc.node_image_override(0).is_none());
     }
 
     #[test]
@@ -1006,10 +1231,85 @@ mod image_replace_tests {
 
     #[test]
     fn opaque_rgba_fixture_reports_fully_opaque() {
-        let mut doc = image_doc();
+        let doc = image_doc();
         assert!(doc.document.assets[0].is_fully_opaque());
-        doc.replace_image_for_node("icon", "t".to_string(), 1, 1, vec![10, 20, 30, 0])
-            .expect("transparent replace");
-        assert!(!doc.document.assets[0].is_fully_opaque());
+    }
+
+    fn shared_asset_doc() -> RuntimeDocument {
+        let asset = ImageAsset {
+            source: "shared".to_string(),
+            width: 1,
+            height: 1,
+            pixels: vec![9, 9, 9, 255],
+        };
+        let mk = |id: &str| CompiledNode {
+            kind: NodeKind::Image,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+            id: id.to_string(),
+            action: String::new(),
+            text: String::new(),
+            image: Some(0),
+            style: Style::default(),
+            hover_style: None,
+            active_style: None,
+        };
+        RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: vec![asset],
+            nodes: vec![mk("a"), mk("b")],
+        })
+        .expect("fixture validates")
+    }
+
+    #[test]
+    fn shared_asset_isolation() {
+        let mut doc = shared_asset_doc();
+        doc.replace_image_for_node("a", "solo".to_string(), 1, 1, vec![1, 2, 3, 255])
+            .expect("replace a");
+        assert_eq!(doc.document.assets[0].pixels, vec![9, 9, 9, 255]);
+        assert!(doc.node_image_override(1).is_none());
+        let (_, _, _, _, pixels) = doc.image_for_node(1).expect("b intact");
+        assert_eq!(pixels, &[9, 9, 9, 255]);
+        assert_eq!(doc.image_revision_for_node(0), 1);
+        assert_eq!(doc.image_revision_for_node(1), 0);
+    }
+
+    #[test]
+    fn repeated_same_node_replace_stays_bounded() {
+        let mut doc = image_doc();
+        for i in 0..100u8 {
+            doc.replace_image_for_node("icon", format!("f{i}"), 1, 1, vec![i, i, i, 255])
+                .expect("replace");
+        }
+        let entry = doc.node_image_override(0).expect("override");
+        assert_eq!(entry.rgba8.len(), 4);
+        assert_eq!(doc.image_revision_for_node(0), 100);
+        assert_eq!(doc.document.assets[0].pixels.len(), 8);
+    }
+
+    #[test]
+    fn paint_identity_tracks_node_revision() {
+        let mut doc = image_doc();
+        let layout =
+            crate::layout::LayoutEngine::compute(&doc, 50.0, 50.0, InteractionState::default());
+        let before = crate::paint::build_paint_commands(&doc, &layout, InteractionState::default());
+        doc.replace_image_for_node("icon", "n".to_string(), 1, 1, vec![5, 6, 7, 255])
+            .expect("replace");
+        let layout2 =
+            crate::layout::LayoutEngine::compute(&doc, 50.0, 50.0, InteractionState::default());
+        let after = crate::paint::build_paint_commands(&doc, &layout2, InteractionState::default());
+        let rev = |cmds: &Vec<crate::paint::PaintCommand>| match cmds.iter().find_map(|c| match c {
+            crate::paint::PaintCommand::Image { revision, .. } => Some(*revision),
+            _ => None,
+        }) {
+            Some(v) => v,
+            None => panic!("expected image command"),
+        };
+        assert_eq!(rev(&before), 0);
+        assert_eq!(rev(&after), 1);
     }
 }

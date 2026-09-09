@@ -1,0 +1,4 @@
+:root { --accent:#ef4048; --accent-strong:#ef4048dd; --snap-fill:#ef404833; }
+html { width:100%; height:100%; }
+body { width:100%; height:100%; margin:0; background:transparent; overflow:hidden; }
+.snap-preview { position:absolute; left:0px; top:0px; width:100%; height:100%; background:var(--snap-fill); border:2px solid var(--accent-strong); }

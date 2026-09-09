@@ -46,6 +46,13 @@ pub struct XVisualInfo {
 }
 
 pub const TRUE_COLOR_CLASS: c_int = 4;
+pub const INPUT_OUTPUT_CLASS: c_uint = 1;
+pub const ALLOC_NONE: c_int = 0;
+pub const TRANSPARENT_CLEAR_PIXEL: c_ulong = 0;
+pub const CW_BACK_PIXMAP: c_ulong = 1 << 0;
+pub const CW_BACK_PIXEL: c_ulong = 1 << 1;
+pub const CW_BORDER_PIXMAP: c_ulong = 1 << 2;
+pub const CW_COLORMAP: c_ulong = 1 << 13;
 
 #[repr(C)]
 pub struct XFontStructHead {
@@ -315,6 +322,13 @@ pub const XK_DOWN: c_ulong = 0xff54;
 pub const XK_SUPER_L: c_ulong = 0xffeb;
 pub const XK_SUPER_R: c_ulong = 0xffec;
 
+// Xcursor client-library theme/size applicators. Resolved dynamically by
+// native/cursor.rs via `DynamicLibrary`; declared here so the facade has one
+// named owner instead of ad-hoc byte-string symbols at call sites.
+pub const XCURSOR_LIBRARY_NAMES: &[&str] = &["libXcursor.so.1", "libXcursor.so"];
+pub const XCURSOR_SET_THEME_SYMBOL: &[u8] = b"XcursorSetTheme\0";
+pub const XCURSOR_SET_SIZE_SYMBOL: &[u8] = b"XcursorSetSize\0";
+
 // Standard X cursor font glyph indices from <X11/cursorfont.h>.
 pub const XC_LEFT_PTR: c_uint = 68;
 pub const XC_HAND2: c_uint = 60;
@@ -344,6 +358,27 @@ unsafe extern "C" {
         vinfo_return: *mut XVisualInfo,
     ) -> Status;
     pub fn XFree(data: *mut c_void) -> c_int;
+    pub fn XCreateWindow(
+        display: *mut Display,
+        parent: Window,
+        x: c_int,
+        y: c_int,
+        width: c_uint,
+        height: c_uint,
+        border_width: c_uint,
+        depth: c_int,
+        class: c_uint,
+        visual: *mut Visual,
+        valuemask: c_ulong,
+        attributes: *mut XSetWindowAttributes,
+    ) -> Window;
+    pub fn XCreateColormap(
+        display: *mut Display,
+        window: Window,
+        visual: *mut Visual,
+        alloc: c_int,
+    ) -> Colormap;
+    pub fn XFreeColormap(display: *mut Display, colormap: Colormap) -> c_int;
     pub fn XCreateSimpleWindow(
         display: *mut Display,
         parent: Window,

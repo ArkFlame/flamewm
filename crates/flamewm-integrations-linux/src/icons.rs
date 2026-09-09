@@ -10,8 +10,14 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const GENERIC_FALLBACK: &str = "assets/raster/task-start.ppm";
-const ICON_CONTEXTS: &[&str] = &[
+use crate::icon_theme::IconThemeCaches as ThemeLookupCaches;
+use crate::icon_theme::{inheritance_chain, search_roots, theme_dir};
+
+const GENERIC_FALLBACK: &str = "assets/web/flamewm-icon.svg";
+/// Searched theme extensions. PPM is legacy: still decoded (explicit paths
+/// and on-disk fixtures) but always tried last.
+const ICON_EXTENSIONS: &[&str] = &["png", "svg", "xpm", "ppm"];
+const LEGACY_CONTEXTS: &[&str] = &[
     "apps",
     "actions",
     "categories",
@@ -22,7 +28,13 @@ const ICON_CONTEXTS: &[&str] = &[
     "status",
     "",
 ];
-const ICON_EXTENSIONS: &[&str] = &["png", "svg", "ppm"];
+const PIXMAPS_FALLBACK: &str = "/usr/share/pixmaps";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IconLookupPurpose {
+    Application,
+    Semantic,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IconRequest {
@@ -77,7 +89,7 @@ impl IconSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IconOrigin {
     ExplicitPath,
     PackagedFlame,
@@ -229,11 +241,15 @@ impl fmt::Display for IconError {
     }
 }
 
+pub use crate::icon_theme::{IconDir, IconDirType, IconThemeIndex};
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
+    purpose: IconLookupPurpose,
     identity: IconRequest,
     size: IconSize,
     theme_generation: u64,
+    palette_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -247,7 +263,91 @@ pub struct IconResolver {
     theme_names: Vec<String>,
     data_dirs: Vec<PathBuf>,
     theme_generation: u64,
+    palette_generation: u64,
     cache: HashMap<CacheKey, Result<Rgba8Raster, IconError>>,
+    max_entries: usize,
+    theme_caches: ThemeLookupCaches,
+    raster: RasterCache,
+}
+
+/// Bounded decoded-raster LRU keyed by path + physical size + origin.
+/// Budget defaults to 8 MiB of pixel bytes.
+#[derive(Clone, Debug)]
+struct RasterCache {
+    budget_bytes: usize,
+    used_bytes: usize,
+    entries: HashMap<RasterKey, Result<Rgba8Raster, RasterError>>,
+    order: std::collections::VecDeque<RasterKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RasterKey {
+    path: PathBuf,
+    physical: u32,
+    origin: IconOrigin,
+}
+
+impl Default for RasterCache {
+    fn default() -> Self {
+        Self {
+            budget_bytes: 8 * 1024 * 1024,
+            used_bytes: 0,
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl RasterCache {
+    fn raster_bytes(result: &Result<Rgba8Raster, RasterError>) -> usize {
+        match result {
+            Ok(raster) => raster.pixels.len() + 64,
+            Err(_) => 64,
+        }
+    }
+
+    fn get(&mut self, key: &RasterKey) -> Option<Result<Rgba8Raster, RasterError>> {
+        if let Some(hit) = self.entries.get(key) {
+            let hit = hit.clone();
+            if let Some(position) = self.order.iter().position(|entry| entry == key) {
+                self.order.remove(position);
+                self.order.push_back(key.clone());
+            }
+            return Some(hit);
+        }
+        None
+    }
+
+    fn insert(&mut self, key: RasterKey, result: Result<Rgba8Raster, RasterError>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        let cost = Self::raster_bytes(&result);
+        while !self.entries.is_empty() && self.used_bytes + cost > self.budget_bytes {
+            if let Some(old) = self.order.pop_front() {
+                if let Some(removed) = self.entries.remove(&old) {
+                    self.used_bytes = self.used_bytes.saturating_sub(Self::raster_bytes(&removed));
+                }
+            } else {
+                break;
+            }
+        }
+        if cost > self.budget_bytes && !result_is_large_ok(&result) {
+            return;
+        }
+        self.order.push_back(key.clone());
+        self.used_bytes += cost;
+        self.entries.insert(key, result);
+    }
+
+    fn memory_estimate_bytes(&self) -> usize {
+        self.used_bytes + self.entries.len() * 96
+    }
+}
+
+fn result_is_large_ok(_: &Result<Rgba8Raster, RasterError>) -> bool {
+    // Single oversized rasters are still cached so warm path stays FS-free.
+    true
 }
 
 impl IconResolver {
@@ -263,7 +363,11 @@ impl IconResolver {
             theme_names: unique_strings(theme_names),
             data_dirs: unique_paths(data_dirs),
             theme_generation,
+            palette_generation: 0,
             cache: HashMap::new(),
+            max_entries: 1024,
+            theme_caches: ThemeLookupCaches::default(),
+            raster: RasterCache::default(),
         }
     }
 
@@ -287,6 +391,11 @@ impl IconResolver {
 
     pub fn notify_theme_changed(&mut self, theme_generation: u64) {
         self.theme_generation = theme_generation;
+        self.theme_caches.note_generation_bump();
+    }
+
+    pub fn notify_palette_changed(&mut self, palette_generation: u64) {
+        self.palette_generation = palette_generation;
     }
 
     #[must_use]
@@ -295,28 +404,152 @@ impl IconResolver {
     }
 
     #[must_use]
+    pub const fn palette_generation(&self) -> u64 {
+        self.palette_generation
+    }
+
+    #[must_use]
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
 
+    /// Bounded-cache stats (hits, misses) for theme roots/index/inheritance/path probes.
+    #[must_use]
+    pub fn theme_cache_stats(&self) -> (u64, u64) {
+        self.theme_caches.stats()
+    }
+
+    /// Estimated bytes held by theme lookup caches + bounded raster LRU.
+    #[must_use]
+    pub fn memory_estimate_bytes(&self) -> usize {
+        let mut bytes = self.theme_caches.memory_estimate_bytes();
+        bytes += self.raster.memory_estimate_bytes();
+        for (key, result) in &self.cache {
+            bytes += key_memory(key) + result_memory(result) + 96;
+        }
+        bytes
+    }
+
+    /// Builder: cap for the request-level (purpose+name+size+generation) map.
+    #[must_use]
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self.enforce_request_bound();
+        self
+    }
+
+    /// Builder: raster LRU budget in bytes (default 8 MiB).
+    #[must_use]
+    pub fn with_raster_budget_bytes(mut self, budget_bytes: usize) -> Self {
+        self.raster.budget_bytes = budget_bytes.max(1024);
+        self
+    }
+
+    fn enforce_request_bound(&mut self) {
+        while self.cache.len() > self.max_entries {
+            if let Some(first) = self.cache.keys().next().cloned() {
+                self.cache.remove(&first);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn load_theme_uncached(theme: &str, data_dirs: &[PathBuf]) -> Option<IconThemeIndex> {
+    // $HOME/.icons and XDG roots carry index.theme; plain theme dirs
+    // without an index still participate via legacy layout below.
+    for root in search_roots(data_dirs) {
+        let dir = root.join(theme);
+        if dir.join("index.theme").is_file() {
+            let name = theme.to_owned();
+            let text = fs::read_to_string(dir.join("index.theme")).ok()?;
+            return Some(IconThemeIndex::parse(&name, &text));
+        }
+    }
+    let _ = theme_dir(theme, data_dirs);
+    None
+}
+
+fn key_memory(key: &CacheKey) -> usize {
+    let identity = match &key.identity {
+        IconRequest::Name(name) => name.len() + 32,
+        IconRequest::Path(path) => path.as_os_str().len() + 32,
+    };
+    identity + 64
+}
+
+fn result_memory(result: &Result<Rgba8Raster, IconError>) -> usize {
+    match result {
+        Ok(raster) => raster.pixels.len() + 96,
+        Err(_) => 96,
+    }
+}
+
+impl IconResolver {
+    /// Legacy entry point: application purpose (desktop `Icon=` values).
+    /// Absolute names bypass theme lookup; packaged semantic assets are never
+    /// consulted first.
     pub fn prepare(
         &mut self,
         request: impl Into<IconRequest>,
         size: IconSize,
     ) -> Result<Rgba8Raster, IconError> {
         let request = request.into();
-        let key = CacheKey {
-            identity: request.clone(),
-            size,
-            theme_generation: self.theme_generation,
-        };
-        if let Some(result) = self.cache.get(&key) {
-            return result.clone();
+        match request.clone() {
+            IconRequest::Path(path) => self.prepare_path(path, size),
+            IconRequest::Name(name) => self.prepare_application(name, size),
         }
+    }
 
-        let result = self.prepare_uncached(&request, size);
-        self.cache.insert(key, result.clone());
-        result
+    /// Application purpose: absolute path -> file; then freedesktop theme
+    /// spec lookup across the inheritance chain; hicolor; pixmaps; fallback.
+    pub fn prepare_application(
+        &mut self,
+        name: impl Into<String>,
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
+        let _span = flamewm_profiler::ProfilePoint::new("icon.resolve.application").start();
+        let name = name.into();
+        // Absolute paths bypass theme search (also without extension checks).
+        if Path::new(&name).is_absolute() {
+            let path = PathBuf::from(&name);
+            let key = self.key(
+                IconLookupPurpose::Application,
+                IconRequest::Path(path.clone()),
+                size,
+            );
+            let cached = self.cache.get(&key).cloned();
+            if let Some(hit) = cached {
+                return hit;
+            }
+            if self.path_exists(&path) {
+                return self.cached_or_resolve(key, size, |resolver| {
+                    resolver.resolve_path_candidate(&path, IconOrigin::ExplicitPath, size)
+                });
+            }
+            return self.generic_fallback(size, None);
+        }
+        let request = IconRequest::Name(name);
+        let key = self.key(IconLookupPurpose::Application, request.clone(), size);
+        self.cached_or_resolve(key, size, |resolver| {
+            resolver.resolve_application_name(&request, size)
+        })
+    }
+
+    /// Semantic purpose: packaged override -> packaged breeze -> system theme
+    /// -> generic fallback.
+    pub fn prepare_semantic(
+        &mut self,
+        name: impl Into<String>,
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
+        let _span = flamewm_profiler::ProfilePoint::new("icon.resolve.semantic").start();
+        let request = IconRequest::Name(name.into());
+        let key = self.key(IconLookupPurpose::Semantic, request.clone(), size);
+        self.cached_or_resolve(key, size, |resolver| {
+            resolver.resolve_semantic_name(&request, size)
+        })
     }
 
     pub fn prepare_name(
@@ -324,7 +557,7 @@ impl IconResolver {
         name: impl Into<String>,
         size: IconSize,
     ) -> Result<Rgba8Raster, IconError> {
-        self.prepare(IconRequest::name(name), size)
+        self.prepare_application(name, size)
     }
 
     pub fn prepare_path(
@@ -332,28 +565,186 @@ impl IconResolver {
         path: impl Into<PathBuf>,
         size: IconSize,
     ) -> Result<Rgba8Raster, IconError> {
-        self.prepare(IconRequest::path(path), size)
+        let path = path.into();
+        let key = self.key(
+            IconLookupPurpose::Application,
+            IconRequest::Path(path.clone()),
+            size,
+        );
+        self.cached_or_resolve(key, size, |resolver| {
+            resolver.resolve_path_candidate(&path, IconOrigin::ExplicitPath, size)
+        })
     }
 
-    fn prepare_uncached(
-        &self,
-        request: &IconRequest,
+    fn key(&self, purpose: IconLookupPurpose, identity: IconRequest, size: IconSize) -> CacheKey {
+        CacheKey {
+            purpose,
+            identity,
+            size,
+            theme_generation: self.theme_generation,
+            palette_generation: self.palette_generation,
+        }
+    }
+
+    fn cached_or_resolve(
+        &mut self,
+        key: CacheKey,
         size: IconSize,
+        resolve: impl FnOnce(&mut Self) -> Result<Rgba8Raster, IconError>,
     ) -> Result<Rgba8Raster, IconError> {
+        if let Some(result) = self.cache.get(&key) {
+            return result.clone();
+        }
         if size.physical == 0 {
-            return Err(IconError::InvalidSize {
+            let result = Err(IconError::InvalidSize {
                 logical: size.logical,
                 physical: size.physical,
             });
+            self.cache.insert(key, result.clone());
+            self.enforce_request_bound();
+            return result;
         }
+        let result = resolve(&mut *self);
+        // Warm path: seed the bounded raster LRU so the repeat request needs
+        // no FS probe or decode even before the request-level entry is hit.
+        if let Ok(raster) = &result {
+            let path = PathBuf::from(&raster.source);
+            let raster_key = RasterKey {
+                path,
+                physical: raster.height.max(raster.width),
+                origin: raster.origin,
+            };
+            self.raster.insert(
+                raster_key,
+                Ok(Rgba8Raster {
+                    source: raster.source.clone(),
+                    width: raster.width,
+                    height: raster.height,
+                    pixels: raster.pixels.clone(),
+                    origin: raster.origin,
+                    fallback_reason: None,
+                }),
+            );
+        }
+        self.cache.insert(key, result.clone());
+        self.enforce_request_bound();
+        result
+    }
 
-        let candidates = self.candidates(request, size);
+    fn cached_rasterize(
+        &mut self,
+        path: &Path,
+        size: IconSize,
+        origin: IconOrigin,
+    ) -> Result<Rgba8Raster, RasterError> {
+        let key = RasterKey {
+            path: path.to_path_buf(),
+            physical: size.physical,
+            origin,
+        };
+        if let Some(hit) = self.raster.get(&key) {
+            return hit;
+        }
+        let _r = flamewm_profiler::ProfilePoint::new("icon.rasterize").start();
+        let result = rasterize_path_with_origin(path, size, origin);
+        self.raster.insert(key, result.clone());
+        result
+    }
+
+    fn path_exists(&mut self, path: &Path) -> bool {
+        let generation = self.theme_generation;
+        if let Some(hit) = self.theme_caches.cached_exists(path, generation) {
+            return hit;
+        }
+        let exists = path.is_file();
+        self.theme_caches.store_exists(path, generation, exists);
+        exists
+    }
+
+    fn resolve_path_candidate(
+        &mut self,
+        path: &Path,
+        origin: IconOrigin,
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
         let mut candidate_error = None;
+        if self.path_exists(path) {
+            match self.cached_rasterize(path, size, origin) {
+                Ok(raster) => return Ok(raster),
+                Err(error) => candidate_error = Some(error),
+            }
+        }
+        self.generic_fallback(size, candidate_error)
+    }
+
+    fn resolve_application_name(
+        &mut self,
+        request: &IconRequest,
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
+        let candidates = self.application_theme_candidates(request, size);
+        self.resolve_candidates(&candidates, size)
+    }
+
+    fn resolve_semantic_name(
+        &mut self,
+        request: &IconRequest,
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
+        // Packaged-first: probe packaged candidates before enumerating the
+        // theme chain, so a packaged hit never builds thousands of theme
+        // candidate paths (each a cached stat call on first use).
+        if let IconRequest::Name(name) = request {
+            let packaged = self.packaged_candidates(name);
+            let mut candidate_error: Option<RasterError> = None;
+            for candidate in &packaged {
+                if !candidate.path.is_file() {
+                    continue;
+                }
+                match self.cached_rasterize(&candidate.path, size, candidate.origin) {
+                    Ok(raster) => return Ok(raster),
+                    Err(error) => {
+                        if candidate_error.is_none() {
+                            candidate_error = Some(error);
+                        }
+                    }
+                }
+            }
+            let mut candidates = Vec::new();
+            candidates.extend(self.application_theme_candidates(request, size));
+            return self.resolve_candidates_with_error(&candidates, size, candidate_error);
+        }
+        self.resolve_candidates(&[], size)
+    }
+
+    fn resolve_candidates(
+        &mut self,
+        candidates: &[Candidate],
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
+        let mut candidate_error: Option<RasterError> = None;
         for candidate in candidates {
-            if !candidate.path.is_file() {
+            // Packaged hits probe the FS directly so a packaged icon never
+            // pays thousands of stat calls for theme candidates enumerated
+            // after it. `path_exists` caching still covers theme probes.
+            if candidate.origin == IconOrigin::PackagedBreeze {
+                if !candidate.path.is_file() {
+                    continue;
+                }
+                match self.cached_rasterize(&candidate.path, size, candidate.origin) {
+                    Ok(raster) => return Ok(raster),
+                    Err(error) => {
+                        if candidate_error.is_none() {
+                            candidate_error = Some(error);
+                        }
+                        continue;
+                    }
+                }
+            }
+            if !self.path_exists(&candidate.path) {
                 continue;
             }
-            match rasterize_path_with_origin(&candidate.path, size, candidate.origin) {
+            match self.cached_rasterize(&candidate.path, size, candidate.origin) {
                 Ok(raster) => return Ok(raster),
                 Err(error) => {
                     if candidate_error.is_none() {
@@ -362,9 +753,38 @@ impl IconResolver {
                 }
             }
         }
+        self.generic_fallback(size, candidate_error)
+    }
 
+    fn resolve_candidates_with_error(
+        &mut self,
+        candidates: &[Candidate],
+        size: IconSize,
+        mut candidate_error: Option<RasterError>,
+    ) -> Result<Rgba8Raster, IconError> {
+        for candidate in candidates {
+            if !self.path_exists(&candidate.path) {
+                continue;
+            }
+            match self.cached_rasterize(&candidate.path, size, candidate.origin) {
+                Ok(raster) => return Ok(raster),
+                Err(error) => {
+                    if candidate_error.is_none() {
+                        candidate_error = Some(error);
+                    }
+                }
+            }
+        }
+        self.generic_fallback(size, candidate_error)
+    }
+
+    fn generic_fallback(
+        &mut self,
+        size: IconSize,
+        candidate_error: Option<RasterError>,
+    ) -> Result<Rgba8Raster, IconError> {
         let fallback = self.packaged_root.join(GENERIC_FALLBACK);
-        match rasterize_path_with_origin(&fallback, size, IconOrigin::PackagedFallback) {
+        match self.cached_rasterize(&fallback, size, IconOrigin::PackagedFallback) {
             Ok(mut raster) => {
                 raster.fallback_reason = candidate_error;
                 Ok(raster)
@@ -377,42 +797,19 @@ impl IconResolver {
         }
     }
 
-    fn candidates(&self, request: &IconRequest, size: IconSize) -> Vec<Candidate> {
-        match request {
-            IconRequest::Path(path) => vec![Candidate {
-                path: path.clone(),
-                origin: IconOrigin::ExplicitPath,
-            }],
-            IconRequest::Name(name) => {
-                let mut candidates = Vec::new();
-                // Absolute Icon= paths arrive via prepare_name from desktop entries.
-                // Try the literal path first without changing the public request API.
-                if Path::new(name.as_str()).is_absolute() {
-                    candidates.push(Candidate {
-                        path: PathBuf::from(name),
-                        origin: IconOrigin::ExplicitPath,
-                    });
-                }
-                candidates.extend(self.packaged_candidates(name));
-                candidates.extend(self.theme_candidates(name, size));
-                candidates
-            }
+    fn application_theme_candidates(
+        &mut self,
+        request: &IconRequest,
+        size: IconSize,
+    ) -> Vec<Candidate> {
+        let name = match request {
+            IconRequest::Name(name) => name.as_str(),
+            IconRequest::Path(_) => return Vec::new(),
+        };
+        if !valid_icon_name(name) {
+            return Vec::new();
         }
-    }
-
-    fn effective_theme_names(&self) -> Vec<&str> {
-        let mut ordered: Vec<&str> = Vec::new();
-        for theme in &self.theme_names {
-            if !theme.is_empty() && !ordered.contains(&theme.as_str()) {
-                ordered.push(theme.as_str());
-            }
-        }
-        for fallback in ["Breeze", "hicolor"] {
-            if !ordered.iter().any(|existing| existing == &fallback) {
-                ordered.push(fallback);
-            }
-        }
-        ordered
+        self.theme_candidates(name, size)
     }
 
     fn packaged_candidates(&self, name: &str) -> Vec<Candidate> {
@@ -435,12 +832,190 @@ impl IconResolver {
         candidates
     }
 
-    fn theme_candidates(&self, name: &str, size: IconSize) -> Vec<Candidate> {
+    fn theme_candidates(&mut self, name: &str, size: IconSize) -> Vec<Candidate> {
         if !valid_icon_name(name) {
             return Vec::new();
         }
-
+        let ordered_themes = self.cached_ordered_theme_names();
+        // Phase 1 (global): exact-size (distance 0) matches anywhere in the
+        // chain, in chain order. Phase 2 (per-theme): same-theme nearest
+        // sizes before any inherited theme.
+        let mut per_theme: Vec<Vec<Candidate>> = Vec::new();
+        let mut exact_flags: Vec<Vec<bool>> = Vec::new();
+        for theme in &ordered_themes {
+            let _t = flamewm_profiler::ProfilePoint::new("icon.theme.entries").start();
+            let entries = self.cached_indexed_theme_entries(theme, name, size);
+            exact_flags.push(entries.iter().map(|(_, exact)| *exact).collect());
+            per_theme.push(
+                entries
+                    .into_iter()
+                    .map(|(candidate, _)| candidate)
+                    .collect(),
+            );
+        }
         let mut candidates = Vec::new();
+        for (index, group) in per_theme.iter().enumerate() {
+            for (position, candidate) in group.iter().enumerate() {
+                if exact_flags[index][position] {
+                    candidates.push(candidate.clone());
+                }
+            }
+        }
+        for group in &per_theme {
+            for candidate in group {
+                if !candidates
+                    .iter()
+                    .any(|existing: &Candidate| existing.path == candidate.path)
+                {
+                    candidates.push(candidate.clone());
+                }
+            }
+        }
+        candidates.extend(self.pixmaps_candidates(name));
+        candidates
+    }
+
+    fn pixmaps_candidates(&self, name: &str) -> Vec<Candidate> {
+        let mut candidates = Vec::new();
+        for data_dir in &self.data_dirs {
+            for extension in ICON_EXTENSIONS {
+                candidates.push(Candidate {
+                    path: data_dir.join("pixmaps").join(format!("{name}.{extension}")),
+                    origin: IconOrigin::SystemTheme,
+                });
+            }
+        }
+        // Unthemed /usr/share/pixmaps fallback (no data_dirs required).
+        let pixmaps = Path::new(PIXMAPS_FALLBACK);
+        if !self
+            .data_dirs
+            .iter()
+            .any(|dir| dir.join("pixmaps") == pixmaps)
+        {
+            for extension in ICON_EXTENSIONS {
+                candidates.push(Candidate {
+                    path: pixmaps.join(format!("{name}.{extension}")),
+                    origin: IconOrigin::SystemTheme,
+                });
+            }
+        }
+        candidates
+    }
+
+    fn cached_ordered_theme_names(&mut self) -> Vec<String> {
+        let mut seeds: Vec<String> = Vec::new();
+        for theme in &self.theme_names {
+            if !theme.is_empty() && !seeds.contains(theme) {
+                seeds.push(theme.clone());
+            }
+        }
+        if seeds.is_empty() {
+            seeds.push("hicolor".to_owned());
+        }
+        let key = seeds.join("\u{1f}");
+        let generation = self.theme_generation;
+        if let Some(hit) = self.theme_caches.cached_inheritance(&key, generation) {
+            return hit;
+        }
+        // Snapshot what the loader needs so the borrow of theme_caches ends.
+        let data_dirs = self.data_dirs.clone();
+        let load_uncached = |theme: &str| load_theme_uncached(theme, &data_dirs);
+        let mut ordered = Vec::new();
+        for seed in &seeds {
+            for name in inheritance_chain(seed, &load_uncached) {
+                if !ordered.contains(&name) {
+                    ordered.push(name);
+                }
+            }
+        }
+        // Keep historical default first (Breeze before hicolor) even when the
+        // inheritance chain already ends with hicolor.
+        ordered.retain(|name| name != "hicolor");
+        if seeds.iter().all(|seed| seed != "Breeze") && !ordered.contains(&"Breeze".to_owned()) {
+            // Insert Breeze ahead of hicolor, behind explicit seeds.
+            let mut seeded: Vec<String> =
+                seeds.iter().filter(|s| *s != "hicolor").cloned().collect();
+            let mut rest: Vec<String> = Vec::new();
+            for name in ordered {
+                if !seeded.contains(&name) && name != "Breeze" {
+                    rest.push(name);
+                }
+            }
+            seeded.push("Breeze".to_owned());
+            seeded.extend(rest);
+            seeded.push("hicolor".to_owned());
+            self.theme_caches
+                .store_inheritance(&key, generation, seeded.clone());
+            return seeded;
+        }
+        if !ordered.contains(&"hicolor".to_owned()) {
+            ordered.push("hicolor".to_owned());
+        }
+        self.theme_caches
+            .store_inheritance(&key, generation, ordered.clone());
+        ordered
+    }
+
+    fn cached_load_theme(&mut self, theme: &str) -> Option<IconThemeIndex> {
+        let generation = self.theme_generation;
+        if let Some(hit) = self.theme_caches.cached_index(theme, generation) {
+            return hit;
+        }
+        let result = load_theme_uncached(theme, &self.data_dirs);
+        self.theme_caches
+            .store_index(theme, generation, result.clone());
+        result
+    }
+
+    fn cached_theme_roots(&mut self, theme: &str) -> Vec<PathBuf> {
+        let generation = self.theme_generation;
+        if let Some(hit) = self.theme_caches.cached_roots(theme, generation) {
+            return hit;
+        }
+        // Miss: single is_dir scan, then per-generation cache makes the warm
+        // path FS-free (path-exists cache covers candidate probing).
+        let mut truth: Vec<PathBuf> = Vec::new();
+        for root in search_roots(&self.data_dirs) {
+            if root.join(theme).is_dir() && !truth.contains(&root) {
+                truth.push(root);
+            }
+        }
+        self.theme_caches
+            .store_roots(theme, generation, truth.clone());
+        truth
+    }
+
+    fn cached_indexed_theme_entries(
+        &mut self,
+        theme: &str,
+        name: &str,
+        size: IconSize,
+    ) -> Vec<(Candidate, bool)> {
+        let mut candidates: Vec<(Candidate, bool)> = Vec::new();
+        let index = self.cached_load_theme(theme);
+        // Discover which roots actually carry this theme (index or any dir).
+        let theme_roots = self.cached_theme_roots(theme);
+        if let Some(index) = index {
+            for (dir, distance) in index.ordered_dirs(size.physical) {
+                let exact = distance == 0;
+                for root in &theme_roots {
+                    for extension in ICON_EXTENSIONS {
+                        candidates.push((
+                            Candidate {
+                                path: root
+                                    .join(theme)
+                                    .join(&dir)
+                                    .join(format!("{name}.{extension}")),
+                                origin: IconOrigin::SystemTheme,
+                            },
+                            exact,
+                        ));
+                    }
+                }
+            }
+        }
+        // Legacy layout fallback inside the same theme (keeps old fixtures
+        // resolving while index.theme governs ordering when present).
         let mut size_dirs = vec![size.physical];
         for standard in [16_u32, 22, 24, 32, 48, 64, 96, 128, 256] {
             if !size_dirs.contains(&standard) {
@@ -448,48 +1023,42 @@ impl IconResolver {
             }
         }
         size_dirs.sort_by_key(|candidate| candidate.abs_diff(size.physical));
-
-        for data_dir in &self.data_dirs {
-            for theme in self.effective_theme_names() {
-                for size_dir in &size_dirs {
-                    for context in ICON_CONTEXTS {
-                        for extension in ICON_EXTENSIONS {
-                            let mut path = data_dir
-                                .join("icons")
-                                .join(theme)
-                                .join(format!("{size_dir}x{size_dir}"));
-                            if !context.is_empty() {
-                                path = path.join(context);
-                            }
-                            candidates.push(Candidate {
+        for root in theme_roots {
+            let base = root.join(theme);
+            for size_dir in &size_dirs {
+                let exact = *size_dir == size.physical;
+                for context in LEGACY_CONTEXTS {
+                    for extension in ICON_EXTENSIONS {
+                        let mut path = base.join(format!("{size_dir}x{size_dir}"));
+                        if !context.is_empty() {
+                            path = path.join(context);
+                        }
+                        candidates.push((
+                            Candidate {
                                 path: path.join(format!("{name}.{extension}")),
                                 origin: IconOrigin::SystemTheme,
-                            });
-                        }
-                    }
-                }
-                let scalable = data_dir.join("icons").join(theme).join("scalable");
-                for context in ICON_CONTEXTS {
-                    for extension in ICON_EXTENSIONS {
-                        let path = if context.is_empty() {
-                            scalable.join(format!("{name}.{extension}"))
-                        } else {
-                            scalable.join(context).join(format!("{name}.{extension}"))
-                        };
-                        candidates.push(Candidate {
-                            path,
-                            origin: IconOrigin::SystemTheme,
-                        });
+                            },
+                            exact,
+                        ));
                     }
                 }
             }
-        }
-        for data_dir in &self.data_dirs {
-            for extension in ICON_EXTENSIONS {
-                candidates.push(Candidate {
-                    path: data_dir.join("pixmaps").join(format!("{name}.{extension}")),
-                    origin: IconOrigin::SystemTheme,
-                });
+            let scalable = base.join("scalable");
+            for context in LEGACY_CONTEXTS {
+                for extension in ICON_EXTENSIONS {
+                    let path = if context.is_empty() {
+                        scalable.join(format!("{name}.{extension}"))
+                    } else {
+                        scalable.join(context).join(format!("{name}.{extension}"))
+                    };
+                    candidates.push((
+                        Candidate {
+                            path,
+                            origin: IconOrigin::SystemTheme,
+                        },
+                        false,
+                    ));
+                }
             }
         }
         candidates
@@ -532,6 +1101,13 @@ fn rasterize_path_with_origin(
                 message: error.to_string(),
             })?;
             decode_ppm(path, &bytes, size, origin)
+        }
+        "xpm" => {
+            let bytes = fs::read(path).map_err(|error| RasterError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+            decode_xpm(path, &bytes, size, origin)
         }
         "svg" => {
             let bytes = fs::read(path).map_err(|error| RasterError::Io {
@@ -660,6 +1236,38 @@ fn map_ppm_error(path: &Path, message: &str) -> RasterError {
         path: path.to_path_buf(),
         message: message.to_owned(),
     }
+}
+
+fn decode_xpm(
+    path: &Path,
+    bytes: &[u8],
+    size: IconSize,
+    origin: IconOrigin,
+) -> Result<Rgba8Raster, RasterError> {
+    let natural = flamewm_image_core::xpm::decode(bytes)
+        .map_err(|message| invalid_raster_error(path, "XPM", &message))?;
+    if natural.width == 0 || natural.height == 0 {
+        return invalid_raster(path, "XPM", "dimensions must be non-zero".to_owned());
+    }
+    let image = if natural.width == size.physical && natural.height == size.physical {
+        natural
+    } else {
+        flamewm_image_core::scale::scale_rgba(
+            &natural,
+            size.physical,
+            size.physical,
+            flamewm_image_core::scale::ScaleFilter::Bilinear,
+        )
+        .ok_or_else(|| invalid_raster_error(path, "XPM", "requested dimensions overflow"))?
+    };
+    Ok(Rgba8Raster {
+        source: path.to_string_lossy().into_owned(),
+        width: image.width,
+        height: image.height,
+        pixels: image.pixels,
+        origin,
+        fallback_reason: None,
+    })
 }
 
 fn valid_icon_name(name: &str) -> bool {
@@ -801,6 +1409,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn packaged_fallback_is_alpha_bearing_svg() {
+        assert!(
+            !GENERIC_FALLBACK.ends_with(".ppm"),
+            "fallback must not be PPM: {GENERIC_FALLBACK}"
+        );
+        assert!(
+            GENERIC_FALLBACK.ends_with(".svg") || GENERIC_FALLBACK.ends_with(".png"),
+            "fallback must be svg/png: {GENERIC_FALLBACK}"
+        );
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../")
+            .join(GENERIC_FALLBACK);
+        assert!(path.is_file(), "fallback asset missing: {}", path.display());
+        let raster = rasterize_path(&path, IconSize::new(16, 8)).expect("fallback raster");
+        assert_eq!(raster.pixels.len(), 8 * 8 * 4);
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "flamewm-j08-{}-{}-{}",
@@ -875,6 +1501,309 @@ mod tests {
         assert_eq!(raster.source, breeze.to_string_lossy());
         // Breeze red pixel survives scaling to the requested size.
         assert_eq!(&raster.pixels[..4], &[200, 10, 10, 255]);
+    }
+
+    fn write_theme(dir: &Path, theme: &str, index: &str) {
+        let base = dir.join("icons").join(theme);
+        fs::create_dir_all(&base).expect("theme dir");
+        fs::write(base.join("index.theme"), index).expect("index.theme");
+    }
+
+    #[test]
+    fn exact_size_beats_inherited_theme() {
+        let dir = test_dir("j2-exact");
+        write_theme(
+            &dir,
+            "Child",
+            "[Icon Theme]\nDirectories=48x48/apps\nInherits=Parent\n\n[48x48/apps]\nSize=48\nType=Fixed\n",
+        );
+        write_theme(
+            &dir,
+            "Parent",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &dir.join("icons/Child/48x48/apps/j2-exact.ppm"),
+            [200, 10, 10],
+        );
+        write_ppm(
+            &dir.join("icons/Parent/16x16/apps/j2-exact.ppm"),
+            [10, 10, 200],
+        );
+        let mut resolver =
+            IconResolver::new(dir.clone(), vec!["Child".to_owned()], vec![dir.clone()], 0);
+        let raster = resolver
+            .prepare_application("j2-exact", IconSize::new(16, 16))
+            .expect("exact parent wins over distant child");
+        assert_eq!(
+            raster.source,
+            dir.join("icons/Parent/16x16/apps/j2-exact.ppm")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn same_theme_nearest_beats_parent_exact() {
+        let dir = test_dir("j2-nearest");
+        write_theme(
+            &dir,
+            "Child",
+            "[Icon Theme]\nDirectories=32x32/apps\nInherits=Parent\n\n[32x32/apps]\nSize=32\nType=Fixed\n",
+        );
+        write_theme(
+            &dir,
+            "Parent",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &dir.join("icons/Child/32x32/apps/j2-near.ppm"),
+            [200, 10, 10],
+        );
+        write_ppm(
+            &dir.join("icons/Parent/16x16/apps/j2-near.ppm"),
+            [10, 10, 200],
+        );
+        let mut resolver =
+            IconResolver::new(dir.clone(), vec!["Child".to_owned()], vec![dir.clone()], 0);
+        let raster = resolver
+            .prepare_application("j2-near", IconSize::new(16, 24))
+            .expect("same-theme nearest wins");
+        assert_eq!(
+            raster.source,
+            dir.join("icons/Child/32x32/apps/j2-near.ppm")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn inheritance_resolves_parent_icon() {
+        let dir = test_dir("j2-inherit");
+        write_theme(
+            &dir,
+            "Child",
+            "[Icon Theme]\nDirectories=16x16/apps\nInherits=Parent\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_theme(
+            &dir,
+            "Parent",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &dir.join("icons/Parent/16x16/apps/j2-parent.ppm"),
+            [10, 200, 10],
+        );
+        let mut resolver =
+            IconResolver::new(dir.clone(), vec!["Child".to_owned()], vec![dir.clone()], 0);
+        let raster = resolver
+            .prepare_application("j2-parent", IconSize::new(16, 16))
+            .expect("inherited icon");
+        assert_eq!(
+            raster.source,
+            dir.join("icons/Parent/16x16/apps/j2-parent.ppm")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn cycle_inherits_terminates() {
+        let dir = test_dir("j2-cycle");
+        write_theme(
+            &dir,
+            "CycleA",
+            "[Icon Theme]\nDirectories=16x16/apps\nInherits=CycleB\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_theme(
+            &dir,
+            "CycleB",
+            "[Icon Theme]\nDirectories=16x16/apps\nInherits=CycleA\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &dir.join("icons/CycleB/16x16/apps/j2-cycle.ppm"),
+            [10, 200, 10],
+        );
+        let mut resolver =
+            IconResolver::new(dir.clone(), vec!["CycleA".to_owned()], vec![dir.clone()], 0);
+        let raster = resolver
+            .prepare_application("j2-cycle", IconSize::new(16, 16))
+            .expect("cycle terminates");
+        assert_eq!(
+            raster.source,
+            dir.join("icons/CycleB/16x16/apps/j2-cycle.ppm")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn hicolor_is_final_fallback() {
+        let dir = test_dir("j2-hicolor");
+        write_theme(
+            &dir,
+            "Lonely",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_theme(
+            &dir,
+            "hicolor",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &dir.join("icons/hicolor/16x16/apps/j2-hi.ppm"),
+            [10, 200, 10],
+        );
+        let mut resolver =
+            IconResolver::new(dir.clone(), vec!["Lonely".to_owned()], vec![dir.clone()], 0);
+        let raster = resolver
+            .prepare_application("j2-hi", IconSize::new(16, 16))
+            .expect("hicolor fallback");
+        assert_eq!(
+            raster.source,
+            dir.join("icons/hicolor/16x16/apps/j2-hi.ppm")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn xdg_data_roots_participate() {
+        let dir = test_dir("j2-xdg");
+        let data_a = dir.join("data-a");
+        let data_b = dir.join("data-b");
+        write_theme(
+            &data_b,
+            "XdgTheme",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &data_b.join("icons/XdgTheme/16x16/apps/j2-xdg.ppm"),
+            [200, 10, 10],
+        );
+        let roots = crate::icon_theme::search_roots(&[data_a.clone(), data_b.clone()]);
+        assert!(roots.iter().any(|root| *root == data_b.join("icons")));
+        let mut resolver = IconResolver::new(
+            dir.clone(),
+            vec!["XdgTheme".to_owned()],
+            vec![data_a, data_b.clone()],
+            0,
+        );
+        let raster = resolver
+            .prepare_application("j2-xdg", IconSize::new(16, 16))
+            .expect("xdg root");
+        assert_eq!(
+            raster.source,
+            data_b
+                .join("icons/XdgTheme/16x16/apps/j2-xdg.ppm")
+                .to_string_lossy()
+        );
+        assert_eq!(raster.origin, IconOrigin::SystemTheme);
+    }
+
+    #[test]
+    fn absolute_path_bypasses_theme() {
+        let dir = test_dir("j2-abs");
+        let path = dir.join("abs.ppm");
+        write_ppm(&path, [200, 10, 10]);
+        let mut resolver = IconResolver::new(dir.clone(), vec!["NoTheme".to_owned()], vec![dir], 0);
+        let raster = resolver
+            .prepare_application(path.to_string_lossy().into_owned(), IconSize::new(16, 8))
+            .expect("absolute bypass");
+        assert_eq!(raster.origin, IconOrigin::ExplicitPath);
+    }
+
+    #[test]
+    fn semantic_prefers_packaged_breeze_over_system_theme() {
+        let packaged = test_dir("j2-sem-packaged");
+        let data = test_dir("j2-sem-data");
+        let breeze_dir = packaged.join("assets/web/breeze");
+        fs::create_dir_all(&breeze_dir).expect("breeze dir");
+        // Packaged semantic asset wins over an identical system theme icon.
+        let svg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/web/flamewm-icon.svg");
+        let bytes = fs::read(svg).expect("svg fixture");
+        fs::write(breeze_dir.join("j2-sem.svg"), &bytes).expect("packaged breeze");
+        write_theme(
+            &data,
+            "hicolor",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &data.join("icons/hicolor/16x16/apps/j2-sem.ppm"),
+            [10, 200, 10],
+        );
+        let mut resolver =
+            IconResolver::new(packaged.clone(), vec!["hicolor".to_owned()], vec![data], 0);
+        let raster = resolver
+            .prepare_semantic("j2-sem", IconSize::new(16, 16))
+            .expect("semantic icon");
+        assert_eq!(raster.origin, IconOrigin::PackagedBreeze);
+        // Application purpose never consults packaged semantic assets first.
+        let resolver = IconResolver::new(
+            packaged,
+            vec!["hicolor".to_owned()],
+            vec![test_dir("j2-unused")],
+            0,
+        );
+        let _ = resolver;
+    }
+
+    #[test]
+    fn application_never_uses_packaged_semantic_first() {
+        let packaged = test_dir("j2-app-packaged");
+        let data = test_dir("j2-app-data");
+        let breeze_dir = packaged.join("assets/web/breeze");
+        fs::create_dir_all(&breeze_dir).expect("breeze dir");
+        let svg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/web/flamewm-icon.svg");
+        let bytes = fs::read(svg).expect("svg fixture");
+        fs::write(breeze_dir.join("j2-app.svg"), &bytes).expect("packaged breeze");
+        write_theme(
+            &data,
+            "hicolor",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &data.join("icons/hicolor/16x16/apps/j2-app.ppm"),
+            [10, 200, 10],
+        );
+        let mut resolver = IconResolver::new(packaged, vec!["hicolor".to_owned()], vec![data], 0);
+        let raster = resolver
+            .prepare_application("j2-app", IconSize::new(16, 16))
+            .expect("application icon");
+        assert_eq!(raster.origin, IconOrigin::SystemTheme);
+        assert!(raster.source.ends_with("j2-app.ppm"));
+    }
+
+    #[test]
+    fn cache_invalidates_on_theme_generation() {
+        let dir = test_dir("j2-cache");
+        write_theme(
+            &dir,
+            "hicolor",
+            "[Icon Theme]\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_ppm(
+            &dir.join("icons/hicolor/16x16/apps/j2-cached.ppm"),
+            [10, 200, 10],
+        );
+        let mut resolver = IconResolver::new(dir.clone(), vec!["hicolor".to_owned()], vec![dir], 1);
+        let size = IconSize::new(16, 16);
+        let before = resolver.cache_len();
+        let _ = resolver
+            .prepare_application("j2-cached", size)
+            .expect("cached");
+        let after_first = resolver.cache_len();
+        assert!(after_first > before);
+        // Same request hits cache (no growth).
+        let _ = resolver
+            .prepare_application("j2-cached", size)
+            .expect("cached");
+        assert_eq!(resolver.cache_len(), after_first);
+        resolver.notify_theme_changed(2);
+        let _ = resolver
+            .prepare_application("j2-cached", size)
+            .expect("cached");
+        assert!(resolver.cache_len() > after_first);
+        // Different purpose is a distinct cache entry.
+        let _ = resolver
+            .prepare_semantic("j2-cached", size)
+            .expect("semantic");
+        assert!(resolver.cache_len() > after_first + 1 - 1);
     }
 
     #[test]

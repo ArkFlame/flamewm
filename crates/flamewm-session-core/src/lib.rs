@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 use flamewm_api::settings::AppearanceMode;
 
+/// Bundled cursor authority: FlameWM-Breeze-Dark (Breeze Dark Xcursor files
+/// under a FlameWM-owned theme id), size 24. Never claims KDE identity.
+pub const CURSOR_THEME_ID: &str = "FlameWM-Breeze-Dark";
+pub const CURSOR_SIZE: &str = "24";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPaths {
     pub bindir: PathBuf,
@@ -32,8 +37,18 @@ impl SessionPaths {
     }
 
     #[must_use]
+    pub fn cursor_search_root(&self) -> PathBuf {
+        self.data_root.join("icons")
+    }
+
+    #[must_use]
+    pub fn cursor_theme_dir(&self) -> PathBuf {
+        self.cursor_search_root().join(CURSOR_THEME_ID)
+    }
+
+    #[must_use]
     pub fn cursor_path(&self) -> PathBuf {
-        self.data_root.join("flamewm/cursors")
+        self.cursor_search_root()
     }
 }
 
@@ -130,19 +145,35 @@ fn flame_environment(
     cursor_library_path: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::new();
+    // Bundled authority first: explicit FLAMEWM_CURSOR_* wins, then existing
+    // XCURSOR_*, then the bundled theme/size defaults.
     environment.insert(
         "XCURSOR_THEME".to_owned(),
         existing_env
-            .get("XCURSOR_THEME")
+            .get("FLAMEWM_CURSOR_THEME")
+            .filter(|value| !value.is_empty())
             .cloned()
-            .unwrap_or_else(|| "Breeze".to_owned()),
+            .or_else(|| {
+                existing_env
+                    .get("XCURSOR_THEME")
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            })
+            .unwrap_or_else(|| CURSOR_THEME_ID.to_owned()),
     );
     environment.insert(
         "XCURSOR_SIZE".to_owned(),
         existing_env
-            .get("XCURSOR_SIZE")
+            .get("FLAMEWM_CURSOR_SIZE")
+            .filter(|value| !value.is_empty())
             .cloned()
-            .unwrap_or_else(|| "24".to_owned()),
+            .or_else(|| {
+                existing_env
+                    .get("XCURSOR_SIZE")
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            })
+            .unwrap_or_else(|| CURSOR_SIZE.to_owned()),
     );
     environment.insert(
         "XCURSOR_THEME_CORE".to_owned(),
@@ -165,15 +196,18 @@ fn flame_environment(
             .unwrap_or_else(|| "FlameWM".to_owned()),
     );
 
-    let cursor_path = paths.cursor_path().display().to_string();
-    let inherited_path = existing_env
-        .get("XCURSOR_PATH")
+    // Search root is the parent of the bundled theme dir (<root>/icons);
+    // never inherit the host XCURSOR_PATH.
+    let search_root = existing_env
+        .get("FLAMEWM_CURSOR_PATH")
         .filter(|value| !value.is_empty())
-        .map(String::as_str)
-        .or(cursor_library_path.filter(|value| !value.is_empty()));
-    let combined_cursor_path = inherited_path.map_or(cursor_path.clone(), |existing| {
-        format!("{cursor_path}:{existing}")
-    });
+        .cloned()
+        .unwrap_or_else(|| paths.cursor_path().display().to_string());
+    let combined_cursor_path = cursor_library_path
+        .filter(|value| !value.is_empty())
+        .map_or(search_root.clone(), |existing| {
+            format!("{search_root}:{existing}")
+        });
     environment.insert("XCURSOR_PATH".to_owned(), combined_cursor_path);
     environment
 }
@@ -378,6 +412,58 @@ mod tests {
         let passthrough = vec!["--replace".to_owned(), "--config-dir=/tmp/evil".to_owned()];
         let plan = build_launch_plan(&paths, &passthrough, &BTreeMap::new());
         assert_eq!(plan.processes[0].arguments, vec!["--replace"]);
+    }
+
+    #[test]
+    fn bundled_cursor_authority_defaults_and_overrides() {
+        let paths = default_paths_from_home("/usr/bin", "/home/test");
+        let plan = build_launch_plan(&paths, &[], &BTreeMap::new());
+        let environment = &plan.processes[0].environment;
+        assert_eq!(
+            environment.get("XCURSOR_THEME").map(String::as_str),
+            Some(CURSOR_THEME_ID)
+        );
+        assert_eq!(
+            environment.get("XCURSOR_SIZE").map(String::as_str),
+            Some(CURSOR_SIZE)
+        );
+        assert_eq!(
+            environment.get("XCURSOR_PATH").map(String::as_str),
+            Some("/usr/share/icons")
+        );
+        // No host inherit: an existing XCURSOR_PATH is ignored.
+        let mut existing = BTreeMap::new();
+        existing.insert("XCURSOR_PATH".to_owned(), "/tmp/host".to_owned());
+        let plan = build_launch_plan(&paths, &[], &existing);
+        assert_eq!(
+            plan.processes[0]
+                .environment
+                .get("XCURSOR_PATH")
+                .map(String::as_str),
+            Some("/usr/share/icons")
+        );
+        // FLAMEWM_CURSOR_* explicit overrides win.
+        let mut existing = BTreeMap::new();
+        existing.insert("FLAMEWM_CURSOR_THEME".to_owned(), "Custom".to_owned());
+        existing.insert("FLAMEWM_CURSOR_SIZE".to_owned(), "32".to_owned());
+        existing.insert(
+            "FLAMEWM_CURSOR_PATH".to_owned(),
+            "/tmp/stage/icons".to_owned(),
+        );
+        let plan = build_launch_plan(&paths, &[], &existing);
+        let environment = &plan.processes[0].environment;
+        assert_eq!(
+            environment.get("XCURSOR_THEME").map(String::as_str),
+            Some("Custom")
+        );
+        assert_eq!(
+            environment.get("XCURSOR_SIZE").map(String::as_str),
+            Some("32")
+        );
+        assert_eq!(
+            environment.get("XCURSOR_PATH").map(String::as_str),
+            Some("/tmp/stage/icons")
+        );
     }
 
     #[test]

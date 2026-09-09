@@ -1,5 +1,5 @@
 use crate::icons::IconRole;
-use crate::palette::Rgb;
+use crate::palette::{PANEL, Rgb};
 use crate::typography::{TextStyle, Typography};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub const WINDOW_CHROME: WindowChromeRecipe = WindowChromeRecipe {
         WindowControlRole::Maximize,
         WindowControlRole::Close,
     ],
-    titlebar_background: Rgb(0x272a2d),
+    titlebar_background: PANEL,
     border: Rgb(0x46484b),
     close_hover: Rgb(0xe81123),
 };

@@ -45,6 +45,19 @@ impl ResizeEdges {
     pub const fn any(self) -> bool {
         self.left || self.right || self.top || self.bottom
     }
+
+    #[must_use]
+    pub fn at(outer_width: u32, outer_height: u32, x: i16, y: i16) -> Self {
+        let threshold = 6_i16;
+        let width = outer_width.clamp(1, u32::from(u16::MAX)) as i16;
+        let height = outer_height.clamp(1, u32::from(u16::MAX)) as i16;
+        Self {
+            left: x <= threshold,
+            right: x >= width.saturating_sub(threshold),
+            top: y <= threshold,
+            bottom: y >= height.saturating_sub(threshold),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

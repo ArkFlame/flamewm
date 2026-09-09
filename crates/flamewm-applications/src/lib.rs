@@ -13,12 +13,40 @@ pub struct DesktopEntry {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WindowApplicationIdentity {
+    pub wm_instance: String,
+    pub wm_class: String,
+    pub executable_basename: String,
+}
+
+impl WindowApplicationIdentity {
+    #[must_use]
+    pub fn new(
+        wm_instance: impl Into<String>,
+        wm_class: impl Into<String>,
+        executable_basename: impl Into<String>,
+    ) -> Self {
+        Self {
+            wm_instance: wm_instance.into(),
+            wm_class: wm_class.into(),
+            executable_basename: executable_basename.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ApplicationCatalog {
     applications: Vec<DesktopEntry>,
+    by_id: std::collections::BTreeMap<String, usize>,
+    by_wm_class: std::collections::BTreeMap<String, usize>,
+    by_stem: std::collections::BTreeMap<String, usize>,
+    by_exec: std::collections::BTreeMap<String, usize>,
 }
 
 pub mod catalog {
-    pub use super::{ApplicationCatalog, DesktopEntry, xdg_application_dirs};
+    pub use super::{
+        ApplicationCatalog, DesktopEntry, WindowApplicationIdentity, xdg_application_dirs,
+    };
 }
 
 pub mod exec {
@@ -108,9 +136,43 @@ impl ApplicationCatalog {
             }
         }
         entries.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(Self {
+        let mut catalog = Self {
             applications: entries,
-        })
+            by_id: std::collections::BTreeMap::new(),
+            by_wm_class: std::collections::BTreeMap::new(),
+            by_stem: std::collections::BTreeMap::new(),
+            by_exec: std::collections::BTreeMap::new(),
+        };
+        catalog.rebuild_indexes();
+        Ok(catalog)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.by_id.clear();
+        self.by_wm_class.clear();
+        self.by_stem.clear();
+        self.by_exec.clear();
+        for (index, entry) in self.applications.iter().enumerate() {
+            self.by_id
+                .entry(entry.id.as_str().to_owned())
+                .or_insert(index);
+            let wm_class = entry.application.startup_wm_class.trim();
+            if !wm_class.is_empty() {
+                self.by_wm_class
+                    .entry(wm_class.to_ascii_lowercase())
+                    .or_insert(index);
+            }
+            for stem in id_stems(&entry.id) {
+                self.by_stem
+                    .entry(stem.to_ascii_lowercase())
+                    .or_insert(index);
+            }
+            if let Some(base) = exec_basename(&entry.exec) {
+                self.by_exec
+                    .entry(base.to_ascii_lowercase())
+                    .or_insert(index);
+            }
+        }
     }
 
     #[must_use]
@@ -127,10 +189,48 @@ impl ApplicationCatalog {
     }
 
     pub fn find(&self, id: &DesktopAppId) -> FlameResult<&DesktopEntry> {
-        self.applications
-            .iter()
-            .find(|entry| &entry.id == id)
+        self.by_id
+            .get(id.as_str())
+            .and_then(|index| self.applications.get(*index))
             .ok_or_else(|| FlameError::new(ErrorCode::NotFound, "application id not found"))
+    }
+
+    pub fn find_by_window_identity(
+        &self,
+        identity: &WindowApplicationIdentity,
+    ) -> Option<&DesktopEntry> {
+        let candidates: Vec<String> = [
+            identity.wm_instance.as_str(),
+            identity.wm_class.as_str(),
+            identity.executable_basename.as_str(),
+        ]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // Priority 1: StartupWMClass exact case-insensitive match.
+        for needle in &candidates {
+            if let Some(index) = self.by_wm_class.get(needle) {
+                return self.applications.get(*index);
+            }
+        }
+        // Priority 2: desktop-file id stem exact match (e.g. "org.mozilla.firefox" or
+        // "firefox" from "org.mozilla.firefox.desktop").
+        for needle in &candidates {
+            if let Some(index) = self.by_stem.get(needle) {
+                return self.applications.get(*index);
+            }
+        }
+        // Priority 3: Exec basename exact match (case-insensitive).
+        for needle in &candidates {
+            if let Some(index) = self.by_exec.get(needle) {
+                return self.applications.get(*index);
+            }
+        }
+        None
     }
 
     #[must_use]
@@ -412,6 +512,28 @@ fn parse_desktop_entry(path: &Path, id: DesktopAppId) -> FlameResult<Option<Desk
     }))
 }
 
+fn id_stems(id: &DesktopAppId) -> Vec<String> {
+    let full = id.as_str().strip_suffix(".desktop").unwrap_or(id.as_str());
+    let mut stems = vec![full.to_owned()];
+    if let Some(last) = full.rsplit('.').next() {
+        if last != full {
+            stems.push(last.to_owned());
+        }
+    }
+    stems
+}
+
+fn exec_basename(exec: &str) -> Option<String> {
+    let program = tokenize_exec(exec).ok()?.into_iter().next()?;
+    let trimmed = program.trim().trim_matches(|c| c == '"' || c == '\'');
+    let file = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let base = file.trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.to_owned())
+}
+
 fn is_true(value: Option<&String>) -> bool {
     value
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
@@ -632,5 +754,123 @@ mod tests {
         );
         assert!(DesktopEntry::from_file(&path).unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn identity_catalog() -> ApplicationCatalog {
+        fn entry(id: &str, name: &str, wm_class: &str, exec: &str) -> DesktopEntry {
+            DesktopEntry {
+                id: DesktopAppId::new(id),
+                application: DesktopApplication {
+                    id: DesktopAppId::new(id),
+                    name: name.into(),
+                    generic_name: String::new(),
+                    comment: String::new(),
+                    startup_wm_class: wm_class.into(),
+                    argv: Vec::new(),
+                    keywords: Vec::new(),
+                    icon_name: String::new(),
+                    categories: Vec::new(),
+                },
+                path: PathBuf::from(format!("/tmp/{id}")),
+                exec: exec.into(),
+            }
+        }
+        let mut catalog = ApplicationCatalog {
+            applications: vec![
+                entry(
+                    "org.kde.dolphin.desktop",
+                    "Dolphin",
+                    "dolphin",
+                    "dolphin %U",
+                ),
+                entry(
+                    "firefox.desktop",
+                    "Firefox",
+                    "firefox",
+                    "/usr/lib/firefox/firefox %u",
+                ),
+                entry(
+                    "org.prismlauncher.PrismLauncher.desktop",
+                    "Prism Launcher",
+                    "PrismLauncher",
+                    "prismlauncher",
+                ),
+                entry("myeditor.desktop", "MyEditor", "", "myeditor"),
+                entry("myeditor-pro.desktop", "MyEditor Pro", "", "myeditor-pro"),
+            ],
+            by_id: std::collections::BTreeMap::new(),
+            by_wm_class: std::collections::BTreeMap::new(),
+            by_stem: std::collections::BTreeMap::new(),
+            by_exec: std::collections::BTreeMap::new(),
+        };
+        catalog.rebuild_indexes();
+        catalog
+    }
+
+    #[test]
+    fn identity_matches_dolphin_by_startup_wm_class() {
+        let catalog = identity_catalog();
+        let found = catalog
+            .find_by_window_identity(&WindowApplicationIdentity::new(
+                "dolphin", "Dolphin", "dolphin",
+            ))
+            .unwrap();
+        assert_eq!(found.id.as_str(), "org.kde.dolphin.desktop");
+    }
+
+    #[test]
+    fn identity_matches_firefox_by_exec_basename() {
+        let catalog = identity_catalog();
+        let found = catalog
+            .find_by_window_identity(&WindowApplicationIdentity::new("", "", "firefox"))
+            .unwrap();
+        assert_eq!(found.id.as_str(), "firefox.desktop");
+    }
+
+    #[test]
+    fn identity_matches_prism_launcher_startup_wm_class() {
+        let catalog = identity_catalog();
+        let found = catalog
+            .find_by_window_identity(&WindowApplicationIdentity::new(
+                "PrismLauncher",
+                "prismlauncher",
+                "prismlauncher",
+            ))
+            .unwrap();
+        assert_eq!(found.id.as_str(), "org.prismlauncher.PrismLauncher.desktop");
+    }
+
+    #[test]
+    fn identity_prefers_startup_wm_class_over_id_stem() {
+        let catalog = identity_catalog();
+        // wm_class "dolphin" must not fuzzy-match another nearby id stem.
+        let found = catalog
+            .find_by_window_identity(&WindowApplicationIdentity::new("", "DOLPHIN", ""))
+            .unwrap();
+        assert_eq!(found.id.as_str(), "org.kde.dolphin.desktop");
+    }
+
+    #[test]
+    fn identity_near_collision_names_stay_exact() {
+        let catalog = identity_catalog();
+        let plain = catalog
+            .find_by_window_identity(&WindowApplicationIdentity::new("", "", "myeditor"))
+            .unwrap();
+        let pro = catalog
+            .find_by_window_identity(&WindowApplicationIdentity::new("", "", "myeditor-pro"))
+            .unwrap();
+        assert_eq!(plain.id.as_str(), "myeditor.desktop");
+        assert_eq!(pro.id.as_str(), "myeditor-pro.desktop");
+        // Substring must not match: "myedit" is not an exact stem/basename.
+        assert!(
+            catalog
+                .find_by_window_identity(&WindowApplicationIdentity::new("", "", "myedit"))
+                .is_none()
+        );
+        assert!(
+            catalog
+                .find_by_window_identity(&WindowApplicationIdentity::new("", "", ""))
+                .is_none()
+        );
     }
 }

@@ -90,6 +90,26 @@ impl Visual {
     }
 }
 
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UiLayer {
+    SurfaceBackground = -2000,
+    Background = -1000,
+    Content = 0,
+    Selection = 100,
+    Floating = 200,
+    Overlay = 500,
+    Popover = 1000,
+    Modal = 1100,
+}
+
+impl UiLayer {
+    #[must_use]
+    pub const fn z_index(self) -> i32 {
+        self as i32
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Material {
     pub fill: Color,
@@ -279,6 +299,25 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_layer_ordering_matches_stacking_contract() {
+        assert!(UiLayer::SurfaceBackground.z_index() < UiLayer::Background.z_index());
+        assert!(UiLayer::Background.z_index() < UiLayer::Content.z_index());
+        assert!(UiLayer::Content.z_index() < UiLayer::Selection.z_index());
+        assert!(UiLayer::Selection.z_index() < UiLayer::Floating.z_index());
+        assert!(UiLayer::Floating.z_index() < UiLayer::Overlay.z_index());
+        assert!(UiLayer::Overlay.z_index() < UiLayer::Popover.z_index());
+        assert!(UiLayer::Popover.z_index() < UiLayer::Modal.z_index());
+        assert_eq!(UiLayer::SurfaceBackground.z_index(), -2000);
+        assert_eq!(UiLayer::Background.z_index(), -1000);
+        assert_eq!(UiLayer::Content.z_index(), 0);
+        assert_eq!(UiLayer::Selection.z_index(), 100);
+        assert_eq!(UiLayer::Floating.z_index(), 200);
+        assert_eq!(UiLayer::Overlay.z_index(), 500);
+        assert_eq!(UiLayer::Popover.z_index(), 1000);
+        assert_eq!(UiLayer::Modal.z_index(), 1100);
+    }
 
     #[test]
     fn selected_visual_uses_semantic_accent() {

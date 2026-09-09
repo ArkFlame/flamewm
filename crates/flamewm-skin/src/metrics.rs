@@ -16,10 +16,15 @@ pub struct DesktopMetrics {
 pub struct WindowChromeMetrics {
     pub radius: u16,
     pub titlebar: u16,
+    pub titlebar_height: u16,
     pub title_side: u16,
     pub controls: u16,
     pub button_width: u16,
     pub button_height: u16,
+    pub control_button_width: u16,
+    pub control_button_height: u16,
+    pub control_glyph_edge: u16,
+    pub app_icon_visual_edge: u16,
     pub icon: u16,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +85,15 @@ impl SkinMetrics {
         chrome: WindowChromeMetrics {
             radius: 6,
             titlebar: 31,
+            titlebar_height: 31,
             title_side: 114,
             controls: 114,
             button_width: 38,
             button_height: 31,
+            control_button_width: 38,
+            control_button_height: 31,
+            control_glyph_edge: 16,
+            app_icon_visual_edge: 20,
             icon: 13,
         },
         settings: SettingsMetrics {

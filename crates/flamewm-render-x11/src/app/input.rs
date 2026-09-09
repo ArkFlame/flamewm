@@ -24,6 +24,7 @@ pub(crate) fn wheel_scroll_delta(button: PointerButton) -> Option<(f32, f32)> {
 /// Horizontal slider track/thumb geometry for pointer-drag mapping.
 /// `track` is the full track rect (device px), `value/min/max` the range;
 /// thumb width is 12px clamped to the track.
+#[allow(dead_code)]
 pub(crate) fn slider_thumb_rect(track: Rect, min: f32, max: f32, value: f32) -> Rect {
     let span = (max - min).max(f32::EPSILON);
     let ratio = ((value - min) / span).clamp(0.0, 1.0);

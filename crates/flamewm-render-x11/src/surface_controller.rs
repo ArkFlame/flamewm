@@ -3,6 +3,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use super::*;
 use crate::xlib::*;
 use flamewm_reactor::Reactor;
+use flamewm_render_core::SurfaceDamage;
 
 /// Reserved generic action for a ButtonRelease that lands outside the
 /// grabbed surface while a pointer grab is active. Feature modules share
@@ -79,6 +80,8 @@ where
 struct SurfaceInstance {
     app: X11App,
     document: RuntimeDocument,
+    role: SurfaceRole,
+    input: SurfaceInputMode,
 }
 
 pub struct SurfaceController {
@@ -126,24 +129,80 @@ impl SurfaceController {
     ) -> Result<SurfaceId, String> {
         let id = SurfaceId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("surface id exhausted")?;
+        let (role, input) = (config.role, config.input);
         let x11_config = X11Config::from(config.clone());
         let app =
             unsafe { X11App::new_surface(self.display, &x11_config, config.x, config.y, false)? };
         let window = app.window;
-        let mut instance = SurfaceInstance { app, document };
-        // SAFETY: display/window live; mask set at create time.
-        unsafe {
-            instance.app.refresh_shape_mask(&instance.document);
+        let mut instance = SurfaceInstance {
+            app,
+            document,
+            role,
+            input,
+        };
+        // Overlay/passthrough surfaces are excluded from WM client
+        // management: override-redirect + empty input region + no grab/focus.
+        if overlay_excluded_from_wm(role) {
+            unsafe {
+                let mut attributes = XSetWindowAttributes {
+                    background_pixmap: 0,
+                    background_pixel: TRANSPARENT_CLEAR_PIXEL,
+                    border_pixmap: 0,
+                    border_pixel: 0,
+                    bit_gravity: 0,
+                    win_gravity: 0,
+                    backing_store: 0,
+                    backing_planes: 0,
+                    backing_pixel: 0,
+                    save_under: 0,
+                    event_mask: 0,
+                    do_not_propagate_mask: 0,
+                    override_redirect: 1,
+                    colormap: 0,
+                    cursor: 0,
+                };
+                XChangeWindowAttributes(
+                    self.display,
+                    window,
+                    CW_OVERRIDE_REDIRECT,
+                    &mut attributes,
+                );
+            }
         }
+        if input == SurfaceInputMode::PassThrough {
+            if let Some(bridge) = instance.app.xshape.as_ref() {
+                // Empty input region: pointer falls through the surface.
+                if let Err(error) = unsafe { bridge.apply_input_mask(window, &[]) } {
+                    return Err(error);
+                }
+            } else {
+                return Err(
+                    "passthrough surface requires XShape input region (unavailable)".to_string(),
+                );
+            }
+        }
+        // Hidden create: mark Full dirty, no layout/paint/present/map/shape.
+        // First show renders retained offscreen, then maps (popup map+raise).
+        if !config.initially_visible {
+            instance.app.mark_full();
+            instance.document.mark_dirty(SurfaceDamage::Full);
+            self.windows.insert(window, id);
+            self.surfaces.insert(id, instance);
+            return Ok(id);
+        }
+        // Visible create: paint retained offscreen first (redraw refreshes
+        // shape once), then map (popup map+raise) + present/flush.
         unsafe {
             instance.app.redraw(&instance.document)?;
         }
-        if config.initially_visible {
-            unsafe {
+        unsafe {
+            if surface_role_needs_popup_raise(role) {
+                XMapWindow(self.display, window);
+                XRaiseWindow(self.display, window);
+            } else {
                 XMapWindow(self.display, window);
             }
-        }
-        unsafe {
+            instance.app.present_scene()?;
             XFlush(self.display);
         }
         self.windows.insert(window, id);
@@ -167,17 +226,30 @@ impl SurfaceController {
     }
 
     pub fn show(&mut self, id: SurfaceId) -> Result<(), String> {
+        // First-show lifecycle: render the retained scene offscreen, refresh
+        // shape once, then map (popup: map+raise atomically) + present/flush
+        // so the first mapped frame is never blank. Second show sees clean
+        // damage and maps/presents without repainting.
+        let role = self.surface_role(id)?;
         let display = self.display;
         let instance = self.instance_mut(id)?;
-        unsafe {
-            instance.app.redraw(&instance.document)?;
+        let painted = unsafe { instance.app.redraw_if_dirty(&mut instance.document)? };
+        if painted {
+            // SAFETY: display/window live; shape follows retained repaint.
+            unsafe { instance.app.refresh_shape_mask(&instance.document) };
         }
         unsafe {
-            XMapWindow(display, instance.app.window);
+            if surface_role_needs_popup_raise(role) {
+                XMapWindow(display, instance.app.window);
+                XRaiseWindow(display, instance.app.window);
+            } else {
+                XMapWindow(display, instance.app.window);
+            }
+        }
+        unsafe {
+            instance.app.present_scene()?;
             XFlush(display);
         }
-        // SAFETY: display/window live; mask refreshes after show.
-        unsafe { instance.app.refresh_shape_mask(&instance.document) };
         Ok(())
     }
     pub fn hide(&mut self, id: SurfaceId) -> Result<(), String> {
@@ -222,6 +294,16 @@ impl SurfaceController {
     }
 
     pub fn grab_pointer(&mut self, id: SurfaceId) -> Result<(), String> {
+        let instance = self
+            .surfaces
+            .get(&id)
+            .ok_or_else(|| format!("unknown surface {}", id.0))?;
+        if !instance.input.allows_grab() {
+            return Err(format!(
+                "surface {} is pass-through; pointer grab refused",
+                id.0
+            ));
+        }
         let display = self.display;
         let instance = self.instance_mut(id)?;
         let result = unsafe {
@@ -261,16 +343,48 @@ impl SurfaceController {
     }
 
     pub fn redraw(&mut self, id: SurfaceId) -> Result<(), String> {
+        let _guard = flamewm_profiler::start("render.present");
         let instance = self.instance_mut(id)?;
         unsafe { instance.app.redraw(&instance.document) }
     }
 
     pub fn redraw_dirty(&mut self) -> Result<(), String> {
+        let _guard = flamewm_profiler::start("render.present");
         let ids: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
         for id in ids {
-            self.redraw(id)?;
+            let instance = self.instance_mut(id)?;
+            // SAFETY: instance owns a live display + app resources.
+            let painted = unsafe { instance.app.redraw_if_dirty(&mut instance.document)? };
+            if painted {
+                let instance = self.instance_mut(id)?;
+                // SAFETY: display/window live; mask follows repaint.
+                unsafe { instance.app.refresh_shape_mask(&instance.document) };
+            }
         }
         Ok(())
+    }
+
+    /// Mark damage on one surface without painting (merged max coverage).
+    pub fn mark_surface_dirty(
+        &mut self,
+        id: SurfaceId,
+        damage: SurfaceDamage,
+    ) -> Result<(), String> {
+        self.instance_mut(id)?.app.mark_dirty(damage);
+        self.instance_mut(id)?.document.mark_dirty(damage);
+        Ok(())
+    }
+
+    /// Peek the merged damage latch for one surface (no consume).
+    pub fn peek_surface_damage(&self, id: SurfaceId) -> Result<SurfaceDamage, String> {
+        let instance = self
+            .surfaces
+            .get(&id)
+            .ok_or_else(|| format!("unknown surface {}", id.0))?;
+        Ok(instance
+            .app
+            .pending_damage
+            .merge(instance.document.peek_damage()))
     }
 
     pub fn pump_events<F>(&mut self, mut on_action: F) -> Result<usize, String>
@@ -334,6 +448,11 @@ impl SurfaceController {
                         .app
                         .event_loop_once(&mut instance.document, &mut callback)?;
                 }
+                // Drain the document-owned damage latch into the app latch so
+                // `redraw_dirty` can coalesce; event_loop already merged its
+                // own marks via redraw_if_dirty.
+                let pending = instance.document.take_damage();
+                instance.app.mark_dirty(pending);
                 instance.app.close_requested
             };
             if let Some((button, x, y, time_ms)) = release_info {
@@ -357,6 +476,28 @@ impl SurfaceController {
 
     pub fn controller_event(&self, id: SurfaceId, event: ActionEvent) -> SurfaceControllerEvent {
         SurfaceControllerEvent { surface: id, event }
+    }
+
+    pub fn surface_role(&self, id: SurfaceId) -> Result<SurfaceRole, String> {
+        Ok(self
+            .surfaces
+            .get(&id)
+            .ok_or_else(|| format!("unknown surface {}", id.0))?
+            .role)
+    }
+
+    pub fn surface_input_mode(&self, id: SurfaceId) -> Result<SurfaceInputMode, String> {
+        Ok(self
+            .surfaces
+            .get(&id)
+            .ok_or_else(|| format!("unknown surface {}", id.0))?
+            .input)
+    }
+
+    /// Overlay management policy: overlays stay raisable but are never
+    /// WM-managed, never focusable, and never in the workarea/taskbar.
+    pub fn is_wm_managed(&self, id: SurfaceId) -> Result<bool, String> {
+        Ok(!overlay_excluded_from_wm(self.surface_role(id)?))
     }
 
     pub fn is_pointer_grabbed(&self, id: SurfaceId) -> Result<bool, String> {
@@ -509,6 +650,69 @@ mod tests {
     fn surface_id_round_trips() {
         let id = SurfaceId(7);
         assert_eq!(id.get(), 7);
+    }
+
+    #[test]
+    fn overlay_maps_to_notification_type_and_is_unmanaged() {
+        assert_eq!(
+            overlay_window_type_name(SurfaceRole::Overlay),
+            "_NET_WM_WINDOW_TYPE_NOTIFICATION"
+        );
+        assert!(overlay_excluded_from_wm(SurfaceRole::Overlay));
+        assert!(!overlay_excluded_from_wm(SurfaceRole::Normal));
+        assert!(!overlay_excluded_from_wm(SurfaceRole::Dock));
+    }
+
+    #[test]
+    fn passthrough_refuses_grab_and_focus() {
+        assert!(!SurfaceInputMode::PassThrough.allows_grab());
+        assert!(!SurfaceInputMode::PassThrough.allows_focus());
+        assert!(SurfaceInputMode::Interactive.allows_grab());
+        assert!(SurfaceInputMode::Interactive.allows_focus());
+    }
+
+    #[test]
+    fn config_maps_overlay_role() {
+        let config = SurfaceConfig {
+            role: SurfaceRole::Overlay,
+            ..SurfaceConfig::default()
+        };
+        let x11: X11Config = config.into();
+        assert_eq!(x11.role, X11WindowRole::Overlay);
+    }
+
+    #[test]
+    fn popup_policy_maps_raise_for_transients_only() {
+        assert!(!surface_role_needs_popup_raise(SurfaceRole::Normal));
+        assert!(!surface_role_needs_popup_raise(SurfaceRole::Desktop));
+        assert!(!surface_role_needs_popup_raise(SurfaceRole::Dock));
+        assert!(surface_role_needs_popup_raise(SurfaceRole::PopupMenu));
+        assert!(surface_role_needs_popup_raise(SurfaceRole::DropdownMenu));
+        assert!(surface_role_needs_popup_raise(SurfaceRole::Overlay));
+        assert!(!x11_role_needs_popup_raise(X11WindowRole::Normal));
+        assert!(x11_role_needs_popup_raise(X11WindowRole::PopupMenu));
+        assert!(x11_role_needs_popup_raise(X11WindowRole::DropdownMenu));
+        assert!(x11_role_needs_popup_raise(X11WindowRole::Overlay));
+    }
+
+    #[test]
+    fn damage_latch_merges_without_paint() {
+        use flamewm_render_core::Rect;
+        assert!(SurfaceDamage::None.is_empty());
+        assert!(!SurfaceDamage::Full.is_empty());
+        assert!(!SurfaceDamage::Region(Rect::default()).is_empty());
+        assert_eq!(
+            SurfaceDamage::None.merge(SurfaceDamage::Full),
+            SurfaceDamage::Full
+        );
+        assert_eq!(
+            SurfaceDamage::Full.merge(SurfaceDamage::None),
+            SurfaceDamage::Full
+        );
+        assert_eq!(
+            SurfaceDamage::None.merge(SurfaceDamage::None),
+            SurfaceDamage::None
+        );
     }
 }
 

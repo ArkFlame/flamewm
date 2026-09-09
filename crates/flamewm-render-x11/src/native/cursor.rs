@@ -1,17 +1,22 @@
 //! Xcursor backend: semantic cursor names via libXcursor, cached,
-//! with core font-cursor fallback. Logs `FLAMEWM_RENDER_CURSOR_BACKEND`
-//! exactly once per process.
+//! with core font-cursor fallback only on Xcursor failure.
+//! Logs `FLAMEWM_RENDER_CURSOR_BACKEND` exactly once per process.
 
 use std::ffi::CString;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::sync::Once;
 
 use flamewm_render_core::CursorKind;
 
 use crate::ffi::dynamic_library::DynamicLibrary;
-use crate::xlib::{Cursor, Display, Window};
+use crate::xlib::{
+    Cursor, Display, Window, XCURSOR_LIBRARY_NAMES, XCURSOR_SET_SIZE_SYMBOL,
+    XCURSOR_SET_THEME_SYMBOL,
+};
 
 type LibraryLoadCursorFn = unsafe extern "C" fn(*mut Display, *const c_char) -> Cursor;
+type LibrarySetThemeFn = unsafe extern "C" fn(*mut Display, *const c_char);
+type LibrarySetSizeFn = unsafe extern "C" fn(*mut Display, c_int);
 
 static LOG_ONCE: Once = Once::new();
 
@@ -26,17 +31,48 @@ pub struct XcursorBackend {
     load: Option<LibraryLoadCursorFn>,
     _library: Option<DynamicLibrary>,
     cache: std::collections::HashMap<CursorKind, Cursor>,
+    #[allow(dead_code)]
     xcursor: bool,
 }
 
 impl XcursorBackend {
     /// # Safety
     /// `display` must be a live Xlib display outliving the backend.
+    #[allow(dead_code)]
     pub unsafe fn new(display: *mut Display) -> Self {
-        let loaded = DynamicLibrary::open(&["libXcursor.so.1", "libXcursor.so"]).ok();
+        unsafe { Self::with_theme(display, None, None) }
+    }
+
+    /// # Safety
+    /// `display` must be a live Xlib display outliving the backend.
+    /// Applies `XcursorSetTheme`/`XcursorSetSize` explicitly when available
+    /// so the bundled theme/size bind even when process env arrives late.
+    pub unsafe fn with_theme(
+        display: *mut Display,
+        theme: Option<&str>,
+        size: Option<c_int>,
+    ) -> Self {
+        let loaded = DynamicLibrary::open(XCURSOR_LIBRARY_NAMES).ok();
         let load = loaded.as_ref().and_then(|lib| {
             unsafe { lib.symbol::<LibraryLoadCursorFn>(b"XcursorLibraryLoadCursor\0") }.ok()
         });
+        if let Some(set_theme) = loaded.as_ref().and_then(|lib| {
+            unsafe { lib.symbol::<LibrarySetThemeFn>(XCURSOR_SET_THEME_SYMBOL) }.ok()
+        }) {
+            if let Some(name) = theme.filter(|name| !name.is_empty()) {
+                if let Ok(cname) = CString::new(name) {
+                    unsafe { set_theme(display, cname.as_ptr()) };
+                }
+            }
+        }
+        if let Some(set_size) = loaded
+            .as_ref()
+            .and_then(|lib| unsafe { lib.symbol::<LibrarySetSizeFn>(XCURSOR_SET_SIZE_SYMBOL) }.ok())
+        {
+            if let Some(size) = size.filter(|size| *size > 0) {
+                unsafe { set_size(display, size) };
+            }
+        }
         let xcursor = load.is_some();
         log_backend(if xcursor {
             "xcursor"
@@ -52,6 +88,7 @@ impl XcursorBackend {
         }
     }
 
+    #[allow(dead_code)]
     pub fn uses_xcursor(&self) -> bool {
         self.xcursor
     }
@@ -119,12 +156,50 @@ fn core_shape(kind: CursorKind) -> u32 {
 
 fn cursor_names(kind: CursorKind) -> &'static [&'static str] {
     match kind {
-        CursorKind::Default | CursorKind::Move => &["default", "left_ptr"],
+        CursorKind::Default => &["default", "left_ptr"],
         CursorKind::Pointer => &["pointer", "hand2", "hand"],
         CursorKind::Text => &["text", "xterm", "ibeam"],
+        CursorKind::Move => &["move", "fleur", "size_all"],
         CursorKind::ResizeHorizontal => &["h_double_arrow", "sb_h_double_arrow", "col-resize"],
         CursorKind::ResizeVertical => &["v_double_arrow", "sb_v_double_arrow", "row-resize"],
         CursorKind::ResizeNorthWestSouthEast => &["nwse-resize", "bottom_right_corner"],
         CursorKind::ResizeNorthEastSouthWest => &["nesw-resize", "bottom_left_corner"],
+    }
+}
+
+/// Thin session facade over [`XcursorBackend`]: owns the backend lifetime and
+/// tracks the last successfully defined cursor.
+pub struct NativeCursorSession {
+    backend: XcursorBackend,
+    current: Option<CursorKind>,
+}
+
+impl NativeCursorSession {
+    #[must_use]
+    pub fn wrap(backend: XcursorBackend) -> Self {
+        Self {
+            backend,
+            current: None,
+        }
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn current(&self) -> Option<CursorKind> {
+        self.current
+    }
+
+    /// Define the cursor for `kind` on `window`.
+    ///
+    /// # Safety
+    /// `window` must be live on this session's display.
+    pub unsafe fn define(&mut self, window: Window, kind: CursorKind) -> Option<Cursor> {
+        let cursor = unsafe { self.backend.define(window, kind) }?;
+        self.current = Some(kind);
+        Some(cursor)
+    }
+
+    pub unsafe fn free_all(&mut self) {
+        unsafe { self.backend.free_all() };
     }
 }

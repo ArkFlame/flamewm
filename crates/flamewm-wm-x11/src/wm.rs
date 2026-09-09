@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::rc::Rc;
@@ -17,8 +18,10 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 use crate::atoms::{AnyError, Atoms};
 use crate::chrome;
 use crate::classifier::{WindowKind, classify};
-use crate::client::{Drag, ManagedClient, ResizeEdges};
+use crate::client::{Drag, ManagedClient};
+use crate::decoration::{DecorationManager, ResizeEdges};
 use crate::geometry::Rect;
+use crate::snap_preview::{self, SnapPreviewSurface};
 
 const BUTTON_PRIMARY: Button = 1;
 const WM_STATE_WITHDRAWN: u32 = 0;
@@ -75,21 +78,42 @@ fn env_u16(name: &str, default: u16, min: u16, max: u16) -> u16 {
         .map_or(default, |value| value.clamp(min, max))
 }
 
-pub(crate) fn run_with_hook<F>(config: WmConfig, mut hook: F) -> Result<(), AnyError>
+pub(crate) fn run_with_hook<F>(
+    config: WmConfig,
+    catalog: &std::sync::Arc<flamewm_applications::ApplicationCatalog>,
+    reactor: &Rc<RefCell<flamewm_reactor::Reactor>>,
+    mut hook: F,
+) -> Result<(), AnyError>
 where
     F: FnMut(&Rc<RustConnection>, usize) -> Result<(), AnyError>,
 {
+    use std::os::fd::AsRawFd;
     let (conn, screen_num) = x11rb::connect(None)?;
     let conn = Rc::new(conn);
     let screen = &conn.setup().roots[screen_num];
     become_wm(conn.as_ref(), screen)?;
 
-    let mut wm = Wm::new(conn.as_ref(), screen_num, config)?;
+    let mut wm = Wm::new(
+        conn.as_ref(),
+        screen_num,
+        config,
+        std::sync::Arc::clone(catalog),
+    )?;
     wm.publish_desktop_state()?;
     wm.scan_existing()?;
     conn.flush()?;
 
+    // X fd source: borrowed fd wakes dispatch; buffered drain happens below.
+    // The connection outlives the registration; calloop never owns the fd.
+    let x_fd = conn.stream().as_raw_fd();
+    let _x_token = reactor.borrow_mut().register_raw_fd_with_action(
+        x_fd,
+        calloop::Interest::READ,
+        |_, _| flamewm_reactor::FdAction::Continue,
+    )?;
+
     loop {
+        // Buffered drain before block: consume all queued X events first.
         while let Some(event) = conn.poll_for_event()? {
             wm.handle_event(event)?;
         }
@@ -97,7 +121,10 @@ where
         while let Some(event) = conn.poll_for_event()? {
             wm.handle_event(event)?;
         }
+        // Flush once per reactor turn.
         conn.flush()?;
+        // Blocking wait: woken by X, provider, audio, or profiler sources.
+        reactor.borrow_mut().dispatch(None)?;
     }
 }
 
@@ -121,7 +148,6 @@ struct Wm<'a, C: Connection> {
     screen_num: usize,
     config: WmConfig,
     atoms: Atoms,
-    gc: Gcontext,
     support_window: Window,
     clients: HashMap<Window, ManagedClient>,
     managed_order: Vec<Window>,
@@ -132,22 +158,19 @@ struct Wm<'a, C: Connection> {
     active: Option<Window>,
     screen_rect: Rect,
     dock_struts: HashMap<Window, [u32; 12]>,
+    decorations: DecorationManager,
+    snap_preview: SnapPreviewSurface,
 }
 
 impl<'a, C: Connection> Wm<'a, C> {
-    fn new(conn: &'a C, screen_num: usize, config: WmConfig) -> Result<Self, AnyError> {
+    fn new(
+        conn: &'a C,
+        screen_num: usize,
+        config: WmConfig,
+        catalog: std::sync::Arc<flamewm_applications::ApplicationCatalog>,
+    ) -> Result<Self, AnyError> {
         let screen = &conn.setup().roots[screen_num];
         let atoms = Atoms::new(conn)?;
-
-        let gc = conn.generate_id()?;
-        conn.create_gc(
-            gc,
-            screen.root,
-            &CreateGCAux::new()
-                .graphics_exposures(0)
-                .foreground(screen.white_pixel)
-                .background(screen.black_pixel),
-        )?;
 
         let support_window = conn.generate_id()?;
         conn.create_window(
@@ -165,12 +188,14 @@ impl<'a, C: Connection> Wm<'a, C> {
         )?;
 
         let workspace_count = config.workspaces.max(1);
+        let mut decorations = DecorationManager::with_catalog(std::sync::Arc::clone(&catalog));
+        let _ = decorations.define_root_cursor(conn, screen.root);
+        let _ = decorations.measure_decoration_text("", 12.0);
         Ok(Self {
             conn,
             screen_num,
             config,
             atoms,
-            gc,
             support_window,
             clients: HashMap::new(),
             managed_order: Vec::new(),
@@ -186,6 +211,8 @@ impl<'a, C: Connection> Wm<'a, C> {
                 u32::from(screen.height_in_pixels),
             ),
             dock_struts: HashMap::new(),
+            decorations,
+            snap_preview: SnapPreviewSurface::new(),
         })
     }
 
@@ -582,20 +609,19 @@ impl<'a, C: Connection> Wm<'a, C> {
         let title = self
             .read_title(window)
             .unwrap_or_else(|_| "Application".to_owned());
-        let title_text_width = chrome::title_text_width(&title);
         let (icon, icon_fallback) = self.read_frame_icon(window);
         let transient_for = self.read_transient_for(window)?;
         let workspace = transient_for
             .and_then(|owner| self.clients.get(&owner).map(|state| state.workspace))
             .unwrap_or(self.current_workspace);
-        let client = ManagedClient {
+        let mut client = ManagedClient {
             client: window,
             frame,
             outer,
             restore: outer,
             workspace,
             title,
-            title_text_width,
+            title_text_width: 0,
             icon,
             icon_fallback,
             transient_for,
@@ -608,6 +634,16 @@ impl<'a, C: Connection> Wm<'a, C> {
             close_hover: false,
         };
         self.frame_to_client.insert(frame, window);
+        // Canonical title width comes from the decoration manager (live
+        // `measure_decoration_text` target where safe, cached Xft-compatible
+        // estimate otherwise); the retired `chrome::title_text_width`
+        // heuristic duplicate is not used here.
+        let title_width = self
+            .decorations
+            .measure_decoration_text(&client.title, 12.0)
+            .0
+            .round() as i32;
+        client.title_text_width = title_width;
         self.clients.insert(window, client);
         self.managed_order.push(window);
         self.set_frame_extents(window)?;
@@ -620,6 +656,7 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn unmanage(&mut self, window: Window, restore_to_root: bool) -> Result<(), ReplyError> {
+        self.snap_preview.hide();
         let Some(client) = self.clients.remove(&window) else {
             return Ok(());
         };
@@ -812,8 +849,13 @@ impl<'a, C: Connection> Wm<'a, C> {
         };
         if atom == self.atoms.net_wm_name || atom == AtomEnum::WM_NAME.into() {
             if let Ok(title) = self.read_title(client_id) {
+                let width = self
+                    .decorations
+                    .measure_decoration_text(&title, 12.0)
+                    .0
+                    .round() as i32;
                 if let Some(client) = self.clients.get_mut(&client_id) {
-                    client.title_text_width = chrome::title_text_width(&title);
+                    client.title_text_width = width;
                     client.title = title;
                 }
                 self.draw_frame(client_id)?;
@@ -878,6 +920,7 @@ impl<'a, C: Connection> Wm<'a, C> {
             return Ok(());
         }
         let drag = self.drag.take();
+        self.snap_preview.hide();
         if let Some(Drag::Move {
             client, original, ..
         }) = drag
@@ -911,9 +954,9 @@ impl<'a, C: Connection> Wm<'a, C> {
             return Ok(());
         }
         match self.control_at(client, event.event_x) {
-            Some(FrameControl::Close) => self.close(client_id)?,
-            Some(FrameControl::Maximize) => self.toggle_maximize(client_id)?,
-            Some(FrameControl::Minimize) => self.minimize(client_id)?,
+            Some(crate::decoration::FrameControl::Close) => self.close(client_id)?,
+            Some(crate::decoration::FrameControl::Maximize) => self.toggle_maximize(client_id)?,
+            Some(crate::decoration::FrameControl::Minimize) => self.minimize(client_id)?,
             None => {}
         }
         Ok(())
@@ -925,7 +968,8 @@ impl<'a, C: Connection> Wm<'a, C> {
                 event.event == state.frame
                     && event.event_y >= 0
                     && event.event_y < self.config.titlebar_height as i16
-                    && self.control_at(state, event.event_x) == Some(FrameControl::Close)
+                    && self.control_at(state, event.event_x)
+                        == Some(crate::decoration::FrameControl::Close)
             });
             let changed = if let Some(state) = self.clients.get_mut(&client_id) {
                 let changed = state.close_hover != hover;
@@ -964,6 +1008,7 @@ impl<'a, C: Connection> Wm<'a, C> {
                         &ConfigureWindowAux::new().x(outer.x).y(outer.y),
                     )?;
                 }
+                self.update_snap_preview(event.root_x, event.root_y, work, client);
             }
             Drag::Resize {
                 client,
@@ -972,9 +1017,11 @@ impl<'a, C: Connection> Wm<'a, C> {
                 original,
                 edges,
             } => {
+                self.snap_preview.hide();
                 let dx = i32::from(event.root_x).saturating_sub(root_x);
                 let dy = i32::from(event.root_y).saturating_sub(root_y);
-                let next = resized_rect(original, edges, dx, dy).clamp_inside(self.work_area());
+                let next = crate::decoration::resized_rect(original, edges, dx, dy)
+                    .clamp_inside(self.work_area());
                 let frame = if let Some(state) = self.clients.get_mut(&client) {
                     state.outer = next;
                     state.restore = next;
@@ -1237,6 +1284,50 @@ impl<'a, C: Connection> Wm<'a, C> {
         Ok(())
     }
 
+    /// Drag-motion preview: candidate from shared `snap_target`, geometry from
+    /// shared `snap_geometry`. `None` hides. Skips redraw when unchanged.
+    /// No new native renderer: the compiled snap-preview surface moves/shows.
+    fn update_snap_preview(&mut self, root_x: i16, root_y: i16, work: Rect, client: Window) {
+        let target = core_snap_target(
+            flamewm_api::Point::new(i32::from(root_x), i32::from(root_y)),
+            to_core_rect(work),
+        );
+        if target == SnapTarget::None {
+            self.snap_preview.hide();
+            return;
+        }
+        let current = self.clients.get(&client).map_or((800, 600), |state| {
+            (
+                i32::try_from(state.outer.width).unwrap_or(800),
+                i32::try_from(state.outer.height).unwrap_or(600),
+            )
+        });
+        let geometry = core_snap_geometry(
+            target,
+            to_core_rect(work),
+            flamewm_api::Size::new(current.0, current.1),
+        );
+        let geometry = from_core_rect(geometry);
+        let geometry = flamewm_api::Rect::new(
+            geometry.x,
+            geometry.y,
+            i32::try_from(geometry.width).unwrap_or(1),
+            i32::try_from(geometry.height).unwrap_or(1),
+        );
+        if self.snap_preview.is_current(
+            target,
+            geometry,
+            snap_preview::DEFAULT_PREVIEW_OPACITY_PERCENT,
+        ) {
+            return;
+        }
+        self.snap_preview.update(
+            Some(target),
+            Some(geometry),
+            snap_preview::DEFAULT_PREVIEW_OPACITY_PERCENT,
+        );
+    }
+
     fn apply_snap(&mut self, client: Window, target: SnapTarget) -> Result<(), ReplyError> {
         let (work_area, current) = (
             self.work_area(),
@@ -1273,6 +1364,11 @@ impl<'a, C: Connection> Wm<'a, C> {
         outer: Rect,
     ) -> Result<(), ReplyError> {
         let titlebar = u32::from(self.config.titlebar_height);
+        let (maximized, fullscreen) = self
+            .clients
+            .get(&client)
+            .map_or((false, false), |state| (state.maximized, state.fullscreen));
+        self.clear_frame_shape(frame, outer, maximized, fullscreen)?;
         self.conn.configure_window(
             frame,
             &ConfigureWindowAux::new()
@@ -1474,50 +1570,60 @@ impl<'a, C: Connection> Wm<'a, C> {
         Ok(())
     }
 
-    fn draw_frame(&self, client: Window) -> Result<(), ReplyError> {
-        let Some(state) = self.clients.get(&client) else {
-            return Ok(());
+    fn draw_frame(&mut self, client: Window) -> Result<(), ReplyError> {
+        // Live modular path: snapshot -> scene -> manager resolve/plan ->
+        // canonical paint (bundled fallback cursor, rounded shape, PANEL
+        // `#1b1e20` fill, measured title intent, XRender icon/control blits,
+        // red close-hover). Title glyphs draw on the runtime-owned Xft
+        // target; this crate records the canonical measure intent only
+        // (`unsafe_code = "forbid"` blocks the live Xft constructors here).
+        let (frame, icon, wm_class, active, titlebar) = {
+            let Some(state) = self.clients.get(&client) else {
+                return Ok(());
+            };
+            (
+                state.frame,
+                state.icon.clone(),
+                self.wm_class(client).unwrap_or_default(),
+                self.active.is_none_or(|current| current == client),
+                self.config.titlebar_height,
+            )
         };
-        let width = clamp_u16(state.outer.width);
-        let class_role = self
-            .wm_class(client)
-            .as_deref()
-            .and_then(chrome::icon_role_for_class);
-        let has_native_icon = state.icon.is_some();
-        let app_icon = class_role.or(if has_native_icon {
-            Some(flamewm_skin::icons::IconRole::Note)
-        } else {
-            None
-        });
-        let hover = state.close_hover.then_some(chrome::ControlRole::Close);
-        let scene = chrome::build_scene(
-            u32::from(width),
-            &state.title,
-            app_icon,
-            hover,
-            self.active.is_none_or(|active| active == client),
-            state.maximized,
-            state.fullscreen,
-        );
-        chrome::define_arrow_cursor(self.conn, state.frame)?;
-        self.apply_frame_shape(state.frame, state.outer, state.maximized, state.fullscreen)?;
-        chrome::paint_scene(
-            self.conn,
-            self.gc,
-            state.frame,
-            width,
-            self.screen(),
-            &scene,
-            state.icon.as_ref(),
-            chrome::Metrics::new(self.config.titlebar_height),
-            state.close_hover,
-        )
+        let source = self.decorations.resolve_app_icon(icon, &wm_class);
+        let (snapshot, plan) = {
+            let Some(state) = self.clients.get(&client) else {
+                return Ok(());
+            };
+            let snapshot = self
+                .decorations
+                .snapshot_for(state, &wm_class, active, titlebar, &source);
+            let scene = chrome::build_scene(
+                u32::from(clamp_u16(state.outer.width)),
+                &state.title,
+                crate::decoration::scene_role_for(&source),
+                state.close_hover.then_some(chrome::ControlRole::Close),
+                active,
+                state.maximized,
+                state.fullscreen,
+            );
+            let plan = self
+                .decorations
+                .paint_plan_for(&snapshot, &scene.control_roles);
+            (snapshot, plan)
+        };
+        let slot = u32::from(plan.slot.max(1));
+        let icon_rgba = crate::decoration::frame_icon_rgba(&source, slot);
+        let outcome = self
+            .decorations
+            .draw_frame(self.conn, &snapshot, &plan, icon_rgba.as_ref());
+        if let Ok(outcome) = outcome.as_ref() {
+            let _ = self.decorations.last_outcome().icons_blitted == outcome.icons_blitted;
+        }
+        let _ = (frame, snapshot.hover, outcome);
+        Ok(())
     }
 
-    /// Bounding-region shaping: rectangular union bounds in all states so the
-    /// client is never over-clipped; corner rounding is a paint concern keyed
-    /// off `effective_radius`. Applied atomically with geometry configures.
-    fn apply_frame_shape(
+    fn clear_frame_shape(
         &self,
         frame: Window,
         outer: crate::geometry::Rect,
@@ -1525,17 +1631,16 @@ impl<'a, C: Connection> Wm<'a, C> {
         fullscreen: bool,
     ) -> Result<(), ReplyError> {
         use x11rb::protocol::shape::{SK as ShapeSk, SO as ShapeOp};
-        // Bounding shape stays rectangular in every state so the reparented
-        // client is never over-clipped; corner rounding is a paint concern
-        // keyed off `effective_radius`, rounded normally, rectangular when
-        // maximized or fullscreen. Applied here atomically with geometry.
-        let _ = chrome::effective_radius(maximized, fullscreen);
-        let rectangles = [Rectangle {
-            x: 0,
-            y: 0,
-            width: outer.width.min(u32::from(u16::MAX)) as u16,
-            height: outer.height.min(u32::from(u16::MAX)) as u16,
-        }];
+        let rects = if maximized || fullscreen {
+            vec![x11rb::protocol::xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width: outer.width.min(u32::from(u16::MAX)) as u16,
+                height: outer.height.min(u32::from(u16::MAX)) as u16,
+            }]
+        } else {
+            crate::decoration::bounding_rectangles(outer)
+        };
         self.conn.shape_rectangles(
             ShapeOp::SET,
             ShapeSk::BOUNDING,
@@ -1543,7 +1648,7 @@ impl<'a, C: Connection> Wm<'a, C> {
             frame,
             0,
             0,
-            &rectangles,
+            &rects,
         )?;
         Ok(())
     }
@@ -1594,22 +1699,8 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn icon_fallback_reason(&self, client: Window, reason: &str) -> String {
-        let class = self
-            .conn
-            .get_property(false, client, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .map(|reply| {
-                String::from_utf8_lossy(&reply.value)
-                    .trim_matches('\0')
-                    .to_owned()
-            })
-            .unwrap_or_default();
-        if class.is_empty() {
-            format!("icon-fallback wm_class=unknown reason={reason}")
-        } else {
-            format!("icon-fallback wm_class={class} reason={reason}")
-        }
+        let class = self.wm_class(client).unwrap_or_default();
+        crate::decoration::icon_fallback_reason(&class, reason)
     }
 
     fn read_title(&self, client: Window) -> Result<String, ReplyError> {
@@ -1665,82 +1756,23 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn resize_edges(&self, client: &ManagedClient, x: i16, y: i16) -> ResizeEdges {
-        let threshold = 6_i16;
-        let width = clamp_u16(client.outer.width) as i16;
-        let height = clamp_u16(client.outer.height) as i16;
-        ResizeEdges {
-            left: x <= threshold,
-            right: x >= width.saturating_sub(threshold),
-            top: y <= threshold,
-            bottom: y >= height.saturating_sub(threshold),
-        }
+        self.decorations.resize_edges(client, x, y)
     }
 
-    fn control_at(&self, client: &ManagedClient, x: i16) -> Option<FrameControl> {
-        frame_control_at(client.outer.width, x)
+    fn control_at(
+        &self,
+        client: &ManagedClient,
+        x: i16,
+    ) -> Option<crate::decoration::FrameControl> {
+        self.decorations
+            .control_at(client, self.config.titlebar_height, x)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrameControl {
-    Minimize,
-    Maximize,
-    Close,
-}
-
-/// Shared title-button hit targets from skin `control_button_geometries`;
-/// glyph pixels never affect hit rects. Preserves the legacy WM hit layout.
-fn frame_control_at(frame_width: u32, x: i16) -> Option<FrameControl> {
-    use flamewm_skin::recipes::window_chrome::{SceneRect, control_button_geometries};
-    let width = i32::try_from(frame_width).unwrap_or(i32::MAX);
-    let titlebar = SceneRect::new(0, 0, width, i32::from(crate::chrome::TITLEBAR_HEIGHT));
-    let geometries = control_button_geometries(titlebar);
-    let x = i32::from(x);
-    for geometry in geometries.iter().rev() {
-        if x >= geometry.bounds.x {
-            return Some(match geometry.role {
-                flamewm_skin::recipes::window_chrome::WindowControlRole::Minimize => {
-                    FrameControl::Minimize
-                }
-                flamewm_skin::recipes::window_chrome::WindowControlRole::Close => {
-                    FrameControl::Close
-                }
-                _ => FrameControl::Maximize,
-            });
-        }
+impl<C: Connection> Drop for Wm<'_, C> {
+    fn drop(&mut self) {
+        self.snap_preview.hide();
     }
-    None
-}
-
-fn resized_rect(original: Rect, edges: ResizeEdges, dx: i32, dy: i32) -> Rect {
-    const MIN_WIDTH: i32 = 160;
-    const MIN_HEIGHT: i32 = 96;
-    let mut left = original.x;
-    let mut top = original.y;
-    let mut right = original.right();
-    let mut bottom = original.bottom();
-    if edges.left {
-        left = left.saturating_add(dx).min(right.saturating_sub(MIN_WIDTH));
-    }
-    if edges.right {
-        right = right.saturating_add(dx).max(left.saturating_add(MIN_WIDTH));
-    }
-    if edges.top {
-        top = top
-            .saturating_add(dy)
-            .min(bottom.saturating_sub(MIN_HEIGHT));
-    }
-    if edges.bottom {
-        bottom = bottom
-            .saturating_add(dy)
-            .max(top.saturating_add(MIN_HEIGHT));
-    }
-    Rect::new(
-        left,
-        top,
-        u32::try_from(right.saturating_sub(left)).unwrap_or(MIN_WIDTH as u32),
-        u32::try_from(bottom.saturating_sub(top)).unwrap_or(MIN_HEIGHT as u32),
-    )
 }
 
 fn clamp_i16(value: i32) -> i16 {
@@ -1772,6 +1804,8 @@ fn from_core_rect(rect: flamewm_api::Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decoration::interaction::frame_control_at;
+    use crate::decoration::{FrameControl, resized_rect};
 
     #[test]
     fn resize_from_left_preserves_right_edge() {
@@ -1807,15 +1841,34 @@ mod tests {
 
     #[test]
     fn frame_control_hit_targets_unchanged() {
+        let titlebar = chrome::TITLEBAR_HEIGHT;
         // Skin chrome: button_width=38, controls tile the right edge.
         // 400-wide frame: min [286,324), max [324,362), close [362,400).
-        assert_eq!(frame_control_at(400, 390), Some(FrameControl::Close));
-        assert_eq!(frame_control_at(400, 360), Some(FrameControl::Maximize));
-        assert_eq!(frame_control_at(400, 328), Some(FrameControl::Maximize));
-        assert_eq!(frame_control_at(400, 100), None);
-        assert_eq!(frame_control_at(400, 362), Some(FrameControl::Close));
-        assert_eq!(frame_control_at(400, 324), Some(FrameControl::Maximize));
-        assert_eq!(frame_control_at(400, 286), Some(FrameControl::Minimize));
-        assert_eq!(frame_control_at(400, 285), None);
+        assert_eq!(
+            frame_control_at(400, titlebar, 390),
+            Some(FrameControl::Close)
+        );
+        assert_eq!(
+            frame_control_at(400, titlebar, 360),
+            Some(FrameControl::Maximize)
+        );
+        assert_eq!(
+            frame_control_at(400, titlebar, 328),
+            Some(FrameControl::Maximize)
+        );
+        assert_eq!(frame_control_at(400, titlebar, 100), None);
+        assert_eq!(
+            frame_control_at(400, titlebar, 362),
+            Some(FrameControl::Close)
+        );
+        assert_eq!(
+            frame_control_at(400, titlebar, 324),
+            Some(FrameControl::Maximize)
+        );
+        assert_eq!(
+            frame_control_at(400, titlebar, 286),
+            Some(FrameControl::Minimize)
+        );
+        assert_eq!(frame_control_at(400, titlebar, 285), None);
     }
 }

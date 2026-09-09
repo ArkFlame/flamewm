@@ -1,8 +1,12 @@
 //! Flame Shell view models. No X11 widget/window owns product state here.
 
 pub mod clock;
+pub mod menu_policy;
+pub mod popup;
 pub mod quickswitch;
+pub mod start_menu;
 pub mod status;
+pub mod workspaces;
 
 use flamewm_api::applications::DesktopApplication;
 use flamewm_api::display::DisplaySnapshot;
@@ -11,56 +15,11 @@ use flamewm_api::system::{
     NetworkAccessPointSnapshot, NetworkKind, PlaybackState, ServiceAvailability, SystemSnapshot,
 };
 use flamewm_api::window::{WindowSnapshot, WindowState};
-use flamewm_api::{DesktopAppId, OutputId, PanelEdge, Rect, Size, TaskEntryId, WindowRef};
+use flamewm_api::{DesktopAppId, OutputId, Rect, Size, TaskEntryId, WindowRef};
+use flamewm_ui_core::IconRole;
 use flamewm_ui_core::style::ShellMetrics;
-use flamewm_ui_core::{IconRole, PopoverDirection, anchor_popover};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartModel {
-    applications: Vec<DesktopApplication>,
-    query: String,
-}
-
-impl StartModel {
-    #[must_use]
-    pub fn new(applications: Vec<DesktopApplication>) -> Self {
-        Self {
-            applications,
-            query: String::new(),
-        }
-    }
-
-    pub fn replace_applications(&mut self, applications: Vec<DesktopApplication>) {
-        self.applications = applications;
-    }
-
-    pub fn set_query(&mut self, query: impl Into<String>) {
-        self.query = query.into();
-    }
-
-    #[must_use]
-    pub fn results(&self) -> Vec<&DesktopApplication> {
-        let needle = self.query.trim().to_lowercase();
-        if needle.is_empty() {
-            return self.applications.iter().collect();
-        }
-        self.applications
-            .iter()
-            .filter(|app| {
-                app.name.to_lowercase().contains(&needle)
-                    || app.id.as_str().to_lowercase().contains(&needle)
-                    || app
-                        .keywords
-                        .iter()
-                        .any(|keyword| keyword.to_lowercase().contains(&needle))
-                    || app
-                        .categories
-                        .iter()
-                        .any(|category| category.to_lowercase().contains(&needle))
-            })
-            .collect()
-    }
-}
+pub use start_menu::{StartModel, StartSurfaceLayout, start_surface_layout};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkView {
@@ -674,69 +633,11 @@ impl PrimaryPresentationRouter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartSurfaceLayout {
+#[deprecated(note = "canonical StartSurfaceLayout lives in start_menu; use that import")]
+pub struct StartSurfaceLayoutCompat {
     pub button: Rect,
     pub anchor: Rect,
     pub popover: Rect,
-}
-
-#[must_use]
-pub fn start_surface_layout(
-    output: OutputId,
-    output_rect: Rect,
-    edge: PanelEdge,
-    metrics: ShellMetrics,
-) -> StartSurfaceLayout {
-    let (button_w, button_h) = if edge.is_horizontal() {
-        (
-            i32::from(metrics.start_button_width),
-            i32::from(metrics.panel_height),
-        )
-    } else {
-        (
-            i32::from(metrics.panel_height),
-            i32::from(metrics.start_button_width),
-        )
-    };
-    let anchor = match edge {
-        PanelEdge::Bottom => Rect::new(
-            output_rect.x,
-            output_rect.bottom() - button_h,
-            button_w,
-            button_h,
-        ),
-        PanelEdge::Top => Rect::new(output_rect.x, output_rect.y, button_w, button_h),
-        PanelEdge::Left => Rect::new(output_rect.x, output_rect.y, button_w, button_h),
-        PanelEdge::Right => Rect::new(
-            output_rect.right() - button_w,
-            output_rect.y,
-            button_w,
-            button_h,
-        ),
-    };
-    let direction = match edge {
-        PanelEdge::Bottom => PopoverDirection::Above,
-        PanelEdge::Top => PopoverDirection::Below,
-        PanelEdge::Left => PopoverDirection::RightOf,
-        PanelEdge::Right => PopoverDirection::LeftOf,
-    };
-    let popover = anchor_popover(
-        output,
-        output_rect,
-        anchor,
-        (
-            i32::from(metrics.start_menu_width),
-            i32::from(metrics.start_menu_min_height),
-        ),
-        direction,
-        i32::from(metrics.popover_offset),
-    )
-    .rect;
-    StartSurfaceLayout {
-        button: Rect::new(0, 0, button_w, button_h),
-        anchor,
-        popover,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,7 +807,7 @@ mod tests {
         let layout = start_surface_layout(
             OutputId::new("eDP-1"),
             Rect::new(0, 0, 1920, 1080),
-            PanelEdge::Bottom,
+            flamewm_api::PanelEdge::Bottom,
             ShellMetrics::default(),
         );
         assert_eq!(layout.anchor, Rect::new(0, 1036, 43, 44));

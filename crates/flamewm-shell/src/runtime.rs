@@ -10,12 +10,14 @@ use flamewm_api::window::WindowSnapshot;
 use flamewm_api::workspace::WorkspaceSnapshot;
 use flamewm_control_core::{ControlRequest, ControlResponse};
 use flamewm_control_dbus::ControlClient;
+use flamewm_shell_core::popup::{
+    anchor_popover_rect, context_menu_rect, context_menu_size, panel_anchor,
+};
 use flamewm_shell_core::start_surface_layout;
 use flamewm_ui_core::style::ShellMetrics;
-use flamewm_ui_core::{anchor_popover, PopoverDirection};
 use flamewm_ui_x11::{
-    decode_document, SurfaceConfig, SurfaceHandle, SurfaceRole, SurfaceRuntime, UiBackendError,
-    UiTemplate,
+    decode_document, SurfaceConfig, SurfaceHandle, SurfaceInputMode, SurfaceRole, SurfaceRuntime,
+    UiBackendError, UiTemplate,
 };
 
 const PANEL_ARTIFACT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flamewm-panel.rwr"));
@@ -517,6 +519,7 @@ impl ShellSurfaces {
                 height: checked_size(panel_snapshot.geometry.height)?,
                 title: "FlameWM panel".to_owned(),
                 role: SurfaceRole::Dock,
+                input: SurfaceInputMode::Interactive,
                 initially_visible: panel_snapshot.visible,
                 x: panel_snapshot.geometry.x,
                 y: panel_snapshot.geometry.y,
@@ -642,8 +645,31 @@ impl ShellSurfaces {
         self.show_grabbed(runtime, self.start_submenu, rect, Transient::StartGroup)
     }
 
-    /// Opens the root Start surface plus its submenu as one transient
-    /// grab/close group: the submenu owns the single pointer grab, an
+    fn open_start_submenu_tail(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), String> {
+        let size = runtime
+            .document_intrinsic_size(self.start_submenu)
+            .map(|(width, height)| {
+                flamewm_api::Size::new(width.max(1.0) as i32, height.max(1.0) as i32)
+            })
+            .unwrap_or(flamewm_api::Size::new(280, 320));
+        let clamped = flamewm_api::Size::new(
+            size.width.min(self.output.geometry.width.max(1)),
+            size.height.min(self.output.geometry.height.max(1)),
+        );
+        let geometry = flamewm_ui_core::popover::PopoverGeometry::place_aligned(
+            self.start_layout.popover,
+            clamped,
+            match self.panel_snapshot.edge {
+                flamewm_api::PanelEdge::Right => flamewm_ui_core::popover::PopoverEdge::Left,
+                _ => flamewm_ui_core::popover::PopoverEdge::Right,
+            },
+            flamewm_ui_core::popover::PopoverAlign::Start,
+            self.output.geometry,
+            0,
+        );
+        let rect = flamewm_api::Rect::from_parts(geometry.origin, clamped);
+        self.show_grabbed(runtime, self.start_submenu, rect, Transient::StartGroup)
+    }
     /// outside release, Escape, or launch closes both surfaces, and the grab
     /// is released exactly once through `close_transients`.
     pub fn open_start_group(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), String> {
@@ -652,13 +678,7 @@ impl ShellSurfaces {
         }
         self.close_transients(runtime)?;
         self.show(runtime, self.start, self.start_layout.popover)?;
-        let rect = flamewm_api::Rect::new(
-            self.start_layout.popover.right(),
-            self.start_layout.popover.y,
-            i32::from(ShellMetrics::default().start_submenu_width),
-            i32::from(ShellMetrics::default().start_menu_min_height),
-        );
-        self.show_grabbed(runtime, self.start_submenu, rect, Transient::StartGroup)
+        return self.open_start_submenu_tail(runtime);
     }
 
     #[must_use]
@@ -680,6 +700,20 @@ impl ShellSurfaces {
     }
 
     pub fn open_status(&mut self, runtime: &mut SurfaceRuntime, name: &str) -> Result<(), String> {
+        // Live path: stable panel node ids, edge from the panel edge, Align
+        // End; no fixed popup_rect. Re-measure happens via intrinsic size
+        // after each content projection.
+        self.open_status_anchored_id(runtime, name, status_source_id(name))
+    }
+
+    /// Anchored open from a stable panel node id (`tray-media`,
+    /// `tray-volume`, `tray-network`, `clock-button`).
+    pub fn open_status_anchored_id(
+        &mut self,
+        runtime: &mut SurfaceRuntime,
+        name: &str,
+        source_id: &str,
+    ) -> Result<(), String> {
         let (surface, transient) = match name {
             "media" => (self.media, Transient::Media),
             "volume" | "audio" => (self.audio, Transient::Audio),
@@ -688,14 +722,38 @@ impl ShellSurfaces {
             _ => return Err(format!("unsupported shell popup {name}")),
         };
         self.close_transients(runtime)?;
-        let rect = self.popup_rect(transient);
+        let rect = anchored_rect_by_id(
+            runtime,
+            self.output.geometry,
+            self.panel,
+            source_id,
+            surface,
+            panel_edge_to_popover(self.panel_snapshot.edge),
+        );
         self.show_grabbed(runtime, surface, rect, transient)
     }
 
-    /// Anchored open: uses `node_global_rect` source rect plus
-    /// `PopoverGeometry::place` and the intrinsic document size for
-    /// audio/network/calendar/start-submenu; no hardcoded popup x/y and no
-    /// duplicated size constants.
+    /// Re-measure the open popup after content changed: intrinsic size +
+    /// clamp + Align End placement. No-op when nothing is open.
+    pub fn remeasure_open_popup(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), String> {
+        let (surface, name) = match self.transient {
+            Some(Transient::Media) => (self.media, "media"),
+            Some(Transient::Audio) => (self.audio, "audio"),
+            Some(Transient::Network) => (self.network, "network"),
+            Some(Transient::Calendar) => (self.calendar, "clock"),
+            _ => return Ok(()),
+        };
+        let rect = anchored_rect_by_id(
+            runtime,
+            self.output.geometry,
+            self.panel,
+            status_source_id(name),
+            surface,
+            panel_edge_to_popover(self.panel_snapshot.edge),
+        );
+        self.show(runtime, surface, rect)
+    }
+
     pub fn open_status_anchored(
         &mut self,
         runtime: &mut SurfaceRuntime,
@@ -773,30 +831,6 @@ impl ShellSurfaces {
         )
     }
 
-    fn popup_rect(&self, transient: Transient) -> flamewm_api::Rect {
-        let metrics = ShellMetrics::default();
-        let size = match transient {
-            Transient::Media => flamewm_shell_core::MEDIA_POPOVER_SIZE,
-            Transient::Audio => flamewm_shell_core::AUDIO_POPOVER_SIZE,
-            Transient::Network => flamewm_shell_core::NETWORK_POPOVER_SIZE,
-            Transient::Calendar => flamewm_shell_core::calendar_popover_size(metrics),
-            _ => flamewm_api::Size::new(1, 1),
-        };
-        panel_popup_rect(
-            &self.panel_snapshot,
-            &self.output,
-            metrics,
-            size,
-            match transient {
-                Transient::Media => 1,
-                Transient::Audio => 0,
-                Transient::Network => 2,
-                Transient::Calendar => 3,
-                _ => 0,
-            },
-        )
-    }
-
     fn show_grabbed(
         &mut self,
         runtime: &mut SurfaceRuntime,
@@ -806,6 +840,7 @@ impl ShellSurfaces {
     ) -> Result<(), String> {
         self.show(runtime, surface, rect)?;
         runtime.raise(surface).map_err(ui_error)?;
+        let _ = runtime.redraw(surface).map_err(ui_error)?;
         runtime.grab_pointer(surface).map_err(ui_error)?;
         self.transient = Some(transient);
         Ok(())
@@ -847,6 +882,7 @@ fn popup_config(title: &str, role: SurfaceRole, rect: flamewm_api::Rect) -> Surf
         height: checked_size(rect.height).unwrap_or(1),
         title: title.to_owned(),
         role,
+        input: SurfaceInputMode::Interactive,
         initially_visible: false,
         x: rect.x,
         y: rect.y,
@@ -862,91 +898,65 @@ fn status_popup_config(
     popup_config(title, SurfaceRole::PopupMenu, rect)
 }
 
-fn anchor_popover_rect(anchor: flamewm_api::Rect, size: flamewm_api::Size) -> flamewm_api::Rect {
-    flamewm_api::Rect::new(anchor.x, anchor.y, size.width, size.height)
-}
-
-fn status_anchor(
-    panel: &flamewm_api::panels::PanelSnapshot,
-    output: &flamewm_api::display::OutputSnapshot,
-    metrics: ShellMetrics,
-    slot: i32,
-) -> flamewm_api::Rect {
-    panel_popup_rect(panel, output, metrics, flamewm_api::Size::new(1, 1), slot)
-}
-
-fn panel_anchor(
-    panel: &flamewm_api::panels::PanelSnapshot,
-    output: &flamewm_api::display::OutputSnapshot,
-    metrics: ShellMetrics,
-    slot: i32,
-) -> flamewm_api::Rect {
-    status_anchor(panel, output, metrics, slot)
-}
-
-fn panel_popup_rect(
-    panel: &flamewm_api::panels::PanelSnapshot,
-    output: &flamewm_api::display::OutputSnapshot,
-    metrics: ShellMetrics,
-    size: flamewm_api::Size,
-    slot: i32,
-) -> flamewm_api::Rect {
-    let panel_rect = panel.geometry;
-    let slot_width = i32::from(metrics.tray_button_width);
-    let clock_width = i32::from(metrics.clock_min_width);
-    let anchor = if panel.edge.is_horizontal() {
-        let right = panel_rect.right();
-        let x = right - clock_width - slot_width * (3 - slot.min(3));
-        flamewm_api::Rect::new(x, panel_rect.y, slot_width, panel_rect.height)
-    } else {
-        let bottom = panel_rect.bottom();
-        let y = bottom - clock_width - slot_width * (3 - slot.min(3));
-        flamewm_api::Rect::new(panel_rect.x, y, panel_rect.width, slot_width)
-    };
-    let direction = match panel.edge {
-        flamewm_api::PanelEdge::Bottom => PopoverDirection::Above,
-        flamewm_api::PanelEdge::Top => PopoverDirection::Below,
-        flamewm_api::PanelEdge::Left => PopoverDirection::RightOf,
-        flamewm_api::PanelEdge::Right => PopoverDirection::LeftOf,
-    };
-    anchor_popover(
-        panel.output.clone(),
-        output.geometry,
-        anchor,
-        (size.width, size.height),
-        direction,
-        i32::from(metrics.popover_offset),
-    )
-    .rect
-}
-
-/// Native context-menu width matches `.context-menu` in flamewm.css
-/// (205px) plus its 2x1px border. Height is padding (2x5px) plus one
-/// 31px row per visible row.
-pub(crate) fn context_menu_size(visible_rows: usize) -> flamewm_api::Size {
-    let rows = visible_rows.max(1) as i32;
-    flamewm_api::Size::new(207, 10 + rows * 31)
-}
-
-/// Pointer-anchored popup rect: point-anchored at the root click point,
-/// clamped inside the output work area. Falls back to output origin only
-/// when no pointer data exists.
-#[must_use]
-pub fn context_menu_rect(
-    output: flamewm_api::OutputId,
-    output_rect: flamewm_api::Rect,
-    pointer: Option<flamewm_api::Point>,
-    size: flamewm_api::Size,
-) -> flamewm_api::Rect {
-    let Some(pointer) = pointer else {
-        return flamewm_api::Rect::new(output_rect.x, output_rect.y, size.width, size.height);
-    };
-    let _ = output;
-    flamewm_api::Rect::new(pointer.x, pointer.y, size.width, size.height).clamp_inside(output_rect)
-}
-
 fn checked_size(value: i32) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("invalid surface size {value}"))
+}
+
+fn status_source_id(name: &str) -> &'static str {
+    match name {
+        "media" => "tray-media",
+        "volume" | "audio" => "tray-volume",
+        "network" => "tray-network",
+        "clock" => "clock-button",
+        _ => "tray-network",
+    }
+}
+
+fn panel_edge_to_popover(edge: flamewm_api::PanelEdge) -> flamewm_ui_core::popover::PopoverEdge {
+    match edge {
+        flamewm_api::PanelEdge::Top => flamewm_ui_core::popover::PopoverEdge::Below,
+        _ => flamewm_ui_core::popover::PopoverEdge::Above,
+    }
+}
+
+/// Measured anchoring from a stable panel node id: source rect from
+/// `node_global_rect_by_id`, popup size from the intrinsic document size,
+/// placed with `PopoverGeometry::place_aligned` + Align End, clamped to the
+/// work area.
+fn anchored_rect_by_id(
+    runtime: &mut SurfaceRuntime,
+    work_area: flamewm_api::Rect,
+    panel: SurfaceHandle,
+    source_id: &str,
+    popup_surface: SurfaceHandle,
+    edge: flamewm_ui_core::popover::PopoverEdge,
+) -> flamewm_api::Rect {
+    let source = runtime
+        .node_global_rect_by_id(panel, source_id)
+        .map(|rect| {
+            flamewm_api::Rect::new(
+                rect.x as i32,
+                rect.y as i32,
+                rect.width.max(1.0) as i32,
+                rect.height.max(1.0) as i32,
+            )
+        })
+        .unwrap_or(work_area);
+    let size = runtime
+        .document_intrinsic_size(popup_surface)
+        .map(|(width, height)| {
+            flamewm_api::Size::new(width.max(1.0) as i32, height.max(1.0) as i32)
+        })
+        .unwrap_or(flamewm_api::Size::new(310, 250));
+    let geometry = flamewm_ui_core::popover::PopoverGeometry::place_aligned(
+        source,
+        size,
+        edge,
+        flamewm_ui_core::popover::PopoverAlign::End,
+        work_area,
+        8,
+    );
+    flamewm_api::Rect::from_parts(geometry.origin, size)
 }
 
 /// Measured anchoring: source rect from `node_global_rect`, popup size from

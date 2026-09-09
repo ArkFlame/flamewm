@@ -190,18 +190,18 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flamewm-api"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "flamewm-applications"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
 
 [[package]]
 name = "flamewm-control-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-platform",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-control-dbus"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "dbus",
  "flamewm-api",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-control-wire"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-control-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-dbus-reactor"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "dbus",
  "flamewm-api",
@@ -238,71 +238,85 @@ dependencies = [
 
 [[package]]
 name = "flamewm-desktop"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
+ "calloop",
  "flamewm-api",
  "flamewm-applications",
  "flamewm-control-core",
  "flamewm-control-dbus",
+ "flamewm-control-wire",
  "flamewm-dbus-reactor",
  "flamewm-desktop-core",
  "flamewm-integrations-linux",
+ "flamewm-profiler",
+ "flamewm-reactor",
  "flamewm-render-compiler",
  "flamewm-ui-core",
  "flamewm-ui-x11",
+ "inotify",
 ]
 
 [[package]]
 name = "flamewm-desktop-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-ui-core",
+ "rustix",
 ]
 
 [[package]]
 name = "flamewm-image-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "resvg",
 ]
 
 [[package]]
 name = "flamewm-integrations-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
 
 [[package]]
 name = "flamewm-integrations-linux"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "dbus",
  "flamewm-api",
  "flamewm-dbus-reactor",
  "flamewm-image-core",
  "flamewm-integrations-core",
+ "flamewm-profiler",
  "libpulse-binding",
 ]
 
 [[package]]
 name = "flamewm-platform"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
 
 [[package]]
+name = "flamewm-profiler"
+version = "0.0.8"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "flamewm-reactor"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "calloop",
 ]
 
 [[package]]
 name = "flamewm-render-compiler"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-image-core",
  "flamewm-render-core",
@@ -310,27 +324,28 @@ dependencies = [
 
 [[package]]
 name = "flamewm-render-core"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "flamewm-render-x11"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "calloop",
+ "flamewm-profiler",
  "flamewm-reactor",
  "flamewm-render-core",
 ]
 
 [[package]]
 name = "flamewm-session-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
 
 [[package]]
 name = "flamewm-settings"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-control-core",
@@ -343,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-settings-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-control-core",
@@ -352,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-shell"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "flamewm-api",
@@ -361,6 +376,7 @@ dependencies = [
  "flamewm-dbus-reactor",
  "flamewm-integrations-linux",
  "flamewm-platform",
+ "flamewm-profiler",
  "flamewm-reactor",
  "flamewm-render-compiler",
  "flamewm-shell-core",
@@ -370,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-shell-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-platform",
@@ -379,25 +395,25 @@ dependencies = [
 
 [[package]]
 name = "flamewm-skin"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "flamewm-ui"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-ui-core",
 ]
 
 [[package]]
 name = "flamewm-ui-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
 
 [[package]]
 name = "flamewm-ui-x11"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-reactor",
  "flamewm-render-core",
@@ -409,14 +425,14 @@ dependencies = [
 
 [[package]]
 name = "flamewm-window-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
 
 [[package]]
 name = "flamewm-wm"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-session-core",
@@ -426,31 +442,37 @@ dependencies = [
 
 [[package]]
 name = "flamewm-wm-x11"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "calloop",
  "flamewm-api",
  "flamewm-applications",
  "flamewm-control-dbus",
  "flamewm-control-wire",
+ "flamewm-image-core",
  "flamewm-integrations-linux",
  "flamewm-platform",
+ "flamewm-profiler",
  "flamewm-reactor",
+ "flamewm-render-compiler",
+ "flamewm-render-core",
+ "flamewm-render-x11",
  "flamewm-skin",
+ "flamewm-ui-x11",
  "flamewm-window-core",
  "x11rb",
 ]
 
 [[package]]
 name = "flamewm-x11-canary"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "x11rb",
 ]
 
 [[package]]
 name = "flamewm-x11-desktop"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
  "flamewm-applications",
@@ -459,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "flamewm-xsettings"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "flamewm-api",
 ]
@@ -570,6 +592,26 @@ name = "imagesize"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
+
+[[package]]
+name = "inotify"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "153be1941a183ec9ccd095ddbe17a8b8d435ef6c76e9e02451b933c3999af2c8"
+dependencies = [
+ "bitflags",
+ "inotify-sys",
+ "libc",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c033f80b2c113cdf91ab7a33faa9cbc014726dcad99880c8609af2a370edf37d"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "js-sys"

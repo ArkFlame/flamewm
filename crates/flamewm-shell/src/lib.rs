@@ -1,6 +1,8 @@
 //! Runtime shell adapter. Product state arrives as snapshots; UI actions leave as controls.
 
+pub mod async_projection;
 pub mod calendar;
+pub mod icon_loader;
 pub mod panel;
 pub mod popovers;
 pub mod projection;

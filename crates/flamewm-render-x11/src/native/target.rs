@@ -1,5 +1,9 @@
 //! Transactional geometry commit + presentation state machine.
 //! Pure state logic lives here; the X11 side-effects stay in `app/`.
+//! [`NativeSurfaceTarget`] owns the scene/window visual resource set and
+//! exposes transactional create/drop/resize plans.
+
+use crate::native::surface_format::SurfaceAlphaMode;
 
 /// Native presentation lifecycle. Only forward transitions are legal;
 /// `Mapped` requires a prior `MapNotify` (see `note_mapped`).
@@ -67,9 +71,151 @@ impl GeometryCommit {
     }
 }
 
+/// Resource-owner record for one native ARGB scene surface.
+/// Holds the visual/depth/colormap/pixmap/gc/picture identity plus size and
+/// alpha mode; transactional helpers plan create/drop/resize so `app/` applies
+/// steps in order and aborts without a partial window resize on failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeSurfaceTarget {
+    pub scene: u64,
+    pub visual_id: u64,
+    pub depth: u32,
+    pub colormap: u64,
+    pub pixmap: u64,
+    pub gc: u64,
+    pub picture: u64,
+    pub width: u32,
+    pub height: u32,
+    pub alpha_mode: SurfaceAlphaMode,
+}
+
+impl NativeSurfaceTarget {
+    pub fn create_plan(
+        scene: u64,
+        visual_id: u64,
+        depth: u32,
+        alpha_mode: SurfaceAlphaMode,
+        commit: GeometryCommit,
+    ) -> Self {
+        Self {
+            scene,
+            visual_id,
+            depth,
+            colormap: 0,
+            pixmap: 0,
+            gc: 0,
+            picture: 0,
+            width: commit.width,
+            height: commit.height,
+            alpha_mode,
+        }
+    }
+
+    /// After native allocation succeeds, record handles transactionally:
+    /// all-or-nothing; zero handles are rejected.
+    pub fn bind_handles(
+        &mut self,
+        colormap: u64,
+        pixmap: u64,
+        gc: u64,
+        picture: u64,
+    ) -> Result<(), String> {
+        if colormap == 0 || pixmap == 0 || gc == 0 {
+            return Err(presenter_error("surface bind requires non-zero handles"));
+        }
+        // Composited path also requires a picture; opaque/shape paths may
+        // carry picture == 0 legitimately.
+        if self.alpha_mode == SurfaceAlphaMode::CompositedArgb32 && picture == 0 {
+            return Err(presenter_error("composited surface requires a picture"));
+        }
+        self.colormap = colormap;
+        self.pixmap = pixmap;
+        self.gc = gc;
+        self.picture = picture;
+        Ok(())
+    }
+
+    /// Release plan: drop picture first, then pixmap/gc, then colormap.
+    /// Pure ordering record; `app/` performs the X calls.
+    #[allow(dead_code)]
+    pub fn drop_order(&self) -> [&'static str; 4] {
+        ["picture", "pixmap", "gc", "colormap"]
+    }
+
+    #[allow(dead_code)]
+    pub fn drop_plan(&mut self) {
+        self.colormap = 0;
+        self.pixmap = 0;
+        self.gc = 0;
+        self.picture = 0;
+    }
+
+    /// Resize plan: returns the new commit when the size actually changes.
+    #[allow(dead_code)]
+    pub fn resize_plan(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<GeometryCommit>, String> {
+        let commit = GeometryCommit::new(width, height)?;
+        if commit.width == self.width && commit.height == self.height {
+            return Ok(None);
+        }
+        // Invalidate pixmap/picture; window resize happens only after the
+        // replacement backbuffer is live (caller enforces ordering).
+        self.pixmap = 0;
+        self.picture = 0;
+        self.width = commit.width;
+        self.height = commit.height;
+        Ok(Some(commit))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_live(&self) -> bool {
+        self.pixmap != 0 && self.gc != 0 && self.colormap != 0
+    }
+}
+
+/// Cached native Picture lifecycle: create once per (drawable, format),
+/// reuse while the drawable is live, drop exactly once.
+/// Pure bookkeeping; X calls stay in the backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CachedPicture {
+    pub picture: u64,
+    pub drawable: u64,
+}
+
+#[allow(dead_code)]
+impl CachedPicture {
+    pub fn acquire(&mut self, drawable: u64, created: u64) -> Result<u64, String> {
+        if drawable == 0 || created == 0 {
+            return Err(presenter_error("picture acquire requires non-zero handles"));
+        }
+        if self.picture != 0 && self.drawable == drawable {
+            return Ok(self.picture);
+        }
+        self.release_plan();
+        self.drawable = drawable;
+        self.picture = created;
+        Ok(self.picture)
+    }
+
+    pub fn release_plan(&mut self) -> Option<u64> {
+        if self.picture == 0 {
+            return None;
+        }
+        let old = self.picture;
+        self.picture = 0;
+        self.drawable = 0;
+        Some(old)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::surface_format::SurfaceAlphaMode;
 
     #[test]
     fn rejects_skipped_and_backward_transitions() {
@@ -99,5 +245,32 @@ mod tests {
             }
         );
         assert!(GeometryCommit::new(20000, 10).is_err());
+    }
+
+    #[test]
+    fn surface_bind_rejects_zero_and_requires_picture_when_composited() {
+        let commit = GeometryCommit::new(8, 8).unwrap();
+        let mut t =
+            NativeSurfaceTarget::create_plan(1, 2, 32, SurfaceAlphaMode::CompositedArgb32, commit);
+        assert!(!t.is_live());
+        assert!(t.bind_handles(1, 2, 3, 0).is_err());
+        assert!(t.bind_handles(0, 2, 3, 4).is_err());
+        t.bind_handles(1, 2, 3, 4).unwrap();
+        assert!(t.is_live());
+        assert_eq!(t.drop_order(), ["picture", "pixmap", "gc", "colormap"]);
+        assert!(t.resize_plan(8, 8).unwrap().is_none());
+        let plan = t.resize_plan(16, 8).unwrap().unwrap();
+        assert_eq!((plan.width, plan.height), (16, 8));
+        assert!(!t.is_live());
+    }
+
+    #[test]
+    fn cached_picture_reuses_and_releases_once() {
+        let mut c = CachedPicture::default();
+        assert_eq!(c.release_plan(), None);
+        assert_eq!(c.acquire(7, 9).unwrap(), 9);
+        assert_eq!(c.acquire(7, 42).unwrap(), 9);
+        assert_eq!(c.release_plan(), Some(9));
+        assert_eq!(c.release_plan(), None);
     }
 }

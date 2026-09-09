@@ -4,6 +4,8 @@ pub const MIN_TEXT_SIZE: u8 = 10;
 pub const MAX_TEXT_SIZE: u8 = 32;
 pub const DEFAULT_NOTE_WIDTH: i32 = 190;
 pub const DEFAULT_NOTE_HEIGHT: i32 = 190;
+pub const MIN_STICKY_W: i32 = 120;
+pub const MIN_STICKY_H: i32 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb {
@@ -19,6 +21,20 @@ impl Rgb {
     }
 }
 
+pub const STICKY_COLOR_YELLOW: (Rgb, Rgb) =
+    (Rgb::new(0xff, 0xe5, 0x6b), Rgb::new(0x17, 0x17, 0x17));
+pub const STICKY_COLOR_GREEN: (Rgb, Rgb) = (Rgb::new(0xc4, 0xf0, 0x9b), Rgb::new(0x17, 0x17, 0x17));
+pub const STICKY_COLOR_PINK: (Rgb, Rgb) = (Rgb::new(0xff, 0xc2, 0xd1), Rgb::new(0x17, 0x17, 0x17));
+pub const STICKY_COLOR_BLUE: (Rgb, Rgb) = (Rgb::new(0xbd, 0xe3, 0xff), Rgb::new(0x17, 0x17, 0x17));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StickyNote {
     pub id: String,
@@ -29,6 +45,7 @@ pub struct StickyNote {
     pub background: Rgb,
     pub foreground: Rgb,
     pub text_size: u8,
+    pub bold: bool,
 }
 
 impl StickyNote {
@@ -49,6 +66,7 @@ impl StickyNote {
             background: Rgb::new(0xff, 0xe5, 0x6b),
             foreground: Rgb::new(0x17, 0x17, 0x17),
             text_size: 15,
+            bold: false,
         }
     }
 
@@ -60,9 +78,107 @@ impl StickyNote {
         true
     }
 
+    pub fn set_bold(&mut self, bold: bool) {
+        self.bold = bold;
+    }
+
+    pub fn toggle_bold(&mut self) -> bool {
+        self.bold = !self.bold;
+        self.bold
+    }
+
+    pub fn set_color(&mut self, preset: usize) -> bool {
+        let (background, foreground) = match preset {
+            0 => STICKY_COLOR_YELLOW,
+            1 => STICKY_COLOR_GREEN,
+            2 => STICKY_COLOR_PINK,
+            3 => STICKY_COLOR_BLUE,
+            _ => return false,
+        };
+        self.background = background;
+        self.foreground = foreground;
+        true
+    }
+
     pub fn clamp_to_work_area(&mut self, work_area: Rect) {
         self.rect = self.rect.clamp_inside(work_area);
     }
+}
+
+/// Move a note rect by `dx`/`dy`, clamped inside the work area.
+#[must_use]
+pub fn move_rect(original: Rect, dx: i32, dy: i32, work_area: Rect) -> Rect {
+    Rect::new(
+        original.x.saturating_add(dx),
+        original.y.saturating_add(dy),
+        original.width.max(MIN_STICKY_W),
+        original.height.max(MIN_STICKY_H),
+    )
+    .clamp_inside(work_area)
+}
+
+/// Resize a note rect from a corner drag, enforcing minimum size and clamping.
+#[must_use]
+pub fn resize_rect(
+    original: Rect,
+    corner: ResizeCorner,
+    dx: i32,
+    dy: i32,
+    work_area: Rect,
+) -> Rect {
+    let width = original.width.max(MIN_STICKY_W);
+    let height = original.height.max(MIN_STICKY_H);
+    let base = Rect::new(original.x, original.y, width, height);
+    let candidate = match corner {
+        ResizeCorner::TopLeft => Rect::new(
+            base.x.saturating_add(dx),
+            base.y.saturating_add(dy),
+            base.width.saturating_sub(dx),
+            base.height.saturating_sub(dy),
+        ),
+        ResizeCorner::TopRight => Rect::new(
+            base.x,
+            base.y.saturating_add(dy),
+            base.width.saturating_add(dx),
+            base.height.saturating_sub(dy),
+        ),
+        ResizeCorner::BottomLeft => Rect::new(
+            base.x.saturating_add(dx),
+            base.y,
+            base.width.saturating_sub(dx),
+            base.height.saturating_add(dy),
+        ),
+        ResizeCorner::BottomRight => Rect::new(
+            base.x,
+            base.y,
+            base.width.saturating_add(dx),
+            base.height.saturating_add(dy),
+        ),
+    };
+    let width = candidate.width.max(MIN_STICKY_W);
+    let height = candidate.height.max(MIN_STICKY_H);
+    let sized = match corner {
+        ResizeCorner::TopLeft => Rect::new(
+            candidate.right().saturating_sub(width),
+            candidate.bottom().saturating_sub(height),
+            width,
+            height,
+        ),
+        ResizeCorner::TopRight => Rect::new(
+            candidate.x,
+            candidate.bottom().saturating_sub(height),
+            width,
+            height,
+        ),
+        ResizeCorner::BottomLeft => Rect::new(
+            candidate.right().saturating_sub(width),
+            candidate.y,
+            width,
+            height,
+        ),
+        ResizeCorner::BottomRight => Rect::new(candidate.x, candidate.y, width, height),
+    };
+    sized.clamp_inside(work_area)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +238,43 @@ impl StickyNoteStore {
         note.foreground = foreground;
         note.text_size = text_size;
         true
+    }
+
+    pub fn set_bold(&mut self, id: &str, bold: bool) -> bool {
+        let Some(note) = self.get_mut(id) else {
+            return false;
+        };
+        note.bold = bold;
+        true
+    }
+
+    pub fn toggle_bold(&mut self, id: &str) -> Option<bool> {
+        let note = self.get_mut(id)?;
+        note.bold = !note.bold;
+        Some(note.bold)
+    }
+
+    pub fn set_color(&mut self, id: &str, preset: usize) -> bool {
+        let Some(note) = self.get_mut(id) else {
+            return false;
+        };
+        note.set_color(preset)
+    }
+
+    #[must_use]
+    pub fn notes_for_workspace(&self, workspace: usize) -> Vec<&StickyNote> {
+        self.notes
+            .iter()
+            .filter(|note| note.workspace == workspace)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn count_for_workspace(&self, workspace: usize) -> usize {
+        self.notes
+            .iter()
+            .filter(|note| note.workspace == workspace)
+            .count()
     }
 
     pub fn enable(&mut self) {

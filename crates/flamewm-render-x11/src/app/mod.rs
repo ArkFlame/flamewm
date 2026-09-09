@@ -4,17 +4,23 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use flamewm_render_core::{
-    ActionEvent, ActionPhase, Color, CursorKind, ImageAsset, InteractionState, LayoutEngine,
-    LayoutResult, PaintCommand, PointerButton, Rect, RuntimeDocument, build_paint_commands,
+    ActionEvent, ActionPhase, Color, CursorKind, InteractionState, LayoutEngine, LayoutResult,
+    PaintCommand, PointerButton, Rect, RuntimeDocument, SurfaceDamage,
+    build_paint_commands_with_scroll,
 };
 
+use std::os::raw::{c_int, c_ulong};
+
 use super::config::{X11Config, X11WindowRole};
-use super::native::cursor::XcursorBackend;
-use super::native::target::{GeometryCommit, PresentationState, presenter_error};
+use super::native::cursor::{NativeCursorSession, XcursorBackend};
+use super::native::surface_format::{SurfaceAlphaMode, fallback_mode, validate_argb32_visual};
+use super::native::target::{
+    GeometryCommit, NativeSurfaceTarget, PresentationState, presenter_error,
+};
 use super::xft::XftBackend;
 use super::xlib::*;
 use super::xrender::XRenderBackend;
-use super::xshape::{XShapeBridge, rounded_mask_spans};
+use super::xshape::XShapeBridge;
 use super::*;
 use cursor::cursor_shape;
 
@@ -28,31 +34,78 @@ mod layout_helpers;
 mod primitives;
 mod render;
 
-pub(crate) use input::{
-    pointer_button_from_raw, slider_thumb_rect, slider_value_from_pointer, wheel_scroll_delta,
-};
+pub(crate) use input::{pointer_button_from_raw, slider_value_from_pointer, wheel_scroll_delta};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ImageCacheKey {
+    node: u32,
     asset: u16,
     width: u32,
     height: u32,
     revision: u64,
+    treatment: u8,
+    fg_r: u8,
+    fg_g: u8,
+    fg_b: u8,
+    fg_a: u8,
 }
 
 #[derive(Clone, Copy)]
 struct CachedImage {
     pixmap: Pixmap,
+    picture: u64,
     mask: Pixmap,
+}
+
+/// Retained paint cache entry: commands rendered once per layout
+/// revision; frames borrow without cloning.
+#[derive(Clone, Debug)]
+pub(crate) struct CachedPaint {
+    pub(crate) commands: Vec<PaintCommand>,
+    pub(crate) revision: u64,
+    pub(crate) interaction: InteractionState,
+    pub(crate) scroll_fingerprint: u64,
 }
 
 unsafe fn free_cached_image(display: *mut Display, image: CachedImage) {
     unsafe {
+        let _ = image.picture;
         XFreePixmap(display, image.pixmap);
         if image.mask != 0 {
             XFreePixmap(display, image.mask);
         }
     }
+}
+
+/// Pure SymbolicForeground math: eff_a = round(sa*fa/255),
+/// premul channel = round(fg*eff_a/255). Testable without X.
+pub(crate) fn symbolic_foreground_argb32(
+    pixels: &[u8],
+    src_w: u32,
+    src_h: u32,
+    width: u32,
+    height: u32,
+    fg: Color,
+) -> Vec<u32> {
+    let (sw, sh, dw, dh) = (src_w.max(1), src_h.max(1), width.max(1), height.max(1));
+    let mut out = Vec::with_capacity((dw as usize) * (dh as usize));
+    for y in 0..dh {
+        let sy = ((y as u64 * src_h as u64) / dh as u64).min((sh - 1) as u64) as usize;
+        for x in 0..dw {
+            let sx = ((x as u64 * src_w as u64) / dw as u64).min((sw - 1) as u64) as usize;
+            let off = (sy * sw as usize + sx) * 4;
+            let sa = u32::from(pixels[off + 3]);
+            let eff_a = (sa * u32::from(fg.a) + 127) / 255;
+            let prem = |c: u32| ((c * eff_a + 127) / 255) as u32;
+            out.push(
+                (eff_a << 24)
+                    | (prem(u32::from(fg.r)) << 16)
+                    | (prem(u32::from(fg.g)) << 8)
+                    | prem(u32::from(fg.b)),
+            );
+        }
+    }
+    out
 }
 
 pub(crate) struct X11App {
@@ -66,21 +119,29 @@ pub(crate) struct X11App {
     pub(crate) colors: HashMap<Color, u64>,
     images: HashMap<ImageCacheKey, CachedImage>,
     pub(crate) cursors: HashMap<CursorKind, Cursor>,
-    pub(crate) current_cursor: CursorKind,
-    pub(crate) xcursor: Option<XcursorBackend>,
+    pub(crate) current_cursor: Option<CursorKind>,
+    pub(crate) xcursor: Option<NativeCursorSession>,
     pub(crate) fonts: HashMap<u8, *mut XFontStructHead>,
     pub(crate) xft: Option<XftBackend>,
     pub(crate) xrender: Option<XRenderBackend>,
     pub(crate) xshape: Option<XShapeBridge>,
+    #[allow(dead_code)]
+    pub(crate) visual: *mut Visual,
+    pub(crate) alpha_mode: SurfaceAlphaMode,
+    pub(crate) surface: Option<NativeSurfaceTarget>,
     pub(crate) wm_delete: Atom,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) presentation: PresentationState,
     pub(crate) clip_stack: Vec<Rect>,
-    pub(crate) scroll_offsets: HashMap<u32, (f32, f32)>,
     pub(crate) range_drag: Option<(u32, f32, f32, f32, f32)>,
     pub(crate) interaction: InteractionState,
+    /// Retained layout+paint cache: reuse while (revision, viewport,
+    /// interaction, scroll fingerprint) is unchanged. No frame clones.
     pub(crate) layout: Option<LayoutResult>,
+    pub(crate) cached_paint: Option<CachedPaint>,
+    pub(crate) cached_viewport: (u32, u32),
+    pub(crate) pending_damage: SurfaceDamage,
     pub(crate) pointer_button: Option<u32>,
     pub(crate) pointer_grabbed: bool,
     pub(crate) super_chord_used: bool,
@@ -110,23 +171,100 @@ impl X11App {
     ) -> Result<Self, String> {
         let screen = unsafe { XDefaultScreen(display) };
         let root = unsafe { XRootWindow(display, screen) };
-        let black = unsafe { XBlackPixel(display, screen) };
-        let depth = unsafe { XDefaultDepth(display, screen) };
+        let width = config.width.max(1);
+        let height = config.height.max(1);
+        // Canonical scene creation: prefer a depth-32 TrueColor ARGB visual
+        // validated by native/surface_format; fall back to the default visual
+        // (opaque or shape-backed) only when no real alpha channel exists.
+        let mut vinfo: XVisualInfo = unsafe { std::mem::zeroed() };
+        let argb_visual =
+            unsafe { XMatchVisualInfo(display, screen, 32, TRUE_COLOR_CLASS, &mut vinfo) } != 0
+                && !vinfo.visual.is_null();
+        let (visual, depth, alpha_mode) = if argb_visual {
+            let alpha_mask = unsafe { visual_alpha_mask(display, vinfo.visual) };
+            match validate_argb32_visual(32, TRUE_COLOR_CLASS, alpha_mask) {
+                Ok(_) => {
+                    // No compositor is claimed in the default Xephyr path, so a
+                    // depth-32 window cannot blend fractionally with the desktop.
+                    // Keep the ARGB32 scene for in-scene alpha, but present via
+                    // the shape-backed mode unless a compositing manager owns its
+                    // selection. Never claim fractional desktop translucency here.
+                    eprintln!("FLAMEWM_RENDER_SURFACE_FORMAT shape-backed (no compositor claim)");
+                    let dv = unsafe { XDefaultVisual(display, screen) };
+                    let dd = unsafe { XDefaultDepth(display, screen) };
+                    (dv, dd, fallback_mode(shape_available(display)))
+                }
+                Err(error) => {
+                    eprintln!("FLAMEWM_RENDER_SURFACE_FORMAT degraded reason={error}");
+                    let dv = unsafe { XDefaultVisual(display, screen) };
+                    let dd = unsafe { XDefaultDepth(display, screen) };
+                    (dv, dd, fallback_mode(shape_available(display)))
+                }
+            }
+        } else {
+            let dv = unsafe { XDefaultVisual(display, screen) };
+            let dd = unsafe { XDefaultDepth(display, screen) };
+            (dv, dd, fallback_mode(shape_available(display)))
+        };
+        if visual.is_null() {
+            return Err("no usable visual for native surface".to_string());
+        }
+        let colormap = if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
+            let cmap = unsafe { XCreateColormap(display, root, visual, ALLOC_NONE) };
+            if cmap == 0 {
+                return Err("XCreateColormap failed for ARGB32 surface".to_string());
+            }
+            cmap
+        } else {
+            unsafe { XDefaultColormap(display, screen) }
+        };
+        let mut attributes = XSetWindowAttributes {
+            background_pixmap: 0,
+            background_pixel: TRANSPARENT_CLEAR_PIXEL,
+            border_pixmap: 0,
+            border_pixel: 0,
+            bit_gravity: 0,
+            win_gravity: 0,
+            backing_store: 0,
+            backing_planes: 0,
+            backing_pixel: 0,
+            save_under: 0,
+            event_mask: 0,
+            do_not_propagate_mask: 0,
+            override_redirect: 0,
+            colormap,
+            cursor: 0,
+        };
+        let mut valuemask = CW_BACK_PIXEL | CW_COLORMAP;
+        let override_redirect = matches!(
+            config.role,
+            X11WindowRole::PopupMenu | X11WindowRole::DropdownMenu | X11WindowRole::Overlay
+        );
+        if override_redirect {
+            attributes.override_redirect = 1;
+            valuemask |= CW_OVERRIDE_REDIRECT;
+        }
         let window = unsafe {
-            XCreateSimpleWindow(
+            XCreateWindow(
                 display,
                 root,
                 x,
                 y,
-                config.width.max(1),
-                config.height.max(1),
+                width,
+                height,
                 0,
-                black,
-                black,
+                depth,
+                INPUT_OUTPUT_CLASS,
+                visual,
+                valuemask,
+                &mut attributes,
             )
         };
         if window == 0 {
-            return Err("XCreateSimpleWindow failed".to_string());
+            if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
+                unsafe { XFreeColormap(display, colormap) };
+            }
+            return Err("XCreateWindow failed for native surface".to_string());
         }
         let event_mask = EXPOSURE_MASK
             | STRUCTURE_NOTIFY_MASK
@@ -145,33 +283,11 @@ impl X11App {
             XStoreName(display, window, title.as_ptr());
         }
         set_window_role(display, window, config.role);
-        if matches!(
-            config.role,
-            X11WindowRole::PopupMenu | X11WindowRole::DropdownMenu
-        ) {
-            let mut attributes = XSetWindowAttributes {
-                background_pixmap: 0,
-                background_pixel: 0,
-                border_pixmap: 0,
-                border_pixel: 0,
-                bit_gravity: 0,
-                win_gravity: 0,
-                backing_store: 0,
-                backing_planes: 0,
-                backing_pixel: 0,
-                save_under: 0,
-                event_mask: 0,
-                do_not_propagate_mask: 0,
-                override_redirect: 1,
-                colormap: 0,
-                cursor: 0,
-            };
-            unsafe {
-                XChangeWindowAttributes(display, window, CW_OVERRIDE_REDIRECT, &mut attributes);
-            }
-        }
         let gc = unsafe { XCreateGC(display, window, 0, ptr::null_mut()) };
         if gc.is_null() {
+            if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
+                unsafe { XFreeColormap(display, colormap) };
+            }
             unsafe {
                 XDestroyWindow(display, window);
             }
@@ -195,6 +311,9 @@ impl X11App {
         if backbuffer == 0 {
             unsafe {
                 XFreeGC(display, gc);
+                if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
+                    XFreeColormap(display, colormap);
+                }
                 XDestroyWindow(display, window);
             }
             return Err("XCreatePixmap failed for retained backbuffer".to_string());
@@ -225,35 +344,24 @@ impl X11App {
                 XSetFont(display, gc, fid);
             }
         }
-        let visual = unsafe { XDefaultVisual(display, screen) };
-        let colormap = unsafe { XDefaultColormap(display, screen) };
-        let xft = if visual.is_null() {
-            eprintln!("FLAMEWM_RENDER_TEXT_BACKEND core-x11 reason=default-visual-null");
-            None
-        } else {
-            match unsafe { XftBackend::new(display, screen, backbuffer, visual, colormap) } {
-                Ok(backend) => {
-                    eprintln!("FLAMEWM_RENDER_TEXT_BACKEND xft preferred=IBM_Plex_Sans");
-                    Some(backend)
-                }
-                Err(error) => {
-                    eprintln!("FLAMEWM_RENDER_TEXT_BACKEND core-x11 reason={error}");
-                    None
-                }
+        let xft = match unsafe { XftBackend::new(display, screen, backbuffer, visual, colormap) } {
+            Ok(backend) => {
+                eprintln!("FLAMEWM_RENDER_TEXT_BACKEND xft preferred=IBM_Plex_Sans");
+                Some(backend)
+            }
+            Err(error) => {
+                eprintln!("FLAMEWM_RENDER_TEXT_BACKEND core-x11 reason={error}");
+                None
             }
         };
-        let xrender = if visual.is_null() {
-            None
-        } else {
-            match unsafe { XRenderBackend::new(display, backbuffer, visual) } {
-                Ok(backend) => {
-                    eprintln!("FLAMEWM_RENDER_ALPHA_BACKEND xrender");
-                    Some(backend)
-                }
-                Err(error) => {
-                    eprintln!("FLAMEWM_RENDER_ALPHA_BACKEND fallback-black reason={error}");
-                    None
-                }
+        let mut xrender = match unsafe { XRenderBackend::new(display, backbuffer, visual) } {
+            Ok(backend) => {
+                eprintln!("FLAMEWM_RENDER_ALPHA_BACKEND xrender");
+                Some(backend)
+            }
+            Err(error) => {
+                eprintln!("FLAMEWM_RENDER_ALPHA_BACKEND opaque-fallback reason={error}");
+                None
             }
         };
         // Shape bridge is render-owned: popup/menu rounded corners. Failure is
@@ -295,7 +403,27 @@ impl X11App {
                 XDefineCursor(display, window, cursor);
             }
         }
-        let xcursor = unsafe { XcursorBackend::new(display) };
+        let xcursor = {
+            let theme = std::env::var("XCURSOR_THEME").ok();
+            let size = std::env::var("XCURSOR_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<std::os::raw::c_int>().ok());
+            let backend = unsafe { XcursorBackend::with_theme(display, theme.as_deref(), size) };
+            let uses_xcursor = backend.uses_xcursor();
+            let session = NativeCursorSession::wrap(backend);
+            eprintln!(
+                "FLAMEWM_RENDER_CURSOR_THEME theme={} size={} backend={}",
+                theme.as_deref().unwrap_or("unset"),
+                size.map(|size| size.to_string())
+                    .unwrap_or_else(|| "unset".to_string()),
+                if uses_xcursor {
+                    "xcursor"
+                } else {
+                    "core-font-cursor"
+                },
+            );
+            session
+        };
         let presentation = if initially_visible {
             PresentationState::Projected
         } else {
@@ -310,6 +438,25 @@ impl X11App {
         unsafe {
             XFlush(display);
         }
+        let picture = if alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
+            xrender.as_ref().map(|_| 1u64).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut surface = NativeSurfaceTarget::create_plan(
+            window,
+            visual as u64,
+            depth as u32,
+            alpha_mode,
+            GeometryCommit::new(width, height).map_err(|e| presenter_error(&e))?,
+        );
+        surface
+            .bind_handles(colormap, backbuffer, gc as u64, picture)
+            .map_err(|e| presenter_error(&e))?;
+        // XRender backend owns the live destination picture; the plan records
+        // presence (1) only when composited + xrender is live.
+        let _ = &mut xrender;
+
         Ok(Self {
             display,
             screen,
@@ -321,21 +468,26 @@ impl X11App {
             colors: HashMap::new(),
             images: HashMap::new(),
             cursors,
-            current_cursor: CursorKind::Default,
+            current_cursor: None,
             xcursor: Some(xcursor),
             fonts,
             xft,
             xrender,
             xshape,
+            visual,
+            alpha_mode,
+            surface: Some(surface),
             wm_delete,
             width: config.width.max(1),
             height: config.height.max(1),
             presentation,
             clip_stack: Vec::new(),
-            scroll_offsets: HashMap::new(),
             range_drag: None,
             interaction: InteractionState::default(),
             layout: None,
+            cached_paint: None,
+            cached_viewport: (config.width.max(1), config.height.max(1)),
+            pending_damage: SurfaceDamage::Full,
             pointer_button: None,
             pointer_grabbed: false,
             super_chord_used: false,
@@ -346,15 +498,74 @@ impl X11App {
     }
 }
 
+fn shape_available(display: *mut Display) -> bool {
+    unsafe { XShapeBridge::new(display).is_ok() }
+}
+
+#[repr(C)]
+struct XRenderDirectProbe {
+    red: u16,
+    red_mask: u16,
+    green: u16,
+    green_mask: u16,
+    blue: u16,
+    blue_mask: u16,
+    alpha: u16,
+    alpha_mask: u16,
+}
+
+#[repr(C)]
+struct XRenderFormatProbe {
+    pict_type: i32,
+    depth: i32,
+    direct: XRenderDirectProbe,
+    colormap: c_ulong,
+}
+
+unsafe extern "C" {
+    fn dlopen(filename: *const i8, flag: c_int) -> *mut std::ffi::c_void;
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const i8) -> *mut std::ffi::c_void;
+    fn dlclose(handle: *mut std::ffi::c_void) -> c_int;
+}
+
+unsafe fn visual_alpha_mask(display: *mut Display, visual: *mut Visual) -> u32 {
+    const RTLD_LAZY: c_int = 1;
+    let names: [&[u8]; 2] = [b"libXrender.so.1\0", b"libXrender.so\0"];
+    let sym = b"XRenderFindVisualFormat\0";
+    for name in names {
+        let handle = unsafe { dlopen(name.as_ptr() as *const i8, RTLD_LAZY) };
+        if handle.is_null() {
+            continue;
+        }
+        type FindFn = unsafe extern "C" fn(*mut Display, *mut Visual) -> *mut XRenderFormatProbe;
+        let func: FindFn = unsafe { std::mem::transmute(dlsym(handle, sym.as_ptr() as *const i8)) };
+        let addr: *mut std::ffi::c_void = unsafe { std::mem::transmute(func) };
+        if addr.is_null() {
+            unsafe { dlclose(handle) };
+            continue;
+        }
+        let format = unsafe { func(display, visual) };
+        let mask = if format.is_null() {
+            0
+        } else {
+            unsafe { u32::from((*format).direct.alpha_mask) }
+        };
+        unsafe { dlclose(handle) };
+        return mask;
+    }
+    0
+}
+
 fn set_window_role(display: *mut Display, window: Window, role: X11WindowRole) {
     let property_name = CString::new("_NET_WM_WINDOW_TYPE").expect("static atom contains no NUL");
-    let role_name = CString::new(match role {
-        X11WindowRole::Normal => "_NET_WM_WINDOW_TYPE_NORMAL",
-        X11WindowRole::Desktop => "_NET_WM_WINDOW_TYPE_DESKTOP",
-        X11WindowRole::Dock => "_NET_WM_WINDOW_TYPE_DOCK",
-        X11WindowRole::PopupMenu => "_NET_WM_WINDOW_TYPE_POPUP_MENU",
-        X11WindowRole::DropdownMenu => "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
-    })
+    let role_name = CString::new(crate::config::overlay_window_type_name(match role {
+        X11WindowRole::Normal => crate::config::SurfaceRole::Normal,
+        X11WindowRole::Desktop => crate::config::SurfaceRole::Desktop,
+        X11WindowRole::Dock => crate::config::SurfaceRole::Dock,
+        X11WindowRole::PopupMenu => crate::config::SurfaceRole::PopupMenu,
+        X11WindowRole::DropdownMenu => crate::config::SurfaceRole::DropdownMenu,
+        X11WindowRole::Overlay => crate::config::SurfaceRole::Overlay,
+    }))
     .expect("static atom contains no NUL");
     let property = unsafe { XInternAtom(display, property_name.as_ptr(), 0) };
     let role_atom = unsafe { XInternAtom(display, role_name.as_ptr(), 0) };

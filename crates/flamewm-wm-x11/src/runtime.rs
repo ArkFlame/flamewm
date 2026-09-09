@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use calloop::{Interest, RegistrationToken};
 
@@ -24,11 +24,35 @@ use flamewm_reactor::{FdAction, Reactor};
 use crate::atoms::AnyError;
 use crate::wm::{WmConfig, run_with_hook};
 
+struct WmBuilderFields {
+    discover_counter: &'static flamewm_profiler::CounterPoint,
+}
+
+fn wm_builder_fields() -> &'static WmBuilderFields {
+    use std::sync::OnceLock;
+    static FIELDS: OnceLock<WmBuilderFields> = OnceLock::new();
+    FIELDS.get_or_init(|| WmBuilderFields {
+        discover_counter: Box::leak(Box::new(flamewm_profiler::CounterPoint::new(
+            "wm.catalog.discover.count",
+        ))),
+    })
+}
+
+/// Discover-once composition root: single `ApplicationCatalog::discover`
+/// per WM process, counted under `wm.catalog.discover.count`. The returned
+/// `Arc` is injected into the launch adapter, `DecorationManager`, and the
+/// host snapshot; launch/repaint paths never rediscover.
+fn discover_catalog_once() -> Result<std::sync::Arc<ApplicationCatalog>, AnyError> {
+    wm_builder_fields().discover_counter.increment();
+    Ok(std::sync::Arc::new(ApplicationCatalog::discover()?))
+}
+
 pub fn run(config: WmConfig) -> Result<(), AnyError> {
+    flamewm_profiler::init_process("flamewm-wm");
     let settings_path = settings_path();
     let mut host = None;
     let control = ControlServer::connect_session()?;
-    let mut reactor = Reactor::new()?;
+    let reactor = Rc::new(RefCell::new(Reactor::new()?));
     let integrations = Rc::new(RefCell::new(LinuxIntegrationRuntime::connect()?));
     if let Err(error) = integrations.borrow_mut().start() {
         integrations.borrow_mut().stop();
@@ -36,7 +60,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
     }
     let provider_error = Rc::new(RefCell::new(None));
     let mut network_registration = match register_provider(
-        &mut reactor,
+        &reactor,
         &integrations,
         &provider_error,
         LinuxIntegrationSource::NetworkManager,
@@ -48,7 +72,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
         }
     };
     let mut mpris_registration = match register_provider(
-        &mut reactor,
+        &reactor,
         &integrations,
         &provider_error,
         LinuxIntegrationSource::Mpris,
@@ -88,7 +112,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
     };
     let audio_updates = Rc::new(RefCell::new(Vec::<AudioSnapshot>::new()));
     let audio_updates_for_callback = Rc::clone(&audio_updates);
-    let _audio_registration = match reactor.register_fd_with_source_action(
+    let _audio_registration = match reactor.borrow_mut().register_fd_with_source_action(
         audio_reader,
         Interest::READ,
         move |_, source, _| {
@@ -118,20 +142,51 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
             return Err(error.into());
         }
     };
+    // Profiler report timer on the reactor; interval from
+    // `FLAMEWM_PROFILE_INTERVAL` (floored at 10s, default 60s), never
+    // hardcoded here. No timer thread.
+    let _profiler_registration = reactor
+        .borrow_mut()
+        .register_timer(profile_report_interval(), true, || {
+            if flamewm_profiler::enabled() {
+                let report = flamewm_profiler::report_window();
+                if !report.is_empty() {
+                    eprintln!("{report}");
+                }
+            }
+        })
+        .map_err(|error| {
+            drop(pulse.clone());
+            integrations.borrow_mut().stop();
+            AnyError::from(io::Error::new(io::ErrorKind::Other, error.to_string()))
+        })?;
+    let _startup_guard = flamewm_profiler::start("wm.startup.catalog");
+    let catalog = discover_catalog_once()?;
+    drop(_startup_guard);
+    let catalog_for_hook = std::sync::Arc::clone(&catalog);
     let started = Instant::now();
     let mut host_started = false;
     let integrations_for_hook = Rc::clone(&integrations);
     let provider_error_for_hook = Rc::clone(&provider_error);
     let pulse_for_hook = Rc::clone(&pulse);
+    let audio_updates_for_hook = Rc::clone(&audio_updates);
+    let reactor_for_hook = Rc::clone(&reactor);
 
-    let result = run_with_hook(config, move |conn, screen| {
+    let result = run_with_hook(config, &catalog, &reactor, move |conn, screen| {
+        // Scoped per-turn span: the whole-process `wm.loop` guard above has
+        // been removed so loop-turn CPU is attributed per turn, not once
+        // across the full process lifetime.
+        let _turn_guard = flamewm_profiler::start("wm.loop");
         if host.is_none() {
             let mut new_host = PlatformHost::new(
-                X11Desktop::from_connection(conn.clone(), screen)?,
+                X11Desktop::from_connection(
+                    conn.clone(),
+                    screen,
+                    std::sync::Arc::clone(&catalog_for_hook),
+                )?,
                 settings_path.clone(),
             );
-            let catalog = ApplicationCatalog::discover()?;
-            let _ = new_host.replace_applications(catalog.all());
+            let _ = new_host.replace_applications(catalog_for_hook.all());
             let integrations = Rc::clone(&integrations_for_hook);
             let pulse = Rc::clone(&pulse_for_hook);
             new_host.set_system_action_handler(Box::new(move |action, snapshot| match action {
@@ -158,12 +213,13 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
         }
         let host = host.as_mut().expect("host initialized");
         if !host_started {
+            let _host_guard = flamewm_profiler::start("wm.startup.host");
             host.start()?;
             host_started = true;
         }
-        reactor.dispatch(Some(Duration::from_millis(16)))?;
+        // ProviderDirty audio domain: drain only snapshots the audio fd delivered.
         {
-            let mut audio_updates = audio_updates.borrow_mut();
+            let mut audio_updates = audio_updates_for_hook.borrow_mut();
             for snapshot in audio_updates.drain(..) {
                 if host.system_mut().update_audio(snapshot) {
                     control.emit_signal(&ControlSignal::SystemChanged {
@@ -175,30 +231,33 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
         if let Some(error) = provider_error_for_hook.borrow_mut().take() {
             return Err(error.into());
         }
+        // ProviderDirty network/media domains: reconcile event-coalesced state
+        // without polling; snapshots only refresh on reported change.
         {
             let mut integrations = integrations_for_hook.borrow_mut();
-            let _ = integrations.reconcile()?;
-            let network = integrations.network_snapshot();
-            let media = integrations.media_snapshot();
-            if host.system_mut().update_network(network) {
-                control.emit_signal(&ControlSignal::SystemChanged {
-                    revision: host.system_snapshot().revision,
-                })?;
-            }
-            if host.system_mut().update_media(media) {
-                control.emit_signal(&ControlSignal::SystemChanged {
-                    revision: host.system_snapshot().revision,
-                })?;
+            if integrations.reconcile()? {
+                let network = integrations.network_snapshot();
+                let media = integrations.media_snapshot();
+                if host.system_mut().update_network(network) {
+                    control.emit_signal(&ControlSignal::SystemChanged {
+                        revision: host.system_snapshot().revision,
+                    })?;
+                }
+                if host.system_mut().update_media(media) {
+                    control.emit_signal(&ControlSignal::SystemChanged {
+                        revision: host.system_snapshot().revision,
+                    })?;
+                }
             }
         }
         refresh_provider(
-            &mut reactor,
+            &reactor_for_hook,
             &mut network_registration,
             &integrations_for_hook,
             &provider_error_for_hook,
         )?;
         refresh_provider(
-            &mut reactor,
+            &reactor_for_hook,
             &mut mpris_registration,
             &integrations_for_hook,
             &provider_error_for_hook,
@@ -220,7 +279,7 @@ struct ProviderRegistration {
 }
 
 fn register_provider(
-    reactor: &mut Reactor,
+    reactor: &Rc<RefCell<Reactor>>,
     integrations: &Rc<RefCell<LinuxIntegrationRuntime>>,
     provider_error: &Rc<RefCell<Option<flamewm_api::FlameError>>>,
     source: LinuxIntegrationSource,
@@ -228,7 +287,7 @@ fn register_provider(
     let watch = integrations.borrow().watch(source);
     let integrations = Rc::clone(integrations);
     let provider_error = Rc::clone(provider_error);
-    let token = reactor.register_raw_fd_with_action(
+    let token = reactor.borrow_mut().register_raw_fd_with_action(
         watch.fd,
         interest_for(watch.events),
         move |_, _| {
@@ -250,7 +309,7 @@ fn register_provider(
 }
 
 fn refresh_provider(
-    reactor: &mut Reactor,
+    reactor: &Rc<RefCell<Reactor>>,
     registration: &mut ProviderRegistration,
     integrations: &Rc<RefCell<LinuxIntegrationRuntime>>,
     provider_error: &Rc<RefCell<Option<flamewm_api::FlameError>>>,
@@ -259,7 +318,7 @@ fn refresh_provider(
     if watch.fd == registration.fd && watch.events == registration.events {
         return Ok(());
     }
-    reactor.remove(registration.token)?;
+    reactor.borrow_mut().remove(registration.token)?;
     *registration = register_provider(reactor, integrations, provider_error, registration.source)?;
     Ok(())
 }
@@ -273,6 +332,12 @@ fn interest_for(events: FdEvents) -> Interest {
         (false, true) => Interest::WRITE,
         _ => Interest::READ,
     }
+}
+
+/// Profiler report interval shared with `flamewm-profiler`; never hardcode
+/// the delay here.
+fn profile_report_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(flamewm_profiler::profile_interval_secs())
 }
 
 fn settings_path() -> PathBuf {

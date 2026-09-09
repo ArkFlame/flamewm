@@ -7,8 +7,23 @@ body { position:relative; background:#000000; color:#f1f2f3; font-size:13px; }
 .desktop-glyph { position:absolute; left:18px; top:5px; width:44px; height:44px; display:block; }
 .desktop-label { position:absolute; left:3px; top:52px; width:76px; height:30px; display:flex; flex-direction:column; align-items:center; justify-content:center; overflow:hidden; }
 .desktop-label-line { width:76px; height:15px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
-.selection { position:absolute; display:none; background:#ef404833; border:1px solid #ef4048dd; }
-.sticky { position:absolute; left:220px; top:180px; width:190px; height:190px; padding:12px; display:none; flex-direction:column; gap:12px; background:#ffe56b; color:#171717; border:1px solid #d0b941; border-radius:5px; cursor:move; }
-.desktop-menu, .sticky-menu { position:absolute; display:none; flex-direction:column; background:#202326; border:1px solid #474b4f; border-radius:4px; width:220px; padding:4px 0px; cursor:default; }
-.desktop-confirm { position:absolute; display:none; flex-direction:column; background:#202326; border:1px solid #474b4f; border-radius:4px; width:220px; padding:8px; }
+.selection { position:absolute; display:block; background:#ef404833; border:1px solid #ef4048dd; }
+.sticky { position:absolute; left:220px; top:180px; width:190px; height:190px; padding:12px; display:flex; flex-direction:column; gap:12px; background:#ffe56b; color:#171717; border:1px solid #d0b941; border-radius:5px; cursor:move; }
+.desktop-menu, .sticky-menu { position:absolute; display:flex; flex-direction:column; background:#202326; border:1px solid #474b4f; border-radius:4px; width:220px; padding:4px 0px; cursor:default; }
+.desktop-confirm { position:absolute; display:flex; flex-direction:column; background:#202326; border:1px solid #474b4f; border-radius:4px; width:220px; padding:8px; }
 .desktop-menu button, .sticky-menu button, .desktop-confirm button { width:212px; height:32px; padding:4px 12px; margin:0px 4px; display:flex; align-items:center; background:transparent; color:#f1f2f3; font-size:13px; box-sizing:border-box; }
+.desktop-menu-row { border-width:0; height:32px; }
+.desktop-menu-row:hover { background:#ef404826; }
+.desktop-menu-icon { width:16px; height:16px; display:block; flex-grow:0; }
+.desktop-drag-ghost { position:absolute; width:82px; height:82px; display:flex; flex-direction:column; align-items:center; padding:0px; border:1px solid #ef40484d; border-radius:4px; color:white; background:#ef404826; opacity:0.76; box-sizing:border-box; cursor:default; }
+.desktop-drag-count { position:absolute; right:2px; top:2px; min-width:18px; height:18px; display:flex; align-items:center; justify-content:center; background:#ef4048; color:white; border-radius:9px; font-size:11px; }
+.desktop-rename { position:absolute; display:flex; flex-direction:column; background:#202326; border:1px solid #474b4f; border-radius:4px; padding:8px; }
+.desktop-rename-value { min-width:180px; min-height:20px; color:#f1f2f3; font-size:13px; }
+.sticky-title { display:none; }
+#sticky-title { display:none; }
+.sticky-drag { position:absolute; left:0px; top:0px; width:100%; height:14px; cursor:move; }
+.sticky-text { cursor:text; }
+.sticky-resize-nw { position:absolute; left:-4px; top:-4px; width:10px; height:10px; cursor:nwse-resize; }
+.sticky-resize-ne { position:absolute; right:-4px; top:-4px; width:10px; height:10px; cursor:nesw-resize; }
+.sticky-resize-sw { position:absolute; left:-4px; bottom:-4px; width:10px; height:10px; cursor:nesw-resize; }
+.sticky-resize-se { position:absolute; right:-4px; bottom:-4px; width:10px; height:10px; cursor:nwse-resize; }

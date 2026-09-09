@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.8 — 2026-09-09
+
+### Interaction and performance convergence
+
+- Desktop drag ghost follows pointer; canonical entries stay put until release commits existing grid/group semantics.
+- Context menus use borderless rows with 16px Breeze icons; pointer menus flip upward and scroll when oversized.
+- Rename is Linux no-clobber (`renameat2` NOREPLACE); grid position migrates; collisions fail without data loss.
+- Start uses one canonical indexed StartModel; Power/session isolation explicit; stale icons never persist; submenu sizes from content.
+- Status popups anchor from source node with End alignment and intrinsic sizing; network shows real AP rows; calendar dims adjacent days via foreground override.
+- Sticky notes scoped per workspace (signal-driven), edit/move/resize/color/bold/delete, v1 loads / v2 writes.
+- Startup/performance: scoped profiler phases with shared interval helper; packaged-first icon resolve (desktop icon ~4s -> ~0.3ms); shell startup self-wall isolated from blocking Control round-trips.
+- Window chrome converges on panel material #1b1e20 with 38x31 controls, centered 16px glyphs, 20px app icon, measured title.
+
+
 ## 0.0.4 — 2026-09-05
 
 ### Product identity

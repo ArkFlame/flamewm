@@ -43,6 +43,17 @@ struct FcConfig {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct XGlyphInfo {
+    width: c_int,
+    height: c_int,
+    x: c_int,
+    y: c_int,
+    x_off: c_int,
+    y_off: c_int,
+}
+
 type XftDrawCreateFn =
     unsafe extern "C" fn(*mut Display, Drawable, *mut Visual, Colormap) -> *mut XftDraw;
 type XftDrawDestroyFn = unsafe extern "C" fn(*mut XftDraw);
@@ -56,6 +67,8 @@ type XftDrawStringUtf8Fn = unsafe extern "C" fn(
     *const c_uchar,
     c_int,
 );
+type XftTextExtentsUtf8Fn =
+    unsafe extern "C" fn(*mut Display, *mut XftFont, *const c_uchar, c_int, *mut XGlyphInfo);
 type XftFontOpenNameFn = unsafe extern "C" fn(*mut Display, c_int, *const c_char) -> *mut XftFont;
 type XftFontCloseFn = unsafe extern "C" fn(*mut Display, *mut XftFont);
 type XftColorAllocValueFn = unsafe extern "C" fn(
@@ -77,6 +90,7 @@ struct XftApi {
     draw_destroy: XftDrawDestroyFn,
     draw_change: XftDrawChangeFn,
     draw_string_utf8: XftDrawStringUtf8Fn,
+    text_extents_utf8: Option<XftTextExtentsUtf8Fn>,
     font_open_name: XftFontOpenNameFn,
     font_close: XftFontCloseFn,
     color_alloc_value: XftColorAllocValueFn,
@@ -130,6 +144,7 @@ impl XftBackend {
             draw_destroy: unsafe { xft_library.symbol(b"XftDrawDestroy\0") }?,
             draw_change: unsafe { xft_library.symbol(b"XftDrawChange\0") }?,
             draw_string_utf8: unsafe { xft_library.symbol(b"XftDrawStringUtf8\0") }?,
+            text_extents_utf8: unsafe { xft_library.symbol(b"XftTextExtentsUtf8\0").ok() },
             font_open_name: unsafe { xft_library.symbol(b"XftFontOpenName\0") }?,
             font_close: unsafe { xft_library.symbol(b"XftFontClose\0") }?,
             color_alloc_value: unsafe { xft_library.symbol(b"XftColorAllocValue\0") }?,
@@ -242,6 +257,40 @@ impl XftBackend {
             )
         };
         Ok(())
+    }
+
+    /// Reusable measurement for decorations: true Xft advance when
+    /// `XftTextExtentsUtf8` is available, else the canonical layout
+    /// estimate (0.58em/char, 1.30em height) so callers never branch.
+    ///
+    /// # Safety
+    /// `display` stays live for the backend lifetime (same as `draw_text`).
+    pub unsafe fn measure_text(&mut self, size: f32, weight: u16, text: &str) -> (f32, f32) {
+        let estimate = xft_measure_estimate(text, size);
+        if text.is_empty() {
+            return estimate;
+        }
+        let Ok(font) = (unsafe { self.font_for(size, weight) }) else {
+            return estimate;
+        };
+        let Some(extents_fn) = self.api.text_extents_utf8 else {
+            return estimate;
+        };
+        let bytes = text.as_bytes();
+        let len = bytes.len().min(c_int::MAX as usize) as c_int;
+        let mut info = XGlyphInfo::default();
+        // SAFETY: `font` is a live Xft handle from `font_for`, `bytes`
+        // outlives the call for `len` bytes, `info` is a valid out-pointer.
+        unsafe {
+            extents_fn(
+                self.display,
+                font,
+                bytes.as_ptr(),
+                len,
+                &mut info as *mut XGlyphInfo,
+            )
+        };
+        ((info.x_off as f32).max(0.0), estimate.1)
     }
 
     unsafe fn font_for(&mut self, size: f32, weight: u16) -> Result<*mut XftFont, String> {
@@ -400,6 +449,33 @@ fn normalize_weight(weight: u16) -> u16 {
     }
 }
 
+/// Pure estimate backing [`XftBackend::measure_text`]: 0.58em per char,
+/// 1.30em line height. Shared so the fallback path is unit-testable.
+pub(crate) fn xft_measure_estimate(text: &str, size: f32) -> (f32, f32) {
+    let height = (size.max(1.0) * 1.30).round();
+    ((text.chars().count() as f32 * size * 0.58).round(), height)
+}
+
+/// Whether Xft text draws onto the composited ARGB32 target directly.
+/// Only the composited path keeps glyph alpha true; shape/opaque fallbacks
+/// draw onto the same drawable but the shape mask clips the tails.
+#[allow(dead_code)]
+pub(crate) fn xft_draws_on_composited_target(composited: bool) -> bool {
+    composited
+}
+
+/// Straight-alpha `Color` -> 16-bit XRender color triple used by
+/// `XftColorAllocValue`. Pure so the alpha expansion is unit-testable.
+#[allow(dead_code)]
+pub(crate) fn xrender_color_for(color: Color) -> (u16, u16, u16, u16) {
+    (
+        u16::from(color.r) * 257,
+        u16::from(color.g) * 257,
+        u16::from(color.b) * 257,
+        u16::from(color.a) * 257,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +486,26 @@ mod tests {
         assert_eq!(normalize_weight(500), 500);
         assert_eq!(normalize_weight(600), 600);
         assert_eq!(normalize_weight(700), 700);
+    }
+
+    #[test]
+    fn xft_measure_estimate_matches_layout() {
+        assert_eq!(xft_measure_estimate("hello", 13.0), (38.0, 17.0));
+        assert_eq!(xft_measure_estimate("", 13.0), (0.0, 17.0));
+    }
+
+    #[test]
+    fn xft_color_expands_straight_alpha() {
+        assert_eq!(
+            xrender_color_for(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 128
+            }),
+            (65535, 0, 0, 32896)
+        );
+        assert!(!xft_draws_on_composited_target(false));
+        assert!(xft_draws_on_composited_target(true));
     }
 }

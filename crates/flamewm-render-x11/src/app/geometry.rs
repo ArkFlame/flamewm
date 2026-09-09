@@ -6,6 +6,7 @@ impl X11App {
     /// Transactional geometry commit: retained size -> backbuffer ->
     /// retarget Xft/XRender -> resize window -> shape -> repaint -> flush.
     /// Any failure aborts before partial state; the error is never swallowed.
+    #[allow(dead_code)]
     pub(crate) unsafe fn commit_geometry(
         &mut self,
         document: &RuntimeDocument,
@@ -40,8 +41,10 @@ impl X11App {
         Ok(())
     }
 
-    /// First present: repaint + flush, then advance CreatedHidden/Projected
-    /// toward Painted. MapNotify (note_mapped) must arrive before Presented.
+    /// First present per SurfaceAlphaMode: composited ARGB scene is already
+    /// transparent-cleared; opaque fallback paints flattened pixels.
+    /// Then advance CreatedHidden/Projected toward Painted.
+    #[allow(dead_code)]
     pub(crate) unsafe fn present_first(
         &mut self,
         document: &RuntimeDocument,
@@ -66,7 +69,9 @@ impl X11App {
     }
 
     /// Chrome-ready path: repaint via the safe external drawable painter
-    /// (same API wm-x11 will use later). Errors propagate, never swallowed.
+    /// (same semantics: transparent clear, canonical scene target, present
+    /// per SurfaceAlphaMode). Errors propagate, never swallowed.
+    #[allow(dead_code)]
     pub(crate) unsafe fn chrome_ready_repaint(
         &mut self,
         document: &RuntimeDocument,
@@ -84,6 +89,7 @@ impl X11App {
     }
 
     /// Advance Mapped -> Presented after the mapped paint is flushed.
+    #[allow(dead_code)]
     pub(crate) unsafe fn present_mapped(
         &mut self,
         document: &RuntimeDocument,

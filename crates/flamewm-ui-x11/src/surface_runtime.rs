@@ -14,6 +14,7 @@ pub enum SurfaceRole {
     Dock,
     PopupMenu,
     DropdownMenu,
+    Overlay,
 }
 
 impl From<SurfaceRole> for flamewm_render_x11::SurfaceRole {
@@ -24,6 +25,23 @@ impl From<SurfaceRole> for flamewm_render_x11::SurfaceRole {
             SurfaceRole::Dock => Self::Dock,
             SurfaceRole::PopupMenu => Self::PopupMenu,
             SurfaceRole::DropdownMenu => Self::DropdownMenu,
+            SurfaceRole::Overlay => Self::Overlay,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SurfaceInputMode {
+    #[default]
+    Interactive,
+    PassThrough,
+}
+
+impl From<SurfaceInputMode> for flamewm_render_x11::SurfaceInputMode {
+    fn from(mode: SurfaceInputMode) -> Self {
+        match mode {
+            SurfaceInputMode::Interactive => Self::Interactive,
+            SurfaceInputMode::PassThrough => Self::PassThrough,
         }
     }
 }
@@ -34,6 +52,7 @@ pub struct SurfaceConfig {
     pub height: u32,
     pub title: String,
     pub role: SurfaceRole,
+    pub input: SurfaceInputMode,
     pub initially_visible: bool,
     pub x: i32,
     pub y: i32,
@@ -46,6 +65,7 @@ impl Default for SurfaceConfig {
             height: 641,
             title: "FlameWM UI".to_string(),
             role: SurfaceRole::Normal,
+            input: SurfaceInputMode::Interactive,
             initially_visible: true,
             x: 0,
             y: 0,
@@ -60,6 +80,7 @@ impl From<SurfaceConfig> for RenderSurfaceConfig {
             height: config.height,
             title: config.title,
             role: config.role.into(),
+            input: config.input.into(),
             initially_visible: config.initially_visible,
             x: config.x,
             y: config.y,
@@ -111,7 +132,6 @@ impl SurfaceRuntime {
             thumb_drag: None,
         })
     }
-
     pub fn create_surface(
         &mut self,
         template: UiTemplate,
@@ -162,11 +182,46 @@ impl SurfaceRuntime {
         self.controller.redraw_dirty().map_err(Into::into)
     }
 
+    /// Mark damage on one surface (merged max-coverage latch consumed by
+    /// `redraw_dirty`); no immediate paint.
+    pub fn mark_dirty(
+        &mut self,
+        surface: SurfaceHandle,
+        damage: flamewm_render_core::SurfaceDamage,
+    ) -> Result<(), UiBackendError> {
+        self.controller
+            .mark_surface_dirty(surface.0, damage)
+            .map_err(UiBackendError::Renderer)
+    }
+
+    pub fn mark_full(&mut self, surface: SurfaceHandle) -> Result<(), UiBackendError> {
+        self.mark_dirty(surface, flamewm_render_core::SurfaceDamage::Full)
+    }
+
+    /// Damage for one surface: document latch peek (no consume).
+    pub fn peek_damage(
+        &self,
+        surface: SurfaceHandle,
+    ) -> Result<flamewm_render_core::SurfaceDamage, UiBackendError> {
+        self.controller
+            .peek_surface_damage(surface.0)
+            .map_err(UiBackendError::Renderer)
+    }
+
     pub fn connection_fd(&self) -> RawFd {
         self.controller.connection_fd()
     }
 
     pub fn grab_pointer(&mut self, surface: SurfaceHandle) -> Result<(), UiBackendError> {
+        // Pass-through surfaces never grab: refuse up front, same as render.
+        if let Ok(mode) = self.controller.surface_input_mode(surface.0) {
+            if mode == flamewm_render_x11::SurfaceInputMode::PassThrough {
+                return Err(UiBackendError::Renderer(format!(
+                    "surface {} is pass-through; pointer grab refused",
+                    surface.0.get()
+                )));
+            }
+        }
         self.controller.grab_pointer(surface.0).map_err(Into::into)
     }
 
@@ -180,6 +235,33 @@ impl SurfaceRuntime {
         self.controller
             .is_pointer_grabbed(surface.0)
             .map_err(UiBackendError::Renderer)
+    }
+
+    pub fn surface_role(&self, surface: SurfaceHandle) -> Result<SurfaceRole, UiBackendError> {
+        let role = self
+            .controller
+            .surface_role(surface.0)
+            .map_err(UiBackendError::Renderer)?;
+        Ok(match role {
+            flamewm_render_x11::SurfaceRole::Normal => SurfaceRole::Normal,
+            flamewm_render_x11::SurfaceRole::Desktop => SurfaceRole::Desktop,
+            flamewm_render_x11::SurfaceRole::Dock => SurfaceRole::Dock,
+            flamewm_render_x11::SurfaceRole::PopupMenu => SurfaceRole::PopupMenu,
+            flamewm_render_x11::SurfaceRole::DropdownMenu => SurfaceRole::DropdownMenu,
+            flamewm_render_x11::SurfaceRole::Overlay => SurfaceRole::Overlay,
+        })
+    }
+
+    pub fn is_wm_managed(&self, surface: SurfaceHandle) -> Result<bool, UiBackendError> {
+        self.controller
+            .is_wm_managed(surface.0)
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// External drawable bridge: measure/draw/fill/blit/shape/flush target
+    /// types re-exported from the render crate for wm-owned drawables.
+    pub fn external_target_note(&self) -> &'static str {
+        "use flamewm_render_x11::{ExternalDrawableSession, ExternalDrawableTarget}"
     }
 
     pub fn with_document<R>(
@@ -203,7 +285,8 @@ impl SurfaceRuntime {
             .map_err(UiBackendError::Document)
     }
 
-    /// Retained scroll offset for one node, keyed by (surface, node).
+    /// Retained scroll offset for one node: render-owned document state is
+    /// the authority; the runtime mirror only seeds drag math.
     pub fn scroll_offset(
         &self,
         surface: SurfaceHandle,
@@ -216,7 +299,8 @@ impl SurfaceRuntime {
     }
 
     /// Apply a semantic scroll delta (wheel ticks, keyboard, programmatic)
-    /// to the retained offset, clamped to [0, max].
+    /// to the render-owned retained offset, clamped to [0, max]. Marks the
+    /// document Full so `redraw_dirty` coalesces the frame.
     pub fn apply_scroll_delta(
         &mut self,
         surface: SurfaceHandle,
@@ -225,17 +309,19 @@ impl SurfaceRuntime {
         max_x: f32,
         max_y: f32,
     ) -> flamewm_render_core::ScrollState {
-        let current = self.scroll_offset(surface, node);
-        let next = flamewm_render_core::ScrollState {
-            offset_x: current.offset_x + delta.dx,
-            offset_y: current.offset_y + delta.dy,
-        }
-        .clamped(max_x, max_y);
+        let next = self
+            .controller
+            .document_mut(surface.0)
+            .map(|document| document.apply_scroll_delta(node, delta, (max_x, max_y)))
+            .unwrap_or(flamewm_render_core::ScrollState {
+                offset_x: delta.dx.clamp(0.0, max_x.max(0.0)),
+                offset_y: delta.dy.clamp(0.0, max_y.max(0.0)),
+            });
         self.scroll_offsets.insert((surface.0.get(), node), next);
         next
     }
 
-    /// Set a retained offset directly (thumb drag target).
+    /// Set a retained offset directly (thumb drag target). Render-owned.
     pub fn set_scroll_offset(
         &mut self,
         surface: SurfaceHandle,
@@ -244,7 +330,11 @@ impl SurfaceRuntime {
         max_x: f32,
         max_y: f32,
     ) -> flamewm_render_core::ScrollState {
-        let next = offset.clamped(max_x, max_y);
+        let next = self
+            .controller
+            .document_mut(surface.0)
+            .map(|document| document.set_scroll_offset(node, offset, (max_x, max_y)))
+            .unwrap_or_else(|_| offset.clamped(max_x, max_y));
         self.scroll_offsets.insert((surface.0.get(), node), next);
         next
     }
@@ -323,6 +413,21 @@ impl SurfaceRuntime {
             .get(node as usize)
             .map(|entry| entry.rect)
             .ok_or_else(|| UiBackendError::Document(format!("node {node} has no layout box")))
+    }
+
+    /// Global rect of one node by string id (layout box in surface coords).
+    /// Resolves the compiled node id, then delegates to `node_global_rect`.
+    pub fn node_global_rect_by_id(
+        &mut self,
+        surface: SurfaceHandle,
+        id: &str,
+    ) -> Option<flamewm_render_core::Rect> {
+        let node = self
+            .controller
+            .document_mut(surface.0)
+            .ok()
+            .and_then(|document| document.node_by_id(id))?;
+        self.node_global_rect(surface, node).ok()
     }
 
     /// Intrinsic document size: content extent of the root node.

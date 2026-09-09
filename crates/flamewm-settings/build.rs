@@ -12,11 +12,14 @@ fn main() {
         .expect("workspace root");
     let ui = root.join("ui/settings.html");
     let css = root.join("ui/settings.css");
-    let raster = root.join("assets/raster");
+    let web = root.join("assets/web");
+    let breeze = root.join("assets/web/breeze");
+    let branding = root.join("assets/branding");
 
     println!("cargo:rerun-if-changed={}", ui.display());
     println!("cargo:rerun-if-changed={}", css.display());
-    println!("cargo:rerun-if-changed={}", raster.display());
+    println!("cargo:rerun-if-changed={}", breeze.display());
+    println!("cargo:rerun-if-changed={}", branding.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let staged_ui = out_dir.join("settings");
@@ -24,13 +27,13 @@ fn main() {
     fs::create_dir_all(&staged_assets).expect("create staged settings assets");
     fs::copy(&ui, staged_ui.join("settings.html")).expect("stage settings UI");
     fs::copy(&css, staged_ui.join("settings.css")).expect("stage settings CSS");
-    for entry in fs::read_dir(&raster).expect("read settings raster assets") {
-        let entry = entry.expect("read settings raster asset entry");
-        let asset = entry.path();
-        if asset.is_file() {
-            fs::copy(&asset, staged_assets.join(entry.file_name()))
-                .expect("stage settings raster asset");
-        }
+    stage_tree(&breeze, &staged_assets.join("breeze"));
+    stage_tree(&branding, &staged_assets.join("branding"));
+    let staged_web = staged_assets.join("web");
+    fs::create_dir_all(&staged_web).expect("create staged settings web assets");
+    for name in ["flamewm-icon.svg", "github.svg", "paypal.svg"] {
+        fs::copy(web.join(name), staged_assets.join("web").join(name))
+            .unwrap_or_else(|_| panic!("stage settings web asset {name}"));
     }
 
     let staged_html = staged_ui.join("settings.html");
@@ -42,4 +45,15 @@ fn main() {
         encode(&compiled.document).expect("encode settings UI"),
     )
     .expect("write settings UI");
+}
+
+fn stage_tree(source: &Path, dest: &Path) {
+    fs::create_dir_all(dest).expect("create staged asset dir");
+    for entry in fs::read_dir(source).expect("read staged asset dir") {
+        let entry = entry.expect("read staged asset entry");
+        let path = entry.path();
+        if path.is_file() {
+            fs::copy(&path, dest.join(entry.file_name())).expect("stage asset file");
+        }
+    }
 }

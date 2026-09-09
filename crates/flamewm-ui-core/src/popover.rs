@@ -13,6 +13,13 @@ pub enum PopoverEdge {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopoverAlign {
+    Start,
+    End,
+    Center,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PopoverGeometry {
     pub origin: Point,
     pub edge: PopoverEdge,
@@ -27,6 +34,25 @@ impl PopoverGeometry {
         work_area: Rect,
         offset: i32,
     ) -> Self {
+        Self::place_aligned(
+            source_rect,
+            popup_size,
+            edge,
+            PopoverAlign::Start,
+            work_area,
+            offset,
+        )
+    }
+
+    #[must_use]
+    pub fn place_aligned(
+        source_rect: Rect,
+        popup_size: Size,
+        edge: PopoverEdge,
+        align: PopoverAlign,
+        work_area: Rect,
+        offset: i32,
+    ) -> Self {
         let size = Size::new(popup_size.width.max(0), popup_size.height.max(0));
         let candidates = [
             edge,
@@ -35,7 +61,7 @@ impl PopoverGeometry {
             PopoverEdge::Above,
         ];
         for candidate in candidates {
-            let origin = Self::origin_for(source_rect, size, candidate, offset);
+            let origin = Self::origin_for(source_rect, size, candidate, align, offset);
             if Self::fits(origin, size, work_area) {
                 return Self {
                     origin: Self::clamp_to_work_area(origin, size, work_area),
@@ -45,7 +71,7 @@ impl PopoverGeometry {
         }
         // Nothing fits: clamp preferred origin into the work area.
         let origin = Self::clamp_to_work_area(
-            Self::origin_for(source_rect, size, edge, offset),
+            Self::origin_for(source_rect, size, edge, align, offset),
             size,
             work_area,
         );
@@ -61,12 +87,44 @@ impl PopoverGeometry {
         }
     }
 
-    fn origin_for(source: Rect, size: Size, edge: PopoverEdge, offset: i32) -> Point {
+    fn origin_for(
+        source: Rect,
+        size: Size,
+        edge: PopoverEdge,
+        align: PopoverAlign,
+        offset: i32,
+    ) -> Point {
         match edge {
-            PopoverEdge::Below => Point::new(source.x, source.bottom() + offset),
-            PopoverEdge::Above => Point::new(source.x, source.y - size.height - offset),
-            PopoverEdge::Right => Point::new(source.right() + offset, source.y),
-            PopoverEdge::Left => Point::new(source.x - size.width - offset, source.y),
+            PopoverEdge::Below => {
+                Point::new(Self::align_x(source, size, align), source.bottom() + offset)
+            }
+            PopoverEdge::Above => Point::new(
+                Self::align_x(source, size, align),
+                source.y - size.height - offset,
+            ),
+            PopoverEdge::Right => {
+                Point::new(source.right() + offset, Self::align_y(source, size, align))
+            }
+            PopoverEdge::Left => Point::new(
+                source.x - size.width - offset,
+                Self::align_y(source, size, align),
+            ),
+        }
+    }
+
+    const fn align_x(source: Rect, size: Size, align: PopoverAlign) -> i32 {
+        match align {
+            PopoverAlign::Start => source.x,
+            PopoverAlign::End => source.right() - size.width,
+            PopoverAlign::Center => source.x + (source.width - size.width) / 2,
+        }
+    }
+
+    const fn align_y(source: Rect, size: Size, align: PopoverAlign) -> i32 {
+        match align {
+            PopoverAlign::Start => source.y,
+            PopoverAlign::End => source.bottom() - size.height,
+            PopoverAlign::Center => source.y + (source.height - size.height) / 2,
         }
     }
 

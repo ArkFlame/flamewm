@@ -16,6 +16,7 @@
 | Render compilation | `crates/flamewm-render-compiler` | compiled render document |
 | Layout, paint, hit testing | `crates/flamewm-render-core` | render commands |
 | Native render output | `crates/flamewm-render-x11` | renderer-native boundary |
+| Static-label CPU/span/counter/memory profiler | `crates/flamewm-profiler` | profiler facade (`start`, points, gauges, `report_window`) |
 
 If a mechanism is not listed, add or clarify its owner before implementing a
 second path. This index is an ownership guide, not a claim that every owner is

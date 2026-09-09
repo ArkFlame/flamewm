@@ -11,11 +11,16 @@ flamewm-api = { path = "../flamewm-api" }
 flamewm-applications = { path = "../flamewm-applications" }
 flamewm-control-core = { path = "../flamewm-control-core" }
 flamewm-control-dbus = { path = "../flamewm-control-dbus" }
+flamewm-control-wire = { path = "../flamewm-control-wire" }
 flamewm-dbus-reactor = { path = "../flamewm-dbus-reactor" }
 flamewm-desktop-core = { path = "../flamewm-desktop-core" }
 flamewm-integrations-linux = { path = "../flamewm-integrations-linux" }
+flamewm-profiler = { path = "../flamewm-profiler" }
+flamewm-reactor = { path = "../flamewm-reactor" }
 flamewm-ui-core = { path = "../flamewm-ui-core" }
 flamewm-ui-x11 = { path = "../flamewm-ui-x11" }
+calloop.workspace = true
+inotify.workspace = true
 
 [build-dependencies]
 flamewm-render-compiler = { path = "../flamewm-render-compiler" }

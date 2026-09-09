@@ -16,6 +16,7 @@ pub enum X11WindowRole {
     Dock,
     PopupMenu,
     DropdownMenu,
+    Overlay,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub enum SurfaceRole {
     Dock,
     PopupMenu,
     DropdownMenu,
+    Overlay,
 }
 
 impl From<SurfaceRole> for X11WindowRole {
@@ -35,7 +37,27 @@ impl From<SurfaceRole> for X11WindowRole {
             SurfaceRole::Dock => Self::Dock,
             SurfaceRole::PopupMenu => Self::PopupMenu,
             SurfaceRole::DropdownMenu => Self::DropdownMenu,
+            SurfaceRole::Overlay => Self::Overlay,
         }
+    }
+}
+
+/// Input participation of a surface. PassThrough surfaces never take
+/// focus or pointer grabs and get an empty XShape input region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SurfaceInputMode {
+    #[default]
+    Interactive,
+    PassThrough,
+}
+
+impl SurfaceInputMode {
+    pub fn allows_grab(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+
+    pub fn allows_focus(self) -> bool {
+        matches!(self, Self::Interactive)
     }
 }
 
@@ -45,9 +67,45 @@ pub struct SurfaceConfig {
     pub height: u32,
     pub title: String,
     pub role: SurfaceRole,
+    pub input: SurfaceInputMode,
     pub initially_visible: bool,
     pub x: i32,
     pub y: i32,
+}
+
+/// Pure policy: overlay surfaces are never WM-managed, never in the
+/// workarea/taskbar, and default to pass-through input.
+pub fn overlay_excluded_from_wm(role: SurfaceRole) -> bool {
+    matches!(role, SurfaceRole::Overlay)
+}
+
+/// Shared popup policy: transient menus/overlays are override-redirect and
+/// must map+raise atomically before any grab (XMapWindow+XRaiseWindow+flush
+/// or XMapRaised). Ordinary Normal/Desktop/Dock surfaces map only.
+pub fn surface_role_needs_popup_raise(role: SurfaceRole) -> bool {
+    matches!(
+        role,
+        SurfaceRole::PopupMenu | SurfaceRole::DropdownMenu | SurfaceRole::Overlay
+    )
+}
+
+/// X11-role twin of [`surface_role_needs_popup_raise`] for render-owned code.
+pub fn x11_role_needs_popup_raise(role: X11WindowRole) -> bool {
+    matches!(
+        role,
+        X11WindowRole::PopupMenu | X11WindowRole::DropdownMenu | X11WindowRole::Overlay
+    )
+}
+
+pub fn overlay_window_type_name(role: SurfaceRole) -> &'static str {
+    match role {
+        SurfaceRole::Normal => "_NET_WM_WINDOW_TYPE_NORMAL",
+        SurfaceRole::Desktop => "_NET_WM_WINDOW_TYPE_DESKTOP",
+        SurfaceRole::Dock => "_NET_WM_WINDOW_TYPE_DOCK",
+        SurfaceRole::PopupMenu => "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+        SurfaceRole::DropdownMenu => "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+        SurfaceRole::Overlay => "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    }
 }
 
 impl Default for SurfaceConfig {
@@ -57,6 +115,7 @@ impl Default for SurfaceConfig {
             height: 641,
             title: "FlameWM Render 0.0.9".to_string(),
             role: SurfaceRole::Normal,
+            input: SurfaceInputMode::Interactive,
             initially_visible: true,
             x: 0,
             y: 0,

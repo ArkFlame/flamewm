@@ -32,3 +32,12 @@ The compiler crate uses package-specific `opt-level=2`; parser speed is not stea
 - no visible drag backlog in Xephyr;
 - no stale motion rendered after release;
 - Start/taskbar/window manipulation must not block on disk/network/system commands.
+
+## Profiler (`flamewm-profiler`, frozen seams R01-R06)
+
+- Static `&'static str` labels only; no per-span allocation or thread.
+- Env: `FLAMEWM_PROFILE=1`, `FLAMEWM_PROFILE_INTERVAL` (default 60, min 10),
+  `FLAMEWM_PROFILE_TOP` (default 8, max 8).
+- Report: single `FLAMEWM_PROFILE_SUMMARY` block via `report_window()` with
+  `SLOWEST_SINGLE` / `HIGHEST_TOTAL` / `HIGHEST_CALL_COUNT` / `MEMORY_TOP`.
+- No product instrumentation yet; product crates opt in later.

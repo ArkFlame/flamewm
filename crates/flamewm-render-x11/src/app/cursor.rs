@@ -1,5 +1,10 @@
 use super::*;
 impl X11App {
+    #[allow(dead_code)]
+    pub(crate) fn current_cursor(&self) -> Option<CursorKind> {
+        self.current_cursor
+    }
+
     pub(crate) fn update_cursor(&mut self, document: &RuntimeDocument, hover: Option<u32>) {
         let kind = hover
             .and_then(|index| {
@@ -15,18 +20,17 @@ impl X11App {
     }
 
     pub(crate) fn set_cursor(&mut self, kind: CursorKind) {
-        if kind == self.current_cursor {
+        if Some(kind) == self.current_cursor {
             return;
         }
-        // Xcursor backend first (semantic names, cached); core font fallback.
+        // Xcursor backend first (semantic names, cached); core font fallback
+        // only when the Xcursor lookup fails.
         if let Some(xcursor) = self.xcursor.as_mut() {
             let window = self.window;
-            let display = self.display;
             let resolved = unsafe { xcursor.define(window, kind) };
             if resolved.is_some() {
-                let _ = display;
                 unsafe { XFlush(self.display) };
-                self.current_cursor = kind;
+                self.current_cursor = Some(kind);
                 return;
             }
         }
@@ -41,7 +45,7 @@ impl X11App {
                 XDefineCursor(self.display, self.window, cursor);
                 XFlush(self.display);
             }
-            self.current_cursor = kind;
+            self.current_cursor = Some(kind);
         }
     }
 }

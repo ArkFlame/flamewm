@@ -146,6 +146,11 @@ if [[ "$VISUAL_CANARY" == 1 ]]; then
   fi
   # SR08 black-pixel gate on the visual display; fails the run on all-black root.
   DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" sr08 || { echo "VISUAL_FAIL canary SR08 black-pixel gate" >&2; exit 1; }
+  # J6 extended probes: geometry/stacking/root-shot are diagnostic only here;
+  # the SR08 gate above remains the single pass/fail canary signal.
+  DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" root-geometry 2>/dev/null || true
+  DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" stacking 2>/dev/null || true
+  DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" root-shot 2>/dev/null || true
 fi
 
 # Reference and current must be compared without resizing; geometry drift is a failure.
@@ -159,3 +164,25 @@ printf 'VISUAL_REFERENCE %s\n' "$REF"
 printf 'VISUAL_CURRENT   %s\n' "$OUT"
 printf 'VISUAL_RMSE      %s\n' "$RMSE"
 printf 'VISUAL_AE        %s\n' "$AE"
+
+# J11 workload hooks (opt-in only; never change pass/fail).
+# FLAMEWM_VISUAL_PROFILE=1 runs: canary startup/PSS/idle/profile-window probes
+# then summarizes FLAMEWM_PROFILE_SUMMARY blocks from the app log (if any).
+if [[ "${FLAMEWM_VISUAL_PROFILE:-0}" == 1 ]]; then
+  CANARY_BIN="${CANARY_BIN:-./.target/release/flamewm-x11-canary}"
+  if [[ ! -x "$CANARY_BIN" ]]; then
+    echo '[visual-profile] building flamewm-x11-canary harness' >&2
+    cargo build --quiet --release -p flamewm-x11-canary || true
+  fi
+  if [[ -x "$CANARY_BIN" ]]; then
+    DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" profile-startup --name "${FLAMEWM_VISUAL_PROFILE_NAME:-flame}" --timeout-secs 10 2>/dev/null || true
+    DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" profile-window --name "${FLAMEWM_VISUAL_PROFILE_NAME:-flame}" 2>/dev/null || true
+    DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" profile-idle --secs "${FLAMEWM_VISUAL_PROFILE_IDLE:-2}" 2>/dev/null || true
+    if [[ -n "${APID:-}" ]]; then
+      DISPLAY="$DISPLAY_NUM" "$CANARY_BIN" profile-pss --pid "$APID" 2>/dev/null || true
+    fi
+  fi
+  if [[ -x tools/profile_summary.py ]]; then
+    python3 tools/profile_summary.py /tmp/flamewm-render-visual-app.log 2>/dev/null || true
+  fi
+fi

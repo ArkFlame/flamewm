@@ -64,11 +64,11 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
     // existing PPM build artifacts keep decoding. Unknown versions are
     // rejected explicitly; no silent reinterpretation of pixel bytes.
     let bytes_per_pixel: u32 = match version {
-        FORMAT_VERSION => 4,
+        FORMAT_VERSION | FORMAT_VERSION_RGBA8_LEGACY => 4,
         FORMAT_VERSION_RGB8_LEGACY => 3,
         other => {
             return Err(format!(
-                "unsupported FlameWM Render format version {other}; expected {FORMAT_VERSION} (legacy {FORMAT_VERSION_RGB8_LEGACY} accepted with RGB8-to-RGBA8 upconversion)"
+                "unsupported FlameWM Render format version {other}; expected {FORMAT_VERSION} (legacy {FORMAT_VERSION_RGBA8_LEGACY} and {FORMAT_VERSION_RGB8_LEGACY} accepted)"
             ));
         }
     };
@@ -148,12 +148,12 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
         let image = reader.opt_u16()?;
         let style = reader.style_versioned(version)?;
         let hover_style = if reader.u8()? != 0 {
-            Some(reader.style()?)
+            Some(reader.style_versioned(version)?)
         } else {
             None
         };
         let active_style = if reader.u8()? != 0 {
-            Some(reader.style()?)
+            Some(reader.style_versioned(version)?)
         } else {
             None
         };
@@ -338,6 +338,10 @@ impl Writer {
             Overflow::Auto => 2,
             Overflow::Scroll => 3,
         });
+        self.u8(match style.image_treatment {
+            ImageTreatment::Original => 0,
+            ImageTreatment::SymbolicForeground => 1,
+        });
     }
 }
 
@@ -431,10 +435,6 @@ impl<'a> Reader<'a> {
             left: self.f32()?,
         })
     }
-    fn style(&mut self) -> Result<Style, String> {
-        self.style_versioned(FORMAT_VERSION)
-    }
-
     fn style_versioned(&mut self, version: u16) -> Result<Style, String> {
         let display = match self.u8()? {
             0 => Display::None,
@@ -528,6 +528,15 @@ impl<'a> Reader<'a> {
                     3 => Overflow::Scroll,
                     v => return Err(format!("invalid overflow {v}")),
                 }
+            },
+            image_treatment: if version == FORMAT_VERSION {
+                match self.u8()? {
+                    0 => ImageTreatment::Original,
+                    1 => ImageTreatment::SymbolicForeground,
+                    v => return Err(format!("invalid image treatment {v}")),
+                }
+            } else {
+                ImageTreatment::Original
             },
         })
     }
@@ -665,5 +674,88 @@ mod tests {
             error.contains("unsupported FlameWM Render format version 9"),
             "unexpected: {error}"
         );
+    }
+
+    fn roundtrip_node(treatment: ImageTreatment) -> CompiledDocument {
+        let mut style = Style::default();
+        style.image_treatment = treatment;
+        CompiledDocument {
+            source_fingerprint: 1,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![CompiledNode {
+                kind: NodeKind::Element,
+                parent: None,
+                first_child: None,
+                next_sibling: None,
+                id: String::new(),
+                action: String::new(),
+                text: String::new(),
+                image: None,
+                style,
+                hover_style: None,
+                active_style: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn v4_roundtrip_preserves_original_treatment() {
+        let document = roundtrip_node(ImageTreatment::Original);
+        let decoded = decode(&encode(&document).unwrap()).unwrap();
+        assert_eq!(decoded, document);
+        assert_eq!(
+            decoded.nodes[0].style.image_treatment,
+            ImageTreatment::Original
+        );
+    }
+
+    #[test]
+    fn v4_roundtrip_preserves_symbolic_treatment() {
+        let document = roundtrip_node(ImageTreatment::SymbolicForeground);
+        let decoded = decode(&encode(&document).unwrap()).unwrap();
+        assert_eq!(decoded, document);
+        assert_eq!(
+            decoded.nodes[0].style.image_treatment,
+            ImageTreatment::SymbolicForeground
+        );
+    }
+
+    #[test]
+    fn v3_style_decodes_with_original_treatment_default() {
+        let document = roundtrip_node(ImageTreatment::SymbolicForeground);
+        let mut bytes = encode(&document).unwrap();
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION_RGBA8_LEGACY.to_le_bytes());
+        // v4 appends 1 treatment byte per style; strip the trailing byte of
+        // the single node style so the payload matches v3 layout.
+        let treatment_offset = bytes.len() - 3;
+        bytes.remove(treatment_offset);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.nodes[0].style.image_treatment,
+            ImageTreatment::Original
+        );
+        assert_eq!(decoded.nodes[0].style.overflow_x, Overflow::Visible);
+        assert_eq!(decoded.nodes[0].style.overflow_y, Overflow::Visible);
+    }
+
+    #[test]
+    fn v2_style_decodes_with_original_treatment_and_overflow_defaults() {
+        let document = roundtrip_node(ImageTreatment::Original);
+        let mut bytes = encode(&document).unwrap();
+        assert_eq!(FORMAT_VERSION, 4);
+        // Convert to v2 layout: version=2 plus strip treatment byte and the
+        // 2 overflow bytes from the single node style (v2 predates both).
+        let style_tail = bytes.len() - 5;
+        bytes.drain(style_tail..style_tail + 3);
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION_RGB8_LEGACY.to_le_bytes());
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.nodes[0].style.image_treatment,
+            ImageTreatment::Original
+        );
+        assert_eq!(decoded.nodes[0].style.overflow_x, Overflow::Visible);
+        assert_eq!(decoded.nodes[0].style.overflow_y, Overflow::Visible);
     }
 }

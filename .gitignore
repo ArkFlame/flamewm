@@ -1,6 +1,7 @@
 /target/
 /.target/
 /.agents/runtime/
+/.performance/
 *.log
 *.core
 

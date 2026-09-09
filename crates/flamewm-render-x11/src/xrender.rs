@@ -345,6 +345,7 @@ impl XRenderBackend {
     /// # Safety
     ///
     /// `source` must be a live pixmap on this backend's display.
+    #[allow(dead_code)]
     pub unsafe fn blit_over(
         &mut self,
         source: Drawable,

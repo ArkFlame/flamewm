@@ -176,6 +176,32 @@ pub fn project_panel(
     Ok(())
 }
 
+fn model_view<'a>(
+    model: &'a StartModel,
+    category: StartCategory,
+    query: &str,
+) -> Vec<&'a flamewm_api::applications::DesktopApplication> {
+    // Canonical indexed path: borrowed query view from the precomputed
+    // index, then the single presentation-bucket filter. No clone, no
+    // set_query-on-temporary. `set_query`/`results` stay as compat shims
+    // in core and are not used here.
+    let needle = query.trim();
+    let base: Vec<&'a flamewm_api::applications::DesktopApplication> = if needle.is_empty() {
+        model.results_view()
+    } else {
+        model.query_view(query)
+    };
+    if category == StartCategory::All {
+        return base;
+    }
+    if category == StartCategory::Power {
+        return Vec::new();
+    }
+    base.into_iter()
+        .filter(|application| application_matches_category(application, category))
+        .collect()
+}
+
 pub fn project_start(
     document: &mut impl UiDocumentAccess,
     model: &StartModel,
@@ -183,22 +209,22 @@ pub fn project_start(
     query: &str,
     session: &SessionCapabilities,
 ) -> Result<(), String> {
-    let queried = model_with_query(model, query);
     for (name, value) in PRESENTATION_CATEGORIES {
         document.visible(
             &format!("start-category-{name}"),
             match value {
                 StartCategory::Power => session_available(session),
-                _ => value == category || !results_for_category(&queried, value, query).is_empty(),
+                _ => value == category || !model_view(model, value, query).is_empty(),
             },
         )?;
     }
+    let count = model_view(model, category, query).len();
     document.text(
         "start-search-label",
         if query.trim().is_empty() {
             "Search applications".to_owned()
         } else {
-            format!("{} ({})", query, queried.results().len())
+            format!("{} ({})", query, count)
         },
     )?;
     Ok(())
@@ -212,12 +238,7 @@ pub fn project_start_submenu(
     session: &SessionCapabilities,
     icon_resolver: &mut IconResolver,
 ) -> Result<(), String> {
-    let queried = model_with_query(model, query);
-    let applications = if query.trim().is_empty() {
-        results_for_category(&queried, category, query)
-    } else {
-        queried.results()
-    };
+    let applications = model_view(model, category, query);
     document.visible("start-applications", !applications.is_empty())?;
     // Measured sizing + scrolling: the template `#start-list` scrolls
     // (`overflow-y:auto`); the virtual window selects visible rows without
@@ -265,13 +286,7 @@ pub fn start_application_for_slot(
     query: &str,
     slot: usize,
 ) -> Option<flamewm_api::DesktopAppId> {
-    let queried = model_with_query(model, query);
-    let applications = if query.trim().is_empty() {
-        results_for_category(&queried, category, query)
-    } else {
-        queried.results()
-    };
-    applications
+    model_view(model, category, query)
         .get(slot)
         .map(|application| application.id.clone())
 }
@@ -598,6 +613,18 @@ pub fn project_calendar(
         b: 72,
         a: 255,
     };
+    const ADJACENT_FG: UiColor = UiColor {
+        r: 98,
+        g: 104,
+        b: 109,
+        a: 255,
+    };
+    const CURRENT_FG: UiColor = UiColor {
+        r: 240,
+        g: 240,
+        b: 240,
+        a: 255,
+    };
     document.text("calendar-month", month_name(grid.month).to_owned())?;
     document.text("calendar-year", grid.year.to_string())?;
     let today = grid
@@ -605,13 +632,15 @@ pub fn project_calendar(
         .iter()
         .position(|cell| cell.today && cell.year == grid.year && cell.month == grid.month);
     for (index, cell) in grid.cells.iter().enumerate() {
-        // Day text and the today fill both live on the 27x27 marker child,
-        // never on the 37x27 cell: the cell only centers its marker. Full
-        // re-projection clears every non-today marker, so midnight refresh
-        // drops the previous fill with no class toggle (none exists on
-        // `UiDocumentAccess`).
+        // 42 cells: day text + per-month foreground (adjacent #62686d,
+        // current light) on the 27x27 marker child, never on the cell.
         let marker = format!("calendar-day-{}-marker", index + 1);
         document.text(&marker, cell.day.to_string())?;
+        if cell.month_kind == flamewm_shell_core::CalendarMonth::Current {
+            document.foreground(&marker, CURRENT_FG)?;
+        } else {
+            document.foreground(&marker, ADJACENT_FG)?;
+        }
         if Some(index) == today {
             document.background(&marker, FLAME_RED)?;
         } else {
@@ -630,6 +659,7 @@ mod calendar_tests {
     struct FakeDocument {
         texts: HashMap<String, String>,
         backgrounds: HashMap<String, UiColor>,
+        foregrounds: HashMap<String, UiColor>,
         cleared: Vec<String>,
     }
 
@@ -663,12 +693,26 @@ mod calendar_tests {
         fn border(&mut self, _id: &str, _color: UiColor) -> Result<(), String> {
             Ok(())
         }
+        fn foreground(&mut self, id: &str, color: UiColor) -> Result<(), String> {
+            self.foregrounds.insert(id.to_owned(), color);
+            Ok(())
+        }
+        fn foreground_clear(&mut self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
         fn background_clear(&mut self, id: &str) -> Result<(), String> {
             self.backgrounds.remove(id);
             self.cleared.push(id.to_owned());
             Ok(())
         }
         fn border_clear(&mut self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn layer(
+            &mut self,
+            _id: &str,
+            _layer: flamewm_ui_core::style::UiLayer,
+        ) -> Result<(), String> {
             Ok(())
         }
         fn overflow(&mut self, _id: &str, _x: Overflow, _y: Overflow) -> Result<(), String> {
@@ -796,28 +840,6 @@ fn month_name(month: u8) -> &'static str {
     .get(month.saturating_sub(1) as usize)
     .copied()
     .unwrap_or("Unknown")
-}
-
-fn model_with_query(model: &StartModel, query: &str) -> StartModel {
-    let mut queried = model.clone();
-    queried.set_query(query);
-    queried
-}
-
-fn results_for_category<'a>(
-    model: &'a StartModel,
-    category: StartCategory,
-    query: &str,
-) -> Vec<&'a flamewm_api::applications::DesktopApplication> {
-    let applications = if query.trim().is_empty() {
-        model.results().into_iter().collect()
-    } else {
-        model.results()
-    };
-    applications
-        .into_iter()
-        .filter(|application| application_matches_category(application, category))
-        .collect()
 }
 
 #[must_use]

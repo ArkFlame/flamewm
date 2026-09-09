@@ -35,8 +35,8 @@ impl X11App {
     where
         F: FnMut(&ActionEvent, &mut RuntimeDocument) -> Result<(), String>,
     {
-        // SAFETY: The caller owns a live X11 display and app resources for the loop.
-        unsafe { self.redraw(document)? };
+        // No unconditional redraw on entry: presenters start from the
+        // retained scene; damage/expose drive paints via redraw_if_dirty.
         loop {
             let mut event = MaybeUninit::<XEvent>::uninit();
             // SAFETY: XNextEvent initializes the supplied XEvent storage before returning.
@@ -52,10 +52,11 @@ impl X11App {
             // SAFETY: type_ is the common discriminator at the start of every XEvent variant.
             match unsafe { event.type_ } {
                 EXPOSE => {
-                    // SAFETY: The discriminator identifies XExposeEvent in this match arm.
+                    // Expose is present-only: re-blit the retained scene,
+                    // never recompute layout/paint. Coalesce counts.
                     if unsafe { event.xexpose.count } == 0 {
                         // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        unsafe { self.present_retained(document)? };
                     }
                 }
                 MAP_NOTIFY => {
@@ -73,8 +74,7 @@ impl X11App {
                         self.height = height;
                         // SAFETY: The display, window, and retained backbuffer belong to this app.
                         unsafe { self.recreate_backbuffer()? };
-                        // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        self.mark_full();
                         // SAFETY: window and display are live; mask follows resize.
                         unsafe { self.refresh_shape_mask(document) };
                     }
@@ -155,8 +155,9 @@ impl X11App {
                                 },
                                 document,
                             )?;
-                            unsafe { self.redraw(document)? };
+                            self.mark_full();
                             if self.single_event {
+                                unsafe { self.redraw_if_dirty(document)? };
                                 return Ok(());
                             }
                             continue;
@@ -180,11 +181,9 @@ impl X11App {
                                 },
                                 document,
                             )?;
-                            // SAFETY: The caller owns a live X11 display and app resources.
-                            unsafe { self.redraw(document)? };
+                            self.mark_full();
                         } else if changed {
-                            // SAFETY: The caller owns a live X11 display and app resources.
-                            unsafe { self.redraw(document)? };
+                            self.mark_full();
                         }
                     } else if changed {
                         if let Some(index) = hover {
@@ -205,16 +204,14 @@ impl X11App {
                                 )?;
                             }
                         }
-                        // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        self.mark_full();
                     }
                 }
                 LEAVE_NOTIFY => {
                     let had_hover = self.interaction.hover.take().is_some();
                     self.set_cursor(CursorKind::Default);
                     if had_hover {
-                        // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        self.mark_full();
                     }
                 }
                 KEY_PRESS => {
@@ -267,8 +264,7 @@ impl X11App {
                             },
                             document,
                         )?;
-                        // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        self.mark_full();
                     } else if !ctrl && !alt && !super_key {
                         let shift_index = if key.state & SHIFT_MASK != 0 { 1 } else { 0 };
                         // SAFETY: key points to the initialized XKeyEvent copied from XEvent.
@@ -287,8 +283,7 @@ impl X11App {
                                 },
                                 document,
                             )?;
-                            // SAFETY: The caller owns a live X11 display and app resources.
-                            unsafe { self.redraw(document)? };
+                            self.mark_full();
                         }
                     }
                 }
@@ -312,8 +307,7 @@ impl X11App {
                                 },
                                 document,
                             )?;
-                            // SAFETY: The caller owns a live X11 display and app resources.
-                            unsafe { self.redraw(document)? };
+                            self.mark_full();
                         }
                         self.super_chord_used = false;
                     }
@@ -339,9 +333,9 @@ impl X11App {
                             },
                             document,
                         )?;
-                        // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        self.mark_full();
                         if self.single_event {
+                            unsafe { self.redraw_if_dirty(document)? };
                             return Ok(());
                         }
                         continue;
@@ -381,8 +375,8 @@ impl X11App {
                                         document,
                                     )?;
                                 }
-                                // SAFETY: The caller owns a live X11 display and app resources.
-                                unsafe { self.redraw(document)? };
+                                self.mark_full();
+                                unsafe { self.redraw_if_dirty(document)? };
                                 return Ok(());
                             }
                             if action.starts_with("window.") && action.ends_with(".move") {
@@ -433,8 +427,7 @@ impl X11App {
                                 }
                             }
                         }
-                        // SAFETY: The caller owns a live X11 display and app resources.
-                        unsafe { self.redraw(document)? };
+                        self.mark_full();
                     }
                 }
                 BUTTON_RELEASE => {
@@ -504,8 +497,7 @@ impl X11App {
                             )?;
                         }
                     }
-                    // SAFETY: The caller owns a live X11 display and app resources.
-                    unsafe { self.redraw(document)? };
+                    self.mark_full();
                     let hover = self.hit_test(document, button.x as f32, button.y as f32);
                     self.interaction.hover = hover;
                     self.update_cursor(document, hover);
@@ -524,9 +516,14 @@ impl X11App {
                 }
                 _ => {}
             }
+            // Coalesce: at most one redraw_if_dirty per drained event.
+            // Damage marks above merge (max coverage); Expose presented
+            // directly. single_event returns after that single paint.
             if self.single_event {
+                unsafe { self.redraw_if_dirty(document)? };
                 return Ok(());
             }
+            unsafe { self.redraw_if_dirty(document)? };
         }
     }
 
@@ -541,8 +538,7 @@ impl X11App {
         F: FnMut(&ActionEvent, &mut RuntimeDocument) -> Result<(), String>,
         R: FnMut(&mut RuntimeDocument) -> Result<(), String>,
     {
-        // SAFETY: The caller owns a live X11 display and app resources.
-        unsafe { self.redraw(document)? };
+        // No unconditional redraw on entry; reactor ticks/damage drive paints.
         loop {
             reactor.dispatch(None).map_err(|error| error.to_string())?;
             on_reactor(document)?;
@@ -568,28 +564,18 @@ impl X11App {
     }
 
     pub(crate) unsafe fn refresh_shape_mask(&self, document: &RuntimeDocument) {
-        // Top-level rounded popup/menu/dropdown visible shape: root radius
-        // plus surface bounds. Square surfaces skip the bridge entirely.
-        let radius = flamewm_render_core::paint::root_corner_radius(document, self.interaction);
-        let shape =
-            flamewm_render_core::paint::surface_shape_pixels(self.width, self.height, radius);
-        if shape.2 == 0 {
-            return;
-        }
-        let Some(bridge) = self.xshape.as_ref() else {
-            eprintln!(
-                "FLAMEWM_RENDER_SHAPE_BACKEND degraded-square-corners reason=xshape-unavailable"
-            );
+        // Retained path: derive VisualCoverage from the cached paint vector.
+        // No layout clone, no command rebuild, no second coverage per frame.
+        let Some(cached) = self.cached_paint.as_ref() else {
             return;
         };
-        let spans = rounded_mask_spans(shape.0, shape.1, shape.2);
-        // SAFETY: window is a live X window on the bridge's display.
-        if let Err(error) = unsafe { bridge.apply_rounded_mask(self.window, &spans) } {
-            eprintln!("FLAMEWM_RENDER_SHAPE_BACKEND degraded-square-corners reason={error}");
-        }
+        let _ = document.ui_scale();
+        unsafe { self.refresh_shape_mask_from_coverage(&cached.commands) };
     }
 
     pub(crate) unsafe fn recreate_backbuffer(&mut self) -> Result<(), String> {
+        // Resize retarget lifecycle: new pixmap first, retarget Xft/XRender
+        // (Pictures freed before Pixmaps on failure paths), then swap.
         // SAFETY: self.display and self.window are live handles owned by this app.
         let replacement = unsafe {
             XCreatePixmap(
@@ -603,6 +589,9 @@ impl X11App {
         if replacement == 0 {
             return Err("XCreatePixmap failed while resizing retained backbuffer".to_string());
         }
+        // Free the old XRender destination Picture before the old Pixmap:
+        // retarget creates the replacement picture first, then the backend
+        // drops the stale picture; the stale pixmap is freed only after swap.
         if let Some(xft) = self.xft.as_mut() {
             // SAFETY: `replacement` is a fresh pixmap on the live display.
             unsafe { xft.set_drawable(replacement) };
@@ -621,6 +610,9 @@ impl X11App {
         }
         let previous = self.backbuffer;
         self.backbuffer = replacement;
+        if let Some(surface) = self.surface.as_mut() {
+            surface.pixmap = replacement;
+        }
         if previous != 0 {
             // SAFETY: previous is the app-owned pixmap replaced above.
             unsafe { XFreePixmap(self.display, previous) };

@@ -76,10 +76,11 @@ pub fn terminal_program() -> String {
 }
 
 /// Entry context rows. Trash exposes Empty Trash only; normal entries expose
-/// Create Shortcut plus Delete (which the caller must confirm first).
+/// Rename, Create Shortcut, plus Delete (which the caller must confirm first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryMenuAction {
     EmptyTrash,
+    Rename,
     CreateShortcut,
     Delete,
 }
@@ -89,6 +90,7 @@ impl EntryMenuAction {
     pub const fn label(self) -> &'static str {
         match self {
             Self::EmptyTrash => "Empty Trash",
+            Self::Rename => "Rename",
             Self::CreateShortcut => "Create Shortcut",
             Self::Delete => "Delete",
         }
@@ -100,8 +102,101 @@ pub fn entry_context_menu(is_trash: bool) -> Vec<EntryMenuAction> {
     if is_trash {
         vec![EntryMenuAction::EmptyTrash]
     } else {
-        vec![EntryMenuAction::CreateShortcut, EntryMenuAction::Delete]
+        vec![
+            EntryMenuAction::Rename,
+            EntryMenuAction::CreateShortcut,
+            EntryMenuAction::Delete,
+        ]
     }
+}
+
+/// Validate a proposed entry file name. Returns the trimmed name on success.
+pub fn validate_rename_name(name: &str) -> FlameResult<String> {
+    use std::path::Component;
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err(FlameError::new(
+            ErrorCode::InvalidArgument,
+            "invalid rename name",
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\0') {
+        return Err(FlameError::new(
+            ErrorCode::InvalidArgument,
+            "invalid rename name",
+        ));
+    }
+    let mut components = Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(trimmed.to_owned()),
+        _ => Err(FlameError::new(
+            ErrorCode::InvalidArgument,
+            "invalid rename name",
+        )),
+    }
+}
+
+/// Rename `old` to `new` without replacing an existing destination.
+/// Both paths must live in the same directory; no shell involved.
+pub fn rename_entry_no_replace(old: &Path, new: &Path) -> FlameResult<()> {
+    let old_parent = old
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| FlameError::new(ErrorCode::InvalidArgument, "rename needs a parent"))?;
+    let new_parent = new
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| FlameError::new(ErrorCode::InvalidArgument, "rename needs a parent"))?;
+    if old_parent != new_parent {
+        return Err(FlameError::new(
+            ErrorCode::InvalidArgument,
+            "rename must stay in the same directory",
+        ));
+    }
+    let old_name = old
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| FlameError::new(ErrorCode::InvalidArgument, "invalid rename source"))?;
+    let new_name = new
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| FlameError::new(ErrorCode::InvalidArgument, "invalid rename target"))?;
+    let validated = validate_rename_name(new_name)?;
+    if old_name == validated {
+        return Err(FlameError::new(
+            ErrorCode::InvalidArgument,
+            "rename name unchanged",
+        ));
+    }
+    if !old.exists() && !old.is_symlink() {
+        return Err(FlameError::new(
+            ErrorCode::NotFound,
+            "rename source not found",
+        ));
+    }
+    if new.exists() || new.is_symlink() {
+        return Err(FlameError::new(
+            ErrorCode::Conflict,
+            "rename target already exists",
+        ));
+    }
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        old,
+        rustix::fs::CWD,
+        new,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::NOENT => FlameError::new(ErrorCode::NotFound, "rename source not found"),
+        rustix::io::Errno::EXIST => {
+            FlameError::new(ErrorCode::Conflict, "rename target already exists")
+        }
+        rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP => {
+            FlameError::new(ErrorCode::Unsupported, "atomic rename not supported")
+        }
+        other => FlameError::new(ErrorCode::IoFailure, format!("rename entry: {other}")),
+    })
 }
 
 /// How a desktop item opens. `.desktop` entries launch via `DesktopEntry`;
@@ -159,7 +254,11 @@ mod tests {
         assert_eq!(entry_context_menu(true), vec![EntryMenuAction::EmptyTrash]);
         assert_eq!(
             entry_context_menu(false),
-            vec![EntryMenuAction::CreateShortcut, EntryMenuAction::Delete]
+            vec![
+                EntryMenuAction::Rename,
+                EntryMenuAction::CreateShortcut,
+                EntryMenuAction::Delete
+            ]
         );
     }
 

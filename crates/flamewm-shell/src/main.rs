@@ -11,8 +11,9 @@ use flamewm_api::settings::{SettingValue, SettingsSnapshot, SettingsTransaction}
 use flamewm_control_core::ControlRequest;
 use flamewm_control_dbus::ControlClient;
 use flamewm_dbus_reactor::BusKind;
-use flamewm_integrations_linux::icons::IconResolver;
 use flamewm_reactor::Reactor;
+use flamewm_shell::async_projection::{self, StartViewNote};
+use flamewm_shell::icon_loader::IconLoader;
 use flamewm_shell::start::StartCategory;
 use flamewm_shell::{projection, start, ShellControl, ShellRuntime, ShellSnapshot, ShellSurfaces};
 use flamewm_shell_core::clock::ClockDateTracker;
@@ -33,6 +34,14 @@ fn main() {
 }
 
 fn execute() -> Result<(), String> {
+    flamewm_profiler::init_process("flamewm-shell");
+    let startup = flamewm_profiler::ProfilePoint::new("shell.startup.total");
+    let startup_guard = startup.start();
+    {
+        let point = flamewm_profiler::ProfilePoint::new("shell.startup.connect");
+        let _s = point.start();
+        let _ = flamewm_profiler::CounterPoint::new("shell.startup.connect").increment();
+    }
     let client = ControlClient::connect(BusKind::Session)
         .map_err(|error| format!("connect control session: {}", error.message))?;
     let snapshot = ShellSnapshot::load(&client)?;
@@ -40,16 +49,29 @@ fn execute() -> Result<(), String> {
         SurfaceRuntime::new().map_err(|error| format!("create UI runtime: {error:?}"))?;
     let surfaces = ShellSurfaces::create(&mut runtime, &snapshot)?;
     let start_model = start::state(snapshot.applications.clone());
-    let mut icon_resolver = IconResolver::from_environment(packaged_root(), 0);
-    project_initial(
-        &mut runtime,
-        &surfaces,
-        &snapshot,
-        &start_model,
-        &mut icon_resolver,
-    )?;
-    // Panel paints in the renderer create/show path; no explicit
+    {
+        let point = flamewm_profiler::ProfilePoint::new("shell.startup.project_panel");
+        let _s = point.start();
+        project_panel_critical(&mut runtime, &surfaces, &snapshot, &start_model)?;
+    }
+    {
+        let show = flamewm_profiler::ProfilePoint::new("shell.panel_show");
+        let _s = show.start();
+        runtime
+            .show(surfaces.panel)
+            .map_err(|e| format!("show panel: {e:?}"))?;
+    }
+    {
+        let point = flamewm_profiler::ProfilePoint::new("shell.startup.reactor");
+        let _s = point.start();
+    }
+    let loader_root = packaged_root();
     // flush_visible patch is kept here.
+
+    drop(startup_guard);
+    let profile_interval = profile_interval_secs();
+    let profile_due = Arc::new(AtomicBool::new(false));
+    let profile_flag = Arc::clone(&profile_due);
 
     let mut reactor = Reactor::new().map_err(|error| format!("create reactor: {error}"))?;
     let clock_due = Arc::new(AtomicBool::new(false));
@@ -73,30 +95,48 @@ fn execute() -> Result<(), String> {
         ShellRuntime::new(snapshot),
         surfaces,
         start_model,
-        icon_resolver,
         client,
+        loader_root,
     )));
     let event_state = Rc::clone(&state);
     let tick_state = Rc::clone(&state);
+    let tick_profile_flag = Arc::clone(&profile_due);
+    reactor
+        .register_timer(Duration::from_secs(5), false, move || {
+            tick_profile_flag.store(true, Ordering::Release);
+        })
+        .map_err(|error| format!("register profile one-shot: {error}"))?;
+    reactor
+        .register_timer(Duration::from_secs(profile_interval), true, move || {
+            profile_flag.store(true, Ordering::Release)
+        })
+        .map_err(|error| format!("register profile timer: {error}"))?;
     run_surface_runtime_with_reactor_access(
         &mut runtime,
         &mut reactor,
         move |event: SurfaceEvent, runtime| event_state.borrow_mut().route_event(event, runtime),
-        move |runtime| tick_state.borrow_mut().tick(runtime, &clock_due),
+        {
+            let tick_profile = Arc::clone(&profile_due);
+            move |runtime| {
+                if tick_profile.swap(false, Ordering::Acquire) {
+                    let _ = flamewm_profiler::report_window();
+                }
+                tick_state.borrow_mut().tick(runtime, &clock_due)
+            }
+        },
     )
     .map_err(|error| format!("surface runtime: {error:?}"))
 }
 
-fn project_initial(
+fn project_panel_critical(
     runtime: &mut SurfaceRuntime,
     surfaces: &ShellSurfaces,
     snapshot: &ShellSnapshot,
     start_model: &flamewm_shell_core::StartModel,
-    icon_resolver: &mut IconResolver,
 ) -> Result<(), String> {
     runtime
         .with_document(surfaces.panel, |document| {
-            projection::project_panel(document, snapshot, icon_resolver)
+            async_projection::project_panel_async(document, snapshot, None)
         })
         .map_err(|error| format!("project panel: {error:?}"))?;
     runtime
@@ -110,50 +150,6 @@ fn project_initial(
             )
         })
         .map_err(|error| format!("project start: {error:?}"))?;
-    runtime
-        .with_document(surfaces.start_submenu, |document| {
-            projection::project_start_submenu(
-                document,
-                start_model,
-                StartCategory::All,
-                "",
-                &snapshot.session,
-                icon_resolver,
-            )
-        })
-        .map_err(|error| format!("project start submenu: {error:?}"))?;
-    runtime
-        .with_document(surfaces.task_menu, |document| {
-            projection::project_task_menu(document, snapshot)
-        })
-        .map_err(|error| format!("project task menu: {error:?}"))?;
-    runtime
-        .with_document(surfaces.media, |document| {
-            projection::project_media(document, snapshot)
-        })
-        .map_err(|error| format!("project media: {error:?}"))?;
-    runtime
-        .with_document(surfaces.audio, |document| {
-            projection::project_audio(document, snapshot)
-        })
-        .map_err(|error| format!("project audio: {error:?}"))?;
-    runtime
-        .with_document(surfaces.network, |document| {
-            projection::project_network(document, snapshot)
-        })
-        .map_err(|error| format!("project network: {error:?}"))?;
-    runtime
-        .with_document(surfaces.network, |document| {
-            projection::project_network_secret(document, "")
-        })
-        .map_err(|error| format!("project network secret: {error:?}"))?;
-    let calendar = projection::current_calendar()
-        .ok_or_else(|| "local calendar date could not be projected".to_owned())?;
-    runtime
-        .with_document(surfaces.calendar, |document| {
-            projection::project_calendar(document, &calendar)
-        })
-        .map_err(|error| format!("project calendar: {error:?}"))?;
     Ok(())
 }
 
@@ -161,7 +157,6 @@ struct ShellLoop {
     shell: ShellRuntime,
     surfaces: ShellSurfaces,
     start_model: flamewm_shell_core::StartModel,
-    icon_resolver: IconResolver,
     control: ControlClient,
     start_category: StartCategory,
     start_query: String,
@@ -176,6 +171,9 @@ struct ShellLoop {
     network_query: NetworkQuery,
     settings_revision: u64,
     settings_cache: Option<SettingsSnapshot>,
+    icon_loader: Option<IconLoader>,
+    loader_root: std::path::PathBuf,
+    start_view: StartViewNote,
 }
 
 impl ShellLoop {
@@ -183,14 +181,13 @@ impl ShellLoop {
         shell: ShellRuntime,
         surfaces: ShellSurfaces,
         start_model: flamewm_shell_core::StartModel,
-        icon_resolver: IconResolver,
         control: ControlClient,
+        loader_root: std::path::PathBuf,
     ) -> Self {
         Self {
             shell,
             surfaces,
             start_model,
-            icon_resolver,
             control,
             start_category: StartCategory::All,
             start_query: String::new(),
@@ -205,12 +202,13 @@ impl ShellLoop {
             network_query: NetworkQuery::default(),
             settings_revision: 0,
             settings_cache: None,
+            icon_loader: None,
+            loader_root,
+            start_view: StartViewNote::default(),
         }
     }
 
     fn refresh_settings_revision(&mut self) -> Result<(), UiBackendError> {
-        // Secret buffer containment: the password is never logged or
-        // persisted; only the boolean toggle travels via settings.
         match self.control.call(&ControlRequest::GetSettings) {
             Ok(flamewm_control_core::ControlResponse::Settings(snapshot)) => {
                 self.settings_revision = snapshot.revision;
@@ -233,11 +231,6 @@ impl ShellLoop {
         runtime: &mut SurfaceRuntime,
     ) -> Result<(), UiBackendError> {
         let action = event.action.action.as_str();
-        // Typed Primary/Secondary routing at the top of dispatch: wheel
-        // buttons map to scroll deltas (handled per scroll container below),
-        // ordinary activation is Primary-only, and Secondary is a no-op
-        // except task slot -> task context, workspace dot -> workspace
-        // context, blank taskbar -> taskbar context. start.search/start.app
         // never activate on Secondary.
         let button = PointerButton::from_raw_x(event.action.button);
         if matches!(button, PointerButton::WheelUp | PointerButton::WheelDown) {
@@ -246,7 +239,7 @@ impl ShellLoop {
         }
         let release_inside = event.action.phase == ActionPhase::Release && event.action.inside;
         if release_inside && matches!(button, PointerButton::Secondary) {
-            return self.route_secondary(action, runtime);
+            return self.route_secondary(&event, runtime);
         }
         if event.action.phase == ActionPhase::Release && !matches!(button, PointerButton::Primary) {
             return Ok(());
@@ -308,8 +301,6 @@ impl ShellLoop {
             return self.apply_controls(runtime);
         }
 
-        // Dead path: Secondary routing now happens exclusively in
-        // `route_secondary` at the top of dispatch. Primary never opens
         // context menus here.
         if false {
             if let Some(slot) = action
@@ -427,8 +418,6 @@ impl ShellLoop {
 
         if action.starts_with("workspace-") || action.starts_with("workspace.") {
             if event.action.phase == ActionPhase::Release && event.action.inside {
-                // Pager clicks go through the existing workspace pager route
-                // (`control_request_for_action` -> ActivateWorkspace).
                 let request = self.shell.control_request_for_action(action);
                 if let Some(request) = request {
                     self.control.call(&request).map_err(|error| {
@@ -437,7 +426,6 @@ impl ShellLoop {
                             error.message
                         ))
                     })?;
-                    // Pager clicks mutate workspace state; resnapshot once.
                     self.refresh_dynamic(runtime);
                 }
             }
@@ -447,7 +435,20 @@ impl ShellLoop {
         let category_hover = event.action.phase == ActionPhase::Hover
             && event.action.inside
             && action.starts_with("start.category.");
-        if category_hover || (event.action.phase == ActionPhase::Release && event.action.inside) {
+        if category_hover {
+            if !self
+                .start_view
+                .note_start_view(self.start_category, &self.start_query)
+            {
+                return Ok(());
+            }
+            let transition = flamewm_profiler::ProfilePoint::new("shell.category_transition");
+            let _s = transition.start();
+            self.shell.dispatch(action);
+            self.apply_controls(runtime)?;
+            return Ok(());
+        }
+        if event.action.phase == ActionPhase::Release && event.action.inside {
             self.shell.dispatch(action);
             self.apply_controls(runtime)?;
         }
@@ -456,13 +457,10 @@ impl ShellLoop {
 
     fn route_secondary(
         &mut self,
-        action: &str,
+        event: &SurfaceEvent,
         runtime: &mut SurfaceRuntime,
     ) -> Result<(), UiBackendError> {
-        // Secondary is a no-op except: task slot -> task context,
-        // workspace dot -> workspace context, blank taskbar -> taskbar
-        // context (closes transients to expose the panel). start.search and
-        // start.app never activate on Secondary.
+        let action = event.action.action.as_str();
         if action == "start.search" || action.starts_with("start.app.") {
             return Ok(());
         }
@@ -471,8 +469,10 @@ impl ShellLoop {
             .and_then(|value| value.parse::<usize>().ok())
             .and_then(|slot| slot.checked_sub(1))
         {
-            self.shell
-                .open_task_context_at_slot(slot, Some(self.surfaces.root_pointer(0.0, 0.0)));
+            self.shell.open_task_context_at_slot(
+                slot,
+                Some(self.surfaces.root_pointer(event.action.x, event.action.y)),
+            );
             return self.apply_controls(runtime);
         }
         if let Some(slot) = action
@@ -480,8 +480,10 @@ impl ShellLoop {
             .and_then(|value| value.parse::<usize>().ok())
             .and_then(|slot| slot.checked_sub(1))
         {
-            self.shell
-                .open_workspace_context_at_slot(slot, Some(self.surfaces.root_pointer(0.0, 0.0)));
+            self.shell.open_workspace_context_at_slot(
+                slot,
+                Some(self.surfaces.root_pointer(event.action.x, event.action.y)),
+            );
             return self.apply_controls(runtime);
         }
         if action == "taskbar.surface" {
@@ -492,8 +494,6 @@ impl ShellLoop {
     }
 
     fn apply_wheel_scroll(&mut self, event: &SurfaceEvent, _runtime: &mut SurfaceRuntime) {
-        // Wheel ticks adjust retained scroll offsets on scroll containers
-        // (audio/network/start lists); rendering reads them on next redraw.
         let button = PointerButton::from_raw_x(event.action.button);
         let delta = match button {
             PointerButton::WheelUp => -48.0,
@@ -545,15 +545,15 @@ impl ShellLoop {
                         .map_err(UiBackendError::Renderer)?;
                 }
                 ShellControl::OpenPopover(name) => {
-                    // Prefer measured anchoring when the panel source node is
-                    // known; fall back to the legacy slot rect otherwise.
-                    let anchored = self
-                        .surfaces
+                    // then places + re-measures.
+                    self.project_status_content(runtime)?;
+                    self.surfaces
                         .open_status(runtime, &name)
-                        .map_err(UiBackendError::Renderer);
-                    anchored.map(|_| {
-                        self.start_open = false;
-                    })?
+                        .map_err(UiBackendError::Renderer)?;
+                    self.surfaces
+                        .remeasure_open_popup(runtime)
+                        .map_err(UiBackendError::Renderer)?;
+                    self.start_open = false;
                 }
                 ShellControl::SystemAction {
                     action,
@@ -616,8 +616,6 @@ impl ShellLoop {
     }
 
     fn context_system_request(&mut self, action: &str) -> Option<ControlRequest> {
-        // Audio UX: Devices/Applications tabs, raise-maximum toggle (cap
-        // 100/150 persisted via settings), typed SystemAction only.
         if action == "audio.tab.devices" {
             self.audio_tab = AudioTab::Devices;
             return None;
@@ -630,7 +628,6 @@ impl ShellLoop {
             self.audio_settings.raise_maximum = !self.audio_settings.raise_maximum;
             let raise = self.audio_settings.raise_maximum;
             let revision = self.settings_revision;
-            // Persist via settings; failure is non-fatal for the toggle.
             let _ = self
                 .control
                 .call(&ControlRequest::ApplySettings(SettingsTransaction {
@@ -759,29 +756,119 @@ impl ShellLoop {
         self.project_network_secret(runtime)
     }
 
+    fn project_status_content(
+        &mut self,
+        runtime: &mut SurfaceRuntime,
+    ) -> Result<(), UiBackendError> {
+        let _ = runtime;
+        Ok(())
+    }
+
     fn project_start(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), UiBackendError> {
-        let start_model = &self.start_model;
-        let resolver = &mut self.icon_resolver;
+        let open = flamewm_profiler::ProfilePoint::new("shell.start.open");
+        let _s = open.start();
+        let start_model = self.start_model.clone();
+        let category = self.start_category;
+        let query = self.start_query.clone();
+        let session = self.shell.snapshot().session.clone();
+        self.ensure_loader();
         runtime.with_document(self.surfaces.start, |document| {
-            projection::project_start(
-                document,
-                start_model,
-                self.start_category,
-                &self.start_query,
-                &self.shell.snapshot().session,
-            )
+            projection::project_start(document, &start_model, category, &query, &session)
         })?;
+        let loader = self.icon_loader.as_mut();
         runtime.with_document(self.surfaces.start_submenu, |document| {
-            projection::project_start_submenu(
+            async_projection::project_start_submenu_async(
                 document,
-                start_model,
-                self.start_category,
-                &self.start_query,
-                &self.shell.snapshot().session,
-                resolver,
+                &start_model,
+                category,
+                &query,
+                &session,
+                loader,
             )
         })?;
         Ok(())
+    }
+
+    fn ensure_loader(&mut self) {
+        if self.icon_loader.is_none() {
+            self.icon_loader = Some(IconLoader::spawn(self.loader_root.clone()));
+        }
+    }
+
+    fn drain_icons(&mut self, runtime: &mut SurfaceRuntime) {
+        self.ensure_loader();
+        let results = self
+            .icon_loader
+            .as_mut()
+            .map(|loader| loader.drain_ready())
+            .unwrap_or_default();
+        if self
+            .icon_loader
+            .as_ref()
+            .map(|l| l.queue_full_drops)
+            .unwrap_or(0)
+            > 0
+            || self
+                .icon_loader
+                .as_ref()
+                .map(|l| l.stale_drops)
+                .unwrap_or(0)
+                > 0
+        {
+            if let Some(loader) = self.icon_loader.as_ref() {
+                async_projection::note_loader_stats(loader);
+            }
+        }
+        if results.is_empty() {
+            return;
+        }
+        // panel + Start reproject).
+        let mut need_panel = false;
+        let mut need_submenu = false;
+        for res in &results {
+            let raster = match &res.raster {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            let image = flamewm_ui_x11::RuntimeImage {
+                source: raster.source.clone(),
+                width: raster.width,
+                height: raster.height,
+                pixels: raster.pixels.clone(),
+            };
+            async_projection::note_icon_result(&res.name, raster.width, raster.height, image);
+            match flamewm_shell::icon_loader::IconLoader::dependent_surface(res.target) {
+                flamewm_shell::icon_loader::DependentSurface::Panel => need_panel = true,
+                flamewm_shell::icon_loader::DependentSurface::StartSubmenu => need_submenu = true,
+            }
+        }
+        if !need_panel && !need_submenu {
+            return;
+        }
+        let snapshot = self.shell.snapshot().clone();
+        let start_model = self.start_model.clone();
+        let category = self.start_category;
+        let query = self.start_query.clone();
+        let session = snapshot.session.clone();
+        if need_panel {
+            let _ = runtime.with_document(self.surfaces.panel, |document| {
+                async_projection::project_panel_async(document, &snapshot, None)
+            });
+            let _ = runtime.redraw(self.surfaces.panel);
+        }
+        if need_submenu {
+            let _ = runtime.with_document(self.surfaces.start_submenu, |document| {
+                async_projection::project_start_submenu_async(
+                    document,
+                    &start_model,
+                    category,
+                    &query,
+                    &session,
+                    None,
+                )
+            });
+            let _ = runtime.redraw(self.surfaces.start_submenu);
+        }
     }
 
     fn launch_start_slot(
@@ -825,7 +912,6 @@ impl ShellLoop {
                 UiBackendError::Renderer(format!("task action failed: {}", error.message))
             })?;
         }
-        // Task clicks mutate managed state; resnapshot and reproject once.
         self.refresh_dynamic(runtime);
         Ok(())
     }
@@ -855,50 +941,53 @@ impl ShellLoop {
             self.network_secret.clear();
             self.network_secret_request_id = request_id;
         }
-        let snapshot = self.shell.snapshot();
-        let resolver = &mut self.icon_resolver;
-        let start_model = &self.start_model;
+        let snapshot = self.shell.snapshot().clone();
+        let start_model = self.start_model.clone();
         let category = self.start_category;
         let query = self.start_query.clone();
         let session = snapshot.session.clone();
         let network_secret = self.network_secret.clone();
-        let projected = runtime
-            .with_document(self.surfaces.panel, |document| {
-                projection::project_panel(document, snapshot, resolver)
-            })
+        self.ensure_loader();
+        let loader = self.icon_loader.as_mut();
+        let panel_result = runtime.with_document(self.surfaces.panel, |document| {
+            async_projection::project_panel_async(document, &snapshot, loader)
+        });
+        let projected = panel_result
             .and_then(|_| {
                 runtime.with_document(self.surfaces.media, |document| {
-                    projection::project_media(document, snapshot)
+                    projection::project_media(document, &snapshot)
                 })
             })
             .and_then(|_| {
                 runtime.with_document(self.surfaces.audio, |document| {
-                    projection::project_audio(document, snapshot)
+                    projection::project_audio(document, &snapshot)
                 })
             })
             .and_then(|_| {
                 runtime.with_document(self.surfaces.network, |document| {
-                    projection::project_network(document, snapshot)?;
+                    projection::project_network(document, &snapshot)?;
                     projection::project_network_secret(document, &network_secret)
                 })
             })
             .and_then(|_| {
                 runtime.with_document(self.surfaces.start, |document| {
-                    projection::project_start(document, start_model, category, &query, &session)
-                })
-            })
-            .and_then(|_| {
-                runtime.with_document(self.surfaces.start_submenu, |document| {
-                    projection::project_start_submenu(
-                        document,
-                        start_model,
-                        category,
-                        &query,
-                        &session,
-                        resolver,
-                    )
+                    projection::project_start(document, &start_model, category, &query, &session)
                 })
             });
+        let submenu_result = {
+            let loader = self.icon_loader.as_mut();
+            runtime.with_document(self.surfaces.start_submenu, |document| {
+                async_projection::project_start_submenu_async(
+                    document,
+                    &start_model,
+                    category,
+                    &query,
+                    &session,
+                    loader,
+                )
+            })
+        };
+        let projected = projected.and(submenu_result);
         if projected.is_ok() {
             for surface in [
                 self.surfaces.panel,
@@ -920,6 +1009,7 @@ impl ShellLoop {
         runtime: &mut SurfaceRuntime,
         clock_due: &AtomicBool,
     ) -> Result<(), UiBackendError> {
+        self.drain_icons(runtime);
         if !clock_due.swap(false, Ordering::Acquire) {
             return Ok(());
         }
@@ -929,8 +1019,6 @@ impl ShellLoop {
         })?;
         runtime.redraw(self.surfaces.panel)?;
 
-        // Clock consumes wall_clock_delay_ms/ClockDateTracker from
-        // shell-core clock.rs: date refresh fires only on local-date change.
         let date = (now.year(), now.month() as u8, now.day() as u8);
         if self.date_tracker.date_changed(date) {
             let calendar = projection::calendar_for_date(date).ok_or_else(|| {
@@ -942,8 +1030,6 @@ impl ShellLoop {
             runtime.redraw(self.surfaces.calendar)?;
             self.local_date = date;
         }
-        // Event-driven dynamic refresh piggybacks the existing clock tick;
-        // revision/content gating lives in `resnapshot_dynamic`, no new
         // polling timer is created.
         self.refresh_dynamic(runtime);
         Ok(())
@@ -952,6 +1038,10 @@ impl ShellLoop {
 
 fn epoch_ms() -> u64 {
     Local::now().timestamp_millis().max(0) as u64
+}
+
+fn profile_interval_secs() -> u64 {
+    flamewm_profiler::profile_interval_secs()
 }
 
 fn packaged_root() -> PathBuf {

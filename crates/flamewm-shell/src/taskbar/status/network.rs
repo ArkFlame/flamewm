@@ -5,9 +5,9 @@ use flamewm_shell_core::{NetworkPopoverModel, NetworkView};
 use super::super::intent::StatusIntent;
 
 /// Maximum network rows a popover page can show. The compiled network
-/// template exposes three `network-slot-N` rows; paging selects which AP
+/// template exposes eight `network-slot-N` rows; paging selects which AP
 /// model rows map into those slots. The model itself is never truncated.
-pub const NETWORK_SLOT_COUNT: usize = 3;
+pub const NETWORK_SLOT_COUNT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkRowView {
@@ -44,7 +44,10 @@ pub struct NetworkPopoverView {
 #[must_use]
 pub fn project(snapshot: &SystemSnapshot) -> NetworkView {
     let mut view = flamewm_shell_core::StatusViews::from_snapshot(snapshot).network;
-    view.visible = snapshot.network.availability == ServiceAvailability::Available;
+    // Availability matrix: Unknown visible but disabled, Available visible
+    // and enabled, Unavailable hidden. Intent/popover stay Available-only.
+    view.visible = snapshot.network.availability != ServiceAvailability::Unavailable;
+    view.enabled = snapshot.network.availability == ServiceAvailability::Available;
     view
 }
 
@@ -97,6 +100,18 @@ pub fn slot_path(snapshot: &NetworkSnapshot, slot: usize) -> Option<String> {
         .into_iter()
         .find(|(page_slot, _)| *page_slot == slot)
         .map(|(_, path)| path)
+}
+
+/// Snapshot AP count (full model rows, never the paged window).
+#[must_use]
+pub fn snapshot_ap_count(snapshot: &NetworkSnapshot) -> usize {
+    snapshot.access_points.len()
+}
+
+/// Visible-row count for the active page (what projection maps into slots).
+#[must_use]
+pub fn project_visible_count(snapshot: &NetworkSnapshot) -> usize {
+    paged_paths(snapshot).len()
 }
 
 /// Stable slot index for an AP path on the active page.
@@ -227,6 +242,24 @@ fn ceil_div(total: usize, per_page: usize) -> usize {
 mod tests {
     use super::*;
     use flamewm_api::system::NetworkAccessPointSnapshot;
+
+    #[test]
+    fn availability_matrix_unknown_visible_disabled_available_enabled_unavailable_hidden() {
+        let mut snapshot = SystemSnapshot::default();
+        snapshot.network.availability = ServiceAvailability::Unknown;
+        let view = project(&snapshot);
+        assert!(view.visible, "Unknown stays visible");
+        assert!(!view.enabled, "Unknown stays disabled");
+        assert!(intent(&snapshot).is_none(), "intent stays Available-only");
+        assert!(popover(&snapshot).is_none(), "popover stays Available-only");
+        snapshot.network.availability = ServiceAvailability::Available;
+        let view = project(&snapshot);
+        assert!(view.visible && view.enabled);
+        snapshot.network.availability = ServiceAvailability::Unavailable;
+        let view = project(&snapshot);
+        assert!(!view.visible, "Unavailable hidden");
+        assert!(!view.enabled);
+    }
 
     #[test]
     fn known_path_maps_to_revision_fenced_connect() {

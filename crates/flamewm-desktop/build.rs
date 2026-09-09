@@ -4,14 +4,7 @@ use std::path::{Path, PathBuf};
 
 use flamewm_render_compiler::{CompileOptions, CompileOutput, compile_file, encode};
 
-const DESKTOP_ASSETS: [&str; 6] = [
-    "wallpaper.ppm",
-    "watermark.ppm",
-    "menu-folder.ppm",
-    "desktop-browser.ppm",
-    "desktop-projects.ppm",
-    "desktop-trash.ppm",
-];
+const DESKTOP_ASSETS: [&str; 2] = ["wallpaper.ppm", "watermark.ppm"];
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -22,8 +15,10 @@ fn main() {
     let html_path = manifest.join("../../ui/desktop/index.html");
     let css_path = manifest.join("../../ui/desktop/desktop.css");
     let raster = root.join("assets/raster");
+    let breeze = root.join("assets/web/breeze");
     println!("cargo:rerun-if-changed={}", html_path.display());
     println!("cargo:rerun-if-changed={}", css_path.display());
+    println!("cargo:rerun-if-changed={}", breeze.display());
     for asset in DESKTOP_ASSETS {
         println!("cargo:rerun-if-changed={}", raster.join(asset).display());
     }
@@ -33,11 +28,11 @@ fn main() {
         .map(|index| {
             format!(
                 "<button id=\"desktop-item-{index}\" class=\"desktop-item\" data-action=\"desktop.item.{index}\">\
-<img id=\"desktop-glyph-{index}-desktop-launcher\" class=\"desktop-glyph\" src=\"assets/desktop-browser.ppm\">\
-<img id=\"desktop-glyph-{index}-file\" class=\"desktop-glyph\" src=\"assets/desktop-projects.ppm\">\
-<img id=\"desktop-glyph-{index}-symlink\" class=\"desktop-glyph\" src=\"assets/menu-folder.ppm\">\
-<img id=\"desktop-glyph-{index}-trash\" class=\"desktop-glyph\" src=\"assets/desktop-trash.ppm\">\
-<img id=\"desktop-glyph-{index}-directory\" class=\"desktop-glyph\" src=\"assets/menu-folder.ppm\">\
+<img id=\"desktop-glyph-{index}-desktop-launcher\" class=\"desktop-glyph\" src=\"assets/breeze/internet-web-browser.svg\">\
+<img id=\"desktop-glyph-{index}-file\" class=\"desktop-glyph\" src=\"assets/breeze/folder-documents.svg\">\
+<img id=\"desktop-glyph-{index}-symlink\" class=\"desktop-glyph\" src=\"assets/breeze/folder.svg\">\
+<img id=\"desktop-glyph-{index}-trash\" class=\"desktop-glyph\" src=\"assets/breeze/user-trash.svg\">\
+<img id=\"desktop-glyph-{index}-directory\" class=\"desktop-glyph\" src=\"assets/breeze/folder.svg\">\
 <div class=\"desktop-label\"><div id=\"desktop-label-{index}-line-1\" class=\"desktop-label-line\">&#8203;</div><div id=\"desktop-label-{index}-line-2\" class=\"desktop-label-line\">&#8203;</div></div>\
 </button>"
             )
@@ -54,6 +49,7 @@ fn main() {
     for asset in DESKTOP_ASSETS {
         fs::copy(raster.join(asset), staged_assets.join(asset)).expect("stage desktop asset");
     }
+    stage_tree(&breeze, &staged_assets.join("breeze"));
 
     let output = compile_file(
         &staged_ui.join("index.html"),
@@ -64,6 +60,17 @@ fn main() {
     validate_text_targets(&output);
     let bytes = encode(&output.document).expect("encode desktop UI");
     fs::write(out.join("flamewm-desktop.rwr"), bytes).expect("write desktop UI");
+}
+
+fn stage_tree(source: &Path, dest: &Path) {
+    fs::create_dir_all(dest).expect("create staged asset dir");
+    for entry in fs::read_dir(source).expect("read staged asset dir") {
+        let entry = entry.expect("read staged asset entry");
+        let path = entry.path();
+        if path.is_file() {
+            fs::copy(&path, dest.join(entry.file_name())).expect("stage asset file");
+        }
+    }
 }
 
 fn validate_text_targets(output: &CompileOutput) {

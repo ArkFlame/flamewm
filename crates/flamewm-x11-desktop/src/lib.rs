@@ -45,6 +45,7 @@ pub struct X11Desktop {
     atoms: BTreeMap<String, Atom>,
     next_transaction: u64,
     pending_mode: Option<PendingMode>,
+    catalog: Option<std::sync::Arc<ApplicationCatalog>>,
 }
 
 impl X11Desktop {
@@ -99,6 +100,26 @@ impl X11Desktop {
             atoms,
             next_transaction: 0,
             pending_mode: None,
+            catalog: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_application_catalog(mut self, catalog: std::sync::Arc<ApplicationCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    pub fn set_application_catalog(&mut self, catalog: std::sync::Arc<ApplicationCatalog>) {
+        self.catalog = Some(catalog);
+    }
+
+    fn application_catalog(&self) -> FlameResult<std::sync::Arc<ApplicationCatalog>> {
+        self.catalog.clone().ok_or_else(|| {
+            FlameError::new(
+                ErrorCode::Unavailable,
+                "application catalog is not injected",
+            )
         })
     }
 
@@ -541,9 +562,8 @@ impl ApplicationPort for X11Desktop {
         app: &DesktopAppId,
         options: &ApplicationLaunchOptions,
     ) -> FlameResult<()> {
-        ApplicationCatalog::discover()?
-            .launch(app, options)
-            .map(|_| ())
+        let catalog = self.application_catalog()?;
+        catalog.launch(app, options).map(|_| ())
     }
     fn launch_uri(&mut self, uri: &str) -> FlameResult<()> {
         Command::new("xdg-open")

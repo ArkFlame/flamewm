@@ -5,6 +5,7 @@
 /// Premultiply straight RGBA8 pixels into packed ARGB32 words.
 /// Word layout is `(a << 24) | (r << 16) | (g << 8) | b` with `r/g/b`
 /// already multiplied by alpha (`r * a / 255`, rounded).
+#[allow(dead_code)]
 pub fn premultiply_rgba8(pixels: &[u8]) -> Vec<u32> {
     pixels
         .chunks_exact(4)

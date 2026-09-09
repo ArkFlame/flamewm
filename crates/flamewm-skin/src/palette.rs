@@ -11,7 +11,7 @@ pub struct AlphaColor {
 
 pub const ACCENT: Rgb = Rgb(0xef4048);
 pub const DESKTOP: Rgb = Rgb(0x000000);
-pub const PANEL: Rgb = Rgb(0x000000);
+pub const PANEL: Rgb = Rgb(0x1b1e20);
 pub const SURFACE: Rgb = Rgb(0x202326);
 pub const SIDEBAR: Rgb = Rgb(0x1b1e20);
 pub const TEXT: Rgb = Rgb(0xf1f2f3);

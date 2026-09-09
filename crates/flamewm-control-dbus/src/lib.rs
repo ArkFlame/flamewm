@@ -10,8 +10,8 @@ use flamewm_api::ports::EnginePorts;
 use flamewm_api::{ErrorCode, FlameError, FlameResult};
 use flamewm_control_core::{ControlError, ControlRequest, Dispatcher, OBJECT_PATH};
 use flamewm_control_wire::{
-    ControlSignal, WireCall, WireReply, WireValue, decode_call, decode_reply, encode_call,
-    encode_reply, encode_signal,
+    ControlSignal, WireCall, WireReply, WireSignal, WireValue, decode_call, decode_reply,
+    decode_signal, encode_call, encode_reply, encode_signal,
 };
 use flamewm_dbus_reactor::{BusKind, BusPump, MessageDisposition};
 use flamewm_platform::host::PlatformHost;
@@ -174,6 +174,81 @@ impl ControlClient {
     }
 }
 
+pub struct ControlSignalClient {
+    pump: BusPump,
+}
+
+impl ControlSignalClient {
+    pub fn connect(kind: BusKind) -> FlameResult<Self> {
+        let pump = BusPump::connect(kind)?;
+        install_match_rule(&pump)?;
+        Ok(Self { pump })
+    }
+
+    pub fn connect_session() -> FlameResult<Self> {
+        Self::connect(BusKind::Session)
+    }
+
+    #[must_use]
+    pub fn watch(&self) -> flamewm_dbus_reactor::BusWatch {
+        self.pump.watch()
+    }
+
+    pub fn on_ready(&self, mut handler: impl FnMut(ControlSignal)) -> FlameResult<usize> {
+        self.pump
+            .on_ready(|message| match decode_bus_signal(message) {
+                Some(signal) => {
+                    handler(signal);
+                    MessageDisposition::Handled
+                }
+                None => MessageDisposition::Unhandled,
+            })
+    }
+}
+
+fn signal_match_rule() -> String {
+    format!("type='signal',path='{}'", OBJECT_PATH)
+}
+
+fn install_match_rule(pump: &BusPump) -> FlameResult<()> {
+    let call = Message::new_method_call(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "AddMatch",
+    )
+    .map_err(|error| invalid(&error))?;
+    let call = call.append1(signal_match_rule());
+    pump.send_with_reply(call, Duration::from_secs(5))
+        .map(|_| ())
+}
+
+/// Decode a raw D-Bus message into a Flame Control signal.
+///
+/// Returns `None` for non-signal traffic and for signals outside the Flame
+/// Control object path or wire vocabulary, so unrelated bus noise is ignored.
+pub fn decode_bus_signal(message: &Message) -> Option<ControlSignal> {
+    if message.msg_type() != MessageType::Signal {
+        return None;
+    }
+    if message.path().map(|path| path.to_string()) != Some(OBJECT_PATH.to_owned()) {
+        return None;
+    }
+    let interface = message.interface()?.to_string();
+    let member = message.member()?.to_string();
+    let args = message
+        .get_items()
+        .into_iter()
+        .map(from_item)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    decode_signal(&WireSignal {
+        interface,
+        member,
+        args,
+    })
+    .ok()
+}
 fn to_item(value: &WireValue) -> Result<MessageItem, String> {
     match value {
         WireValue::Bool(v) => Ok(MessageItem::Bool(*v)),
@@ -262,4 +337,54 @@ fn to_flame_error(error: ControlError) -> FlameError {
 }
 fn error_name(error: &FlameError) -> &'static str {
     flamewm_control_core::error_name(error.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signal_message(signal: &ControlSignal) -> Message {
+        let wire = encode_signal(signal);
+        let mut message =
+            Message::new_signal(OBJECT_PATH, &wire.interface, &wire.member).expect("signal");
+        message.append_items(
+            &wire
+                .args
+                .iter()
+                .map(to_item)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("args"),
+        );
+        message
+    }
+
+    #[test]
+    fn workspaces_changed_round_trips_through_bus_message() {
+        let signal = ControlSignal::WorkspacesChanged { revision: 7 };
+        let wire = encode_signal(&signal);
+        assert_eq!(decode_signal(&wire), Ok(signal.clone()));
+        assert_eq!(decode_bus_signal(&signal_message(&signal)), Some(signal));
+    }
+
+    #[test]
+    fn unrelated_bus_traffic_is_rejected() {
+        let foreign = Message::new_signal(
+            "/org/freedesktop/Notifications",
+            "com.example.Noise",
+            "Ping",
+        )
+        .expect("signal");
+        assert_eq!(decode_bus_signal(&foreign), None);
+        let wrong_vocab =
+            Message::new_signal(OBJECT_PATH, "com.arkflame.FlameWM1.Foo", "Bar").expect("signal");
+        assert_eq!(decode_bus_signal(&wrong_vocab), None);
+    }
+
+    #[test]
+    fn signal_match_rule_scopes_to_control_object_path() {
+        assert_eq!(
+            signal_match_rule(),
+            format!("type='signal',path='{OBJECT_PATH}'")
+        );
+    }
 }

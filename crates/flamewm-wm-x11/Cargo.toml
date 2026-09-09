@@ -10,14 +10,22 @@ repository.workspace = true
 calloop.workspace = true
 flamewm-api = { path = "../flamewm-api" }
 flamewm-applications = { path = "../flamewm-applications" }
+flamewm-image-core = { path = "../flamewm-image-core" }
 flamewm-integrations-linux = { path = "../flamewm-integrations-linux" }
 flamewm-window-core = { path = "../flamewm-window-core" }
 flamewm-platform = { path = "../flamewm-platform" }
+flamewm-profiler = { path = "../flamewm-profiler" }
 flamewm-control-dbus = { path = "../flamewm-control-dbus" }
 flamewm-control-wire = { path = "../flamewm-control-wire" }
 flamewm-reactor = { path = "../flamewm-reactor" }
+flamewm-render-core = { path = "../flamewm-render-core" }
+flamewm-render-x11 = { path = "../flamewm-render-x11" }
 flamewm-skin = { path = "../flamewm-skin" }
+flamewm-ui-x11 = { path = "../flamewm-ui-x11" }
 x11rb.workspace = true
+
+[build-dependencies]
+flamewm-render-compiler = { path = "../flamewm-render-compiler" }
 
 [lints]
 workspace = true

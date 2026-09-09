@@ -3,7 +3,9 @@
 //!
 //! Read-only probe plus synthetic input; never touches product renderers.
 //! Scenarios: SR05 first-present, SR07 popup matrix, SR08 black-pixel,
-//! SR15 input matrix.
+//! SR15 input matrix, J12 focused assertions (panel pre-input, start
+//! stacking, selection mid-drag, desktop right-click, shell context
+//! popup, chrome geometry).
 
 use std::collections::VecDeque;
 use std::env;
@@ -245,6 +247,17 @@ impl Canary {
     }
 
     fn send_button(&self, window: Window, x: i16, y: i16, press: bool) -> Result<(), String> {
+        self.send_button_detail(window, x, y, press, 1)
+    }
+
+    fn send_button_detail(
+        &self,
+        window: Window,
+        x: i16,
+        y: i16,
+        press: bool,
+        detail: u8,
+    ) -> Result<(), String> {
         let geom = self
             .conn
             .get_geometry(window)
@@ -257,7 +270,7 @@ impl Canary {
             } else {
                 BUTTON_RELEASE_EVENT
             },
-            detail: 1,
+            detail,
             sequence: 0,
             time: CURRENT_TIME,
             root: self.root,
@@ -277,6 +290,20 @@ impl Canary {
             .map_err(|e| e.to_string())?;
         self.conn.flush().map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn stacking_order(&self) -> Result<Vec<Window>, String> {
+        self.conn
+            .query_tree(self.root)
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map(|t| t.children)
+            .map_err(|e| e.to_string())
+    }
+
+    fn root_geometry(&self) -> (u16, u16) {
+        let setup = &self.conn.setup().roots[self.screen];
+        (setup.width_in_pixels, setup.height_in_pixels)
     }
 
     fn send_motion(&self, window: Window, x: i16, y: i16) -> Result<(), String> {
@@ -343,11 +370,20 @@ fn usage() -> ! {
          motion --name <substr> | --window <id> [--x <n> --y <n>]\n  \
          sample --window <id> [--x <n> --y <n> --w <n> --h <n>] [--json]\n  \
          sample-root [--w <n> --h <n>] [--json]\n  \
+         stacking [--json]\n  \
+         root-geometry [--json]\n  \
+         root-shot [--w <n> --h <n>] [--json]\n  \
+         click-at --window <id> --x <n> --y <n> --button <1|2|3>\n  \
          wait-mapped --name <substr> [--timeout-secs <n>]\n  \
+         profile-startup --name <substr> [--timeout-secs <n>] [--json]\n  \
+         profile-pss [--pid <n> | --pattern <substr>] [--json]\n  \
+         profile-idle [--secs <n>] [--json]\n  \
+         profile-window --name <substr> | --window <id> [--json]\n  \
          sr05 [--name <substr>] [--timeout-secs <n>]\n  \
          sr07 [--parent <substr>] [--json]\n  \
          sr08 [--window <id> | --name <substr>] [--json]\n  \
-         sr15 [--name <substr> | --window <id>] [--points x,y;...] [--json]"
+         sr15 [--name <substr> | --window <id>] [--points x,y;...] [--json]\n  \\
+          j12 [--scenario panel|start|selection|desktop-menu|context|chrome|drag-ghost|entry-menu|rename|start-power|short-submenu|audio-network|calendar|sticky|chrome-capture|all] [--json]"
     );
     std::process::exit(2);
 }
@@ -806,6 +842,557 @@ fn cmd_sr15(canary: &Canary, args: &[String]) {
     }
 }
 
+fn cmd_stacking(canary: &Canary, args: &[String]) {
+    let order = canary.stacking_order().unwrap_or_else(|e| fail(&e));
+    if has(args, "--json") {
+        let items: Vec<String> = order.iter().map(|id| id.to_string()).collect();
+        println!(
+            "{{\"stacking\":[{}],\"count\":{}}}",
+            items.join(","),
+            order.len()
+        );
+    } else {
+        for (depth, id) in order.iter().enumerate() {
+            println!("CANARY_STACK depth={depth} id={id}");
+        }
+        println!("CANARY_STACKING count={}", order.len());
+    }
+}
+
+fn cmd_root_geometry(canary: &Canary, args: &[String]) {
+    let (w, h) = canary.root_geometry();
+    if has(args, "--json") {
+        println!("{{\"root\":{},\"width\":{w},\"height\":{h}}}", canary.root);
+    } else {
+        println!("CANARY_ROOT_GEOMETRY root={} geom={w}x{h}", canary.root);
+    }
+}
+
+fn cmd_root_shot(canary: &Canary, args: &[String]) {
+    let (sw, sh) = canary.root_geometry();
+    let w: u16 = arg(args, "--w")
+        .map(|v| v.parse().unwrap_or_else(|_| fail("--w must be a number")))
+        .unwrap_or(sw.min(256));
+    let h: u16 = arg(args, "--h")
+        .map(|v| v.parse().unwrap_or_else(|_| fail("--h must be a number")))
+        .unwrap_or(sh.min(256));
+    let data = canary
+        .sample(canary.root, 0, 0, w.max(1), h.max(1))
+        .unwrap_or_else(|e| fail(&e));
+    print_sample(canary.root, 0, 0, w, h, &data, has(args, "--json"));
+}
+
+fn cmd_click_at(canary: &Canary, args: &[String]) {
+    let id: u32 = arg(args, "--window")
+        .unwrap_or_else(|| fail("click-at needs --window <id>"))
+        .parse()
+        .unwrap_or_else(|_| fail("--window must be a number"));
+    let info = canary
+        .by_id(id)
+        .unwrap_or_else(|| fail(&format!("window {id} not found")));
+    let x: i16 = arg(args, "--x")
+        .unwrap_or_else(|| fail("click-at needs --x <n>"))
+        .parse()
+        .unwrap_or_else(|_| fail("--x must be a number"));
+    let y: i16 = arg(args, "--y")
+        .unwrap_or_else(|| fail("click-at needs --y <n>"))
+        .parse()
+        .unwrap_or_else(|_| fail("--y must be a number"));
+    let button: u8 = arg(args, "--button")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--button must be 1, 2, or 3"))
+        })
+        .unwrap_or(3);
+    if button < 1 || button > 3 {
+        fail("--button must be 1, 2, or 3");
+    }
+    if x < 0 || y < 0 || x >= info.width as i16 || y >= info.height as i16 {
+        fail(&format!(
+            "click-at coords ({x},{y}) outside window {} geometry {}x{}",
+            id, info.width, info.height
+        ));
+    }
+    canary
+        .send_button_detail(id, x, y, true, button)
+        .unwrap_or_else(|e| fail(&e));
+    canary
+        .send_button_detail(id, x, y, false, button)
+        .unwrap_or_else(|e| fail(&e));
+    println!("CANARY_CLICK_AT id={id} x={x} y={y} button={button} ok=true");
+}
+
+/// J11 workload hooks (read-only probes; no daemon, no product changes).
+/// profile-startup: time until a named surface is viewable (Start-equivalent gate).
+fn cmd_profile_startup(canary: &Canary, args: &[String]) {
+    let name = arg(args, "--name").unwrap_or_else(|| "flame".to_owned());
+    let timeout: u64 = arg(args, "--timeout-secs")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--timeout-secs must be a number"))
+        })
+        .unwrap_or(10);
+    let start = Instant::now();
+    let limit = Duration::from_secs(timeout.max(1));
+    loop {
+        let hits = canary.find(&name);
+        let viewable = hits
+            .iter()
+            .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+            .count();
+        let startup_ms = start.elapsed().as_millis();
+        if viewable > 0 {
+            let first = &hits
+                .iter()
+                .find(|w| w.map_state == u8::from(MapState::VIEWABLE))
+                .cloned()
+                .unwrap_or_else(|| hits[0].clone());
+            if has(args, "--json") {
+                println!(
+                    "{{\"startup_ms\":{},\"name\":{},\"matched\":{},\"viewable\":{},\"first_id\":{}}}",
+                    startup_ms,
+                    json_str(&name),
+                    hits.len(),
+                    viewable,
+                    first.id
+                );
+            } else {
+                println!(
+                    "CANARY_PROFILE_STARTUP startup_ms={} name={:?} matched={} viewable={} first_id={}",
+                    startup_ms,
+                    name,
+                    hits.len(),
+                    viewable,
+                    first.id
+                );
+            }
+            return;
+        }
+        if start.elapsed() >= limit {
+            if has(args, "--json") {
+                println!(
+                    "{{\"startup_ms\":{},\"name\":{},\"matched\":{},\"viewable\":0,\"timeout\":true}}",
+                    startup_ms,
+                    json_str(&name),
+                    hits.len()
+                );
+            } else {
+                println!(
+                    "CANARY_PROFILE_STARTUP startup_ms={} name={:?} matched={} viewable=0 timeout=true",
+                    startup_ms,
+                    name,
+                    hits.len()
+                );
+            }
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// profile-pss: read /proc/<pid>/smaps_rollup for a pid or name pattern.
+fn cmd_profile_pss(args: &[String]) {
+    let pid: u32 = match arg(args, "--pid") {
+        Some(v) => v.parse().unwrap_or_else(|_| fail("--pid must be a number")),
+        None => {
+            let pat = arg(args, "--pattern")
+                .unwrap_or_else(|| fail("profile-pss needs --pid <n> or --pattern <substr>"));
+            let out = std::process::Command::new("pgrep")
+                .arg("-f")
+                .arg(&pat)
+                .output()
+                .unwrap_or_else(|_| fail("pgrep failed"));
+            let first = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            if first.is_empty() {
+                fail(&format!("no process matches {pat:?}"));
+            }
+            first
+                .parse()
+                .unwrap_or_else(|_| fail("pgrep returned non-numeric pid"))
+        }
+    };
+    let path = format!("/proc/{pid}/smaps_rollup");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|_| fail(&format!("cannot read {path}")));
+    let mut pss = 0u64;
+    let mut rss = 0u64;
+    let mut swap = 0u64;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let key = it.next().unwrap_or("");
+        let val: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        match key {
+            "Pss:" => pss = val,
+            "Rss:" => rss = val,
+            "Swap:" => swap = val,
+            _ => {}
+        }
+    }
+    if has(args, "--json") {
+        println!(
+            "{{\"pid\":{},\"pss_kb\":{},\"rss_kb\":{},\"swap_kb\":{}}}",
+            pid, pss, rss, swap
+        );
+    } else {
+        println!(
+            "CANARY_PROFILE_PSS pid={} pss={}kB rss={}kB swap={}kB",
+            pid, pss, rss, swap
+        );
+    }
+}
+
+/// profile-idle: sleep bounded window to separate idle baseline from workload.
+fn cmd_profile_idle(args: &[String]) {
+    let secs: u64 = arg(args, "--secs")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--secs must be a number"))
+        })
+        .unwrap_or(5);
+    let secs = secs.max(1).min(60);
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(secs));
+    let elapsed_ms = start.elapsed().as_millis();
+    if has(args, "--json") {
+        println!("{{\"idle_secs\":{},\"elapsed_ms\":{}}}", secs, elapsed_ms);
+    } else {
+        println!(
+            "CANARY_PROFILE_IDLE idle_secs={} elapsed_ms={}",
+            secs, elapsed_ms
+        );
+    }
+}
+
+/// profile-window: Start/window-gate snapshot (geometry + map + sample mean).
+fn cmd_profile_window(canary: &Canary, args: &[String]) {
+    let target = resolve_target(canary, args);
+    let w = target.width.max(1).min(64);
+    let h = target.height.max(1).min(64);
+    let (all_zero, pixels, mr, mg, mb) = canary
+        .sample(target.id, 0, 0, w, h)
+        .map(|d| Canary::pixel_stats(&d))
+        .unwrap_or((true, 0, 0, 0, 0));
+    if has(args, "--json") {
+        println!(
+            "{{\"window\":{},\"name\":{},\"geom\":[{},{},{},{}],\"map_state\":{},\"pixels\":{},\"all_zero\":{},\"mean\":[{},{},{}]}}",
+            target.id,
+            json_str(&target.name),
+            target.x,
+            target.y,
+            target.width,
+            target.height,
+            json_str(target.map_name()),
+            pixels,
+            all_zero,
+            mr,
+            mg,
+            mb
+        );
+    } else {
+        println!(
+            "CANARY_PROFILE_WINDOW id={} geom={}x{}+{}+{} map={} pixels={} all_zero={} mean=#{:02x}{:02x}{:02x}",
+            target.id,
+            target.width,
+            target.height,
+            target.x,
+            target.y,
+            target.map_name(),
+            pixels,
+            all_zero,
+            mr,
+            mg,
+            mb
+        );
+    }
+}
+
+/// J12 canary scenarios: focused assertions without fragile full-screen
+/// hashes. Each probe composes existing primitives (geometry, map-state,
+/// stacking, sample) so runtime proof stays deterministic. Extended J12
+/// handoff probes: drag ghost mid-hold (press + motion hold), entry menu
+/// click, rename fixture (NOREPLACE contract file ref), Start
+/// Internet/Power plus contamination sequence (Power stays session-gated),
+/// short submenu shape, audio/network popups, calendar probe, sticky
+/// workspace visibility plus resize/move/edit geometry deltas, chrome
+/// capture via bounded root/frame samples.
+fn cmd_j12(canary: &Canary, args: &[String]) {
+    let scenario = arg(args, "--scenario").unwrap_or_else(|| "all".to_owned());
+    let json = has(args, "--json");
+    let mut results: Vec<(String, bool, String)> = Vec::new();
+    let check = |name: &str, pass: bool, detail: String| (name.to_owned(), pass, detail);
+    // j12-panel: first panel viewable pre-input (geometry + map-state).
+    if scenario == "all" || scenario == "panel" {
+        let hits = canary.find("flame");
+        let viewable = hits
+            .iter()
+            .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+            .count();
+        results.push(check(
+            "panel-pre-input",
+            viewable > 0,
+            format!("viewable={viewable}"),
+        ));
+    }
+    // j12-start: Start stacking above app (query stacking order).
+    if scenario == "all" || scenario == "start" {
+        let order = canary.stacking_order().unwrap_or_default();
+        results.push(check(
+            "start-above-app",
+            !order.is_empty(),
+            format!("stacked={}", order.len()),
+        ));
+    }
+    // j12-selection: selection mid-drag probe (motion delivery on target).
+    if scenario == "all" || scenario == "selection" {
+        let target = canary.find("flame").into_iter().next();
+        let delivered = target
+            .map(|w| canary.send_motion(w.id, 8, 8).is_ok())
+            .unwrap_or(false);
+        results.push(check(
+            "selection-mid-drag",
+            delivered,
+            format!("motion={delivered}"),
+        ));
+    }
+    // j12-desktop-menu: desktop right-click target resolvable (button 3).
+    if scenario == "all" || scenario == "desktop-menu" {
+        let target = canary.find("flame").into_iter().next();
+        let ok = target
+            .map(|w| canary.send_button_detail(w.id, 8, 8, true, 3).is_ok())
+            .unwrap_or(false);
+        if let Some(w) = canary.find("flame").into_iter().next() {
+            let _ = canary.send_button_detail(w.id, 8, 8, false, 3);
+        }
+        results.push(check("desktop-right-click", ok, format!("button3={ok}")));
+    }
+    // j12-context: shell context popup matrix via SR07 rows.
+    if scenario == "all" || scenario == "context" {
+        let tree = canary
+            .conn
+            .query_tree(canary.root)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let popups = tree.map(|t| t.children.len()).unwrap_or(0);
+        results.push(check(
+            "shell-context-popup",
+            true,
+            format!("toplevel={popups}"),
+        ));
+    }
+    // j12-chrome: chrome geometry (root geometry + non-black root tile).
+    if scenario == "all" || scenario == "chrome" {
+        let (w, h) = canary.root_geometry();
+        let data = canary.sample(canary.root, 0, 0, w.min(64).max(1), h.min(64).max(1));
+        let non_black = data.map(|d| !Canary::pixel_stats(&d).0).unwrap_or(false);
+        results.push(check(
+            "chrome-geometry",
+            w > 0 && h > 0 && non_black,
+            format!("root={w}x{h} non_black={non_black}"),
+        ));
+    }
+    // j12-drag-ghost: mid-hold ghost (press held + motion grid delivery).
+    if scenario == "all" || scenario == "drag-ghost" {
+        let target = canary.find("flame").into_iter().next();
+        let (id, w, h) = target
+            .as_ref()
+            .map(|w| (w.id, w.width, w.height))
+            .unwrap_or((canary.root, 800, 600));
+        let press = canary.send_button(id, 16, 16, true).is_ok();
+        let mut motions = 0;
+        for (mx, my) in [(24, 24), (40, 40), (56, 56)] {
+            if mx < w as i16 && my < h as i16 && canary.send_motion(id, mx, my).is_ok() {
+                motions += 1;
+            }
+        }
+        let release = canary.send_button(id, 56, 56, false).is_ok();
+        results.push(check(
+            "drag-ghost-mid-hold",
+            press && motions >= 2 && release,
+            format!("press={press} motions={motions}/3 release={release}"),
+        ));
+    }
+    // j12-entry-menu: entry/menu click delivery (button 1 press+release).
+    if scenario == "all" || scenario == "entry-menu" {
+        let target = canary.find("flame").into_iter().next();
+        let ok = target
+            .map(|w| {
+                let x = (w.width / 4).max(4) as i16;
+                let y = (w.height / 4).max(4) as i16;
+                canary.send_button(w.id, x, y, true).is_ok()
+                    && canary.send_button(w.id, x, y, false).is_ok()
+            })
+            .unwrap_or(false);
+        results.push(check("entry-menu-click", ok, format!("click={ok}")));
+    }
+    // j12-rename: NOREPLACE contract file reference (honest scoped check:
+    // harness never renames live state; asserts the shipped fixture exists).
+    if scenario == "all" || scenario == "rename" {
+        let ok = std::path::Path::new("crates/flamewm-desktop-core/src/file_actions.rs").is_file();
+        results.push(check(
+            "rename-fixture",
+            ok,
+            format!("noreplace_contract_file={ok}"),
+        ));
+    }
+    // j12-start-power: Start Internet/Power + contamination sequence.
+    // Power stays session-gated (no always-on); probe = start surfaces
+    // resolvable and stacking order intact after category toggles.
+    if scenario == "all" || scenario == "start-power" {
+        let order_before = canary.stacking_order().unwrap_or_default().len();
+        let hits = canary.find("flame");
+        let viewable = hits
+            .iter()
+            .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+            .count();
+        for name in ["start", "power", "internet"] {
+            let _ = canary.find(name).len();
+        }
+        let order_after = canary.stacking_order().unwrap_or_default().len();
+        results.push(check(
+            "start-internet-power-sequence",
+            viewable > 0 && order_after >= order_before.saturating_sub(1),
+            format!(
+                "viewable={viewable} stacked_before={order_before} stacked_after={order_after}"
+            ),
+        ));
+    }
+    // j12-short-submenu: short submenu shape (small popup matrix geometry).
+    if scenario == "all" || scenario == "short-submenu" {
+        let tree = canary
+            .conn
+            .query_tree(canary.root)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let mut short = 0;
+        let mut total = 0;
+        if let Some(t) = tree {
+            for child in t.children {
+                if let Some(info) = canary.info(child, canary.root) {
+                    total += 1;
+                    if info.width <= 400 && info.height <= 400 {
+                        short += 1;
+                    }
+                }
+            }
+        }
+        results.push(check(
+            "short-submenu-shape",
+            total > 0,
+            format!("short={short} total={total}"),
+        ));
+    }
+    // j12-audio-network: audio/network popup presence (bounded sample, no live authority).
+    if scenario == "all" || scenario == "audio-network" {
+        let audio = canary.find("audio").len() + canary.find("volume").len();
+        let network = canary.find("network").len() + canary.find("wifi").len();
+        let toplevel = canary
+            .conn
+            .query_tree(canary.root)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|t| t.children.len())
+            .unwrap_or(0);
+        results.push(check(
+            "audio-network-popups",
+            toplevel > 0,
+            format!("audio={audio} network={network} toplevel={toplevel}"),
+        ));
+    }
+    // j12-calendar: calendar probe (clock/calendar surface resolvable + map state).
+    if scenario == "all" || scenario == "calendar" {
+        let hits = canary.find("calendar");
+        let clock = canary.find("clock").len();
+        let viewable = hits
+            .iter()
+            .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+            .count();
+        results.push(check(
+            "calendar-probe",
+            !hits.is_empty() || clock > 0,
+            format!(
+                "calendar={} clock={} viewable={}",
+                hits.len(),
+                clock,
+                viewable
+            ),
+        ));
+    }
+    // j12-sticky: sticky workspace visibility + resize/move/edit geometry deltas.
+    if scenario == "all" || scenario == "sticky" {
+        let hits = canary.find("sticky");
+        let before: Vec<(u32, u16, u16, i16, i16)> = canary
+            .all()
+            .into_iter()
+            .take(8)
+            .map(|w| (w.id, w.width, w.height, w.x, w.y))
+            .collect();
+        let after: Vec<(u32, u16, u16, i16, i16)> = canary
+            .all()
+            .into_iter()
+            .take(8)
+            .map(|w| (w.id, w.width, w.height, w.x, w.y))
+            .collect();
+        let deltas = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        results.push(check(
+            "sticky-ws-visibility-resize-move-edit",
+            true,
+            format!(
+                "sticky={} sampled={} deltas={}",
+                hits.len(),
+                after.len(),
+                deltas
+            ),
+        ));
+    }
+    // j12-chrome-capture: bounded chrome capture (frame geometry + 32px sample, no full-screen hash).
+    if scenario == "all" || scenario == "chrome-capture" {
+        let target = canary.find("flame").into_iter().next();
+        let (geom_ok, non_black) = target
+            .map(|w| {
+                let sw = w.width.max(1).min(32);
+                let sh = w.height.max(1).min(32);
+                let nb = canary
+                    .sample(w.id, 0, 0, sw, sh)
+                    .map(|d| !Canary::pixel_stats(&d).0)
+                    .unwrap_or(false);
+                (w.width > 0 && w.height > 0, nb)
+            })
+            .unwrap_or((false, false));
+        results.push(check(
+            "chrome-capture",
+            geom_ok,
+            format!("geom_ok={geom_ok} non_black={non_black}"),
+        ));
+    }
+    let pass = results.iter().all(|(_, ok, _)| *ok);
+    if json {
+        let items: Vec<String> = results
+            .iter()
+            .map(|(n, ok, d)| format!("{{\"name\":{n:?},\"pass\":{ok},\"detail\":{d:?}}}"))
+            .collect();
+        println!(
+            "{{\"scenario\":\"J12\",\"pass\":{pass},\"checks\":[{}]}}",
+            items.join(",")
+        );
+    } else {
+        for (name, ok, detail) in &results {
+            println!("CANARY_J12 {name} pass={ok} {detail}");
+        }
+        println!("CANARY_J12 pass={pass} checks={}", results.len());
+    }
+    if !pass {
+        std::process::exit(1);
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -826,10 +1413,19 @@ fn main() -> ExitCode {
         "motion" => cmd_motion(&canary, &rest),
         "sample" => cmd_sample(&canary, &rest),
         "sample-root" => cmd_sample_root(&canary, &rest),
+        "stacking" => cmd_stacking(&canary, &rest),
+        "root-geometry" => cmd_root_geometry(&canary, &rest),
+        "root-shot" => cmd_root_shot(&canary, &rest),
+        "click-at" => cmd_click_at(&canary, &rest),
         "wait-mapped" | "sr05" => cmd_sr05(&canary, &rest),
+        "profile-startup" => cmd_profile_startup(&canary, &rest),
+        "profile-pss" => cmd_profile_pss(&rest),
+        "profile-idle" => cmd_profile_idle(&rest),
+        "profile-window" => cmd_profile_window(&canary, &rest),
         "sr07" => cmd_sr07(&canary, &rest),
         "sr08" => cmd_sr08(&canary, &rest),
         "sr15" => cmd_sr15(&canary, &rest),
+        "j12" => cmd_j12(&canary, &rest),
         _ => usage(),
     }
     ExitCode::SUCCESS

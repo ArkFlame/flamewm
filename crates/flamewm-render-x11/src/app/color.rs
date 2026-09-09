@@ -1,10 +1,27 @@
 use super::*;
+
+/// Explicit OpaqueFallback flatten: only used when SurfaceAlphaMode is
+/// OpaqueFallback. Composited/shape paths never flatten through black.
+pub(crate) fn flatten_opaque_fallback(color: Color) -> Color {
+    let alpha = color.a as u16;
+    Color::rgb(
+        ((color.r as u16 * alpha) / 255) as u8,
+        ((color.g as u16 * alpha) / 255) as u8,
+        ((color.b as u16 * alpha) / 255) as u8,
+    )
+}
+
 impl X11App {
     pub(crate) unsafe fn pixel(&mut self, color: Color) -> Result<u64, String> {
-        let opaque = if color.a == 255 {
+        // Retired: normal blend_over_black. Only explicit OpaqueFallback
+        // flattens; composited/shape paths never flatten.
+        let opaque = if color.a == 255
+            || self.alpha_mode == SurfaceAlphaMode::CompositedArgb32
+            || self.alpha_mode == SurfaceAlphaMode::ShapeBackedArgb32
+        {
             color
         } else {
-            blend_over_black(color)
+            flatten_opaque_fallback(color)
         };
         if let Some(pixel) = self.colors.get(&opaque) {
             return Ok(*pixel);
@@ -28,6 +45,7 @@ impl X11App {
         Ok(xcolor.pixel as u64)
     }
 }
+#[allow(dead_code)]
 pub(crate) fn root_background(
     document: &RuntimeDocument,
     interaction: InteractionState,
@@ -39,13 +57,9 @@ pub(crate) fn root_background(
     if color.a == 0 { None } else { Some(color) }
 }
 
+#[allow(dead_code)]
 pub(crate) fn blend_over_black(color: Color) -> Color {
-    let alpha = color.a as u16;
-    Color::rgb(
-        ((color.r as u16 * alpha) / 255) as u8,
-        ((color.g as u16 * alpha) / 255) as u8,
-        ((color.b as u16 * alpha) / 255) as u8,
-    )
+    flatten_opaque_fallback(color)
 }
 
 pub(crate) fn rgb_to_pixel(
@@ -85,7 +99,7 @@ mod tests {
     #[test]
     fn alpha_blends_over_black() {
         assert_eq!(
-            blend_over_black(Color {
+            flatten_opaque_fallback(Color {
                 r: 200,
                 g: 100,
                 b: 50,

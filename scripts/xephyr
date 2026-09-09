@@ -60,6 +60,59 @@ desktop_log=.target/flamewm/desktop.log
 shell_log=.target/flamewm/shell.log
 : >"$xephyr_log"; : >"$wm_log"; : >"$desktop_log"; : >"$shell_log"
 
+# J11 .performance evidence run directory pipeline.
+# Profiler owns formatting/append; this harness owns lifecycle only.
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_DIR="$ROOT/.performance/$RUN_ID"
+mkdir -p "$RUN_DIR"
+export FLAMEWM_PROFILE_DIR="$RUN_DIR"
+# Manifest: run identity + environment (best-effort fields never fail the run).
+{
+  echo "run_id=$RUN_ID"
+  echo "head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  echo "dirty=$(git -C "$ROOT" status --short 2>/dev/null | sha256sum | cut -d' ' -f1 || echo unknown)"
+  echo "version=$VERSION"
+  echo "display=${FLAMEWM_XEPHYR_DISPLAY:-auto}"
+  echo "geometry=$SCREEN"
+  echo "profile=$([ "${FLAMEWM_PROFILE:-0}" = 1 ] && echo 1 || echo 0)"
+  echo "profile_interval=${FLAMEWM_PROFILE_INTERVAL:-60}"
+  echo "profile_top=${FLAMEWM_PROFILE_TOP:-8}"
+  echo "xcursor_theme=${FLAMEWM_CURSOR_THEME:-FlameWM-Breeze-Dark}"
+  echo "xcursor_size=${FLAMEWM_CURSOR_SIZE:-24}"
+  echo "xcursor_path=${FLAMEWM_CURSOR_PATH:-$ROOT/.target/stage-icons}"
+  echo "command=$0 $*"
+  echo "rustc=$(rustc --version 2>/dev/null || echo unknown)"
+  echo "cargo=$(cargo --version 2>/dev/null || echo unknown)"
+} >"$RUN_DIR/manifest.txt" 2>/dev/null || true
+ln -sfn "$RUN_DIR" "$ROOT/.performance/latest" 2>/dev/null || true
+# Evidence collection: copy logs, best-effort PSS, canary screenshot,
+# profile summary. Never hides exit codes; never deletes old runs.
+collect_evidence(){
+  [[ -n "${RUN_DIR:-}" ]] || return 0
+  [[ -d "${RUN_DIR:-}" ]] || return 0
+  for f in "$xephyr_log" "$wm_log" "$desktop_log" "$shell_log"; do
+    cp "$f" "$RUN_DIR/$(basename "$f")" 2>/dev/null || true
+  done
+  for rec in "wm:${wm_pid:-}" "desktop:${desktop_pid:-}" "shell:${shell_pid:-}"; do
+    name="${rec%%:*}"; pid="${rec##*:}"
+    [[ -n "$pid" && -r "/proc/$pid/smaps_rollup" ]] || continue
+    awk '/^Pss:/{pss=$2} /^Rss:/{rss=$2} /^Swap:/{sw=$2} END{printf "%s pid=%s pss=%dkB rss=%dkB swap=%dkB\n", "'"${name}"'", "'"${pid}"'", pss+0, rss+0, sw+0}' \
+      "/proc/$pid/smaps_rollup" >>"$RUN_DIR/pss.txt" 2>/dev/null || true
+  done
+  [[ -s .target/flamewm/canary-root.png ]] && cp .target/flamewm/canary-root.png "$RUN_DIR/root.png" 2>/dev/null || true
+  if [[ -x tools/profile_summary.py ]]; then
+    shopt -s nullglob
+    prof_logs=("$RUN_DIR"/*.profile.log)
+    shopt -u nullglob
+    if [[ "${#prof_logs[@]}" -gt 0 ]]; then
+      python3 tools/profile_summary.py "$wm_log" "$desktop_log" "$shell_log" "${prof_logs[@]}" >"$RUN_DIR/summary.txt" 2>/dev/null || true
+    else
+      python3 tools/profile_summary.py "$wm_log" "$desktop_log" "$shell_log" >"$RUN_DIR/summary.txt" 2>/dev/null || true
+    fi
+  fi
+}
+
 xephyr_pid=''
 wm_pid=''
 desktop_pid=''
@@ -74,10 +127,14 @@ cleanup(){
   [[ -n "${wm_pid:-}" ]] && wait "$wm_pid" 2>/dev/null || true
   [[ -n "${xephyr_pid:-}" ]] && wait "$xephyr_pid" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap 'collect_evidence; cleanup' EXIT INT TERM
 
 fail(){
   echo "FLAMEWM_XEPHYR_FAIL: $*" >&2
+  if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR:-}" ]]; then
+    echo "FLAMEWM_XEPHYR_FAIL: $*" >>"$RUN_DIR/crash.txt" 2>/dev/null || true
+    first_dead_child >>"$RUN_DIR/crash.txt" 2>&1 || true
+  fi
   for f in "$xephyr_log" "$wm_log" "$desktop_log" "$shell_log"; do
     echo "--- tail $f ---" >&2
     tail -n 30 "$f" >&2 || true
@@ -142,10 +199,21 @@ require_alive(){
 # Nested X11 app env: force clients onto the Xephyr display and off the host
 # Wayland compositor; identify the session as an X11 FlameWM session.
 # J11 production appearance/session consumer: same env the flamewm launcher
-# applies — FlameWM identity (never KDE), XCURSOR_* cursor theme, and the
-# guarded Breeze toolkit theme (GTK only if Breeze-Dark installed, Qt only
-# if a Breeze style plugin exists). Explicit user values always win.
+# applies — FlameWM identity (never KDE), XCURSOR_* cursor theme (bundled
+# FlameWM-Breeze-Dark authority), and the guarded Breeze toolkit theme
+# (GTK only if Breeze-Dark installed, Qt only if a Breeze style plugin
+# exists). Explicit user values always win.
 session_appearance_env(){
+  : "${FLAMEWM_CURSOR_THEME:=FlameWM-Breeze-Dark}"
+  : "${FLAMEWM_CURSOR_SIZE:=24}"
+  # Search root is the parent of the bundled theme dir (<root>/icons);
+  # dev staging symlink under .target must exist before launch.
+  : "${FLAMEWM_CURSOR_PATH:=$ROOT/.target/stage-icons}"
+  if [[ ! -d "$FLAMEWM_CURSOR_PATH/$FLAMEWM_CURSOR_THEME" ]]; then
+    echo "FLAMEWM_XEPHYR_FAIL: cursor theme missing: $FLAMEWM_CURSOR_PATH/$FLAMEWM_CURSOR_THEME" >&2
+    echo "  expected dev staging symlink: $ROOT/.target/stage-icons -> <staged usr/share/icons>" >&2
+    return 1
+  fi
   : "${FLAMEWM_APPEARANCE:=dark}"
   export FLAMEWM_APPEARANCE
   case "$FLAMEWM_APPEARANCE" in
@@ -153,8 +221,9 @@ session_appearance_env(){
     light|Light|LIGHT) export FLAMEWM_DARK_MODE=0 ;;
     *) export FLAMEWM_DARK_MODE=1 ;;
   esac
-  export XCURSOR_THEME="${XCURSOR_THEME:-Breeze}"
-  export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+  export XCURSOR_THEME="${FLAMEWM_CURSOR_THEME}"
+  export XCURSOR_SIZE="${FLAMEWM_CURSOR_SIZE}"
+  export XCURSOR_PATH="${FLAMEWM_CURSOR_PATH}${XCURSOR_LIBRARY_PATH:+:$XCURSOR_LIBRARY_PATH}"
   export XCURSOR_THEME_CORE="${XCURSOR_THEME_CORE:-1}"
   if [[ "${XDG_CURRENT_DESKTOP:-}" == [Kk][Dd][Ee] ]] || [[ -z "${XDG_CURRENT_DESKTOP:-}" ]]; then
     export XDG_CURRENT_DESKTOP=FlameWM
@@ -174,13 +243,13 @@ nested_env(){
   if [[ "$DEBUG_CRASH" == 1 ]]; then
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY="$nested" XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP" \
       FLAMEWM_DESKTOP="$FLAMEWM_DESKTOP" FLAMEWM_APPEARANCE="$FLAMEWM_APPEARANCE" FLAMEWM_DARK_MODE="$FLAMEWM_DARK_MODE" \
-      XCURSOR_THEME="$XCURSOR_THEME" XCURSOR_SIZE="$XCURSOR_SIZE" XCURSOR_THEME_CORE="$XCURSOR_THEME_CORE" \
+      XCURSOR_THEME="$XCURSOR_THEME" XCURSOR_SIZE="$XCURSOR_SIZE" XCURSOR_PATH="$XCURSOR_PATH" XCURSOR_THEME_CORE="$XCURSOR_THEME_CORE" \
       ${GTK_THEME:+GTK_THEME="$GTK_THEME"} ${QT_STYLE_OVERRIDE:+QT_STYLE_OVERRIDE="$QT_STYLE_OVERRIDE"} \
       "${CRASH_ENV_EXTRA[@]}" "$@"
   else
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY="$nested" XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP" \
       FLAMEWM_DESKTOP="$FLAMEWM_DESKTOP" FLAMEWM_APPEARANCE="$FLAMEWM_APPEARANCE" FLAMEWM_DARK_MODE="$FLAMEWM_DARK_MODE" \
-      XCURSOR_THEME="$XCURSOR_THEME" XCURSOR_SIZE="$XCURSOR_SIZE" XCURSOR_THEME_CORE="$XCURSOR_THEME_CORE" \
+      XCURSOR_THEME="$XCURSOR_THEME" XCURSOR_SIZE="$XCURSOR_SIZE" XCURSOR_PATH="$XCURSOR_PATH" XCURSOR_THEME_CORE="$XCURSOR_THEME_CORE" \
       ${GTK_THEME:+GTK_THEME="$GTK_THEME"} ${QT_STYLE_OVERRIDE:+QT_STYLE_OVERRIDE="$QT_STYLE_OVERRIDE"} "$@"
   fi
 }
@@ -285,6 +354,16 @@ canary_checks(){
       echo "WARN: canary SR15 skipped (no window matches $CANARY_NAME)" >&2
     fi
   fi
+  # J6 extended probes: sample geometry, stacking query, root screenshot.
+  # shellcheck disable=SC2086
+  DISPLAY="$nested" "$CANARY_BIN" root-geometry $json_flag 2>/dev/null \
+    || echo 'WARN: canary root-geometry probe failed' >&2
+  # shellcheck disable=SC2086
+  DISPLAY="$nested" "$CANARY_BIN" stacking $json_flag 2>/dev/null \
+    || echo 'WARN: canary stacking probe failed' >&2
+  # shellcheck disable=SC2086
+  DISPLAY="$nested" "$CANARY_BIN" root-shot $json_flag 2>/dev/null \
+    || echo 'WARN: canary root-shot probe failed' >&2
   shot=.target/flamewm/canary-root.png
   if command -v import >/dev/null 2>&1; then
     DISPLAY="$nested" import -window root "$shot" 2>/dev/null || fail "canary screenshot failed (import)"
@@ -320,8 +399,10 @@ if [[ "$CANARY" == 1 ]]; then
   require_alive wm "$wm_pid" "$wm_log"
   require_alive desktop "$desktop_pid" "$desktop_log"
   require_alive shell "$shell_pid" "$shell_log"
+  collect_evidence
   echo "FLAMEWM_XEPHYR_CANARY_PASS display=$nested version=$VERSION"
   echo "logs: $xephyr_log $wm_log $desktop_log $shell_log"
+  echo "evidence: $RUN_DIR"
   exit 0
 fi
 

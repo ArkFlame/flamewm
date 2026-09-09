@@ -21,7 +21,11 @@ mod surface_controller;
 
 use app::X11App;
 pub use config::*;
-pub use external_drawable::*;
+pub use external_drawable::{
+    ExternalDrawableSession, ExternalDrawableTarget, NativeDrawableRenderer,
+    external_font_pattern_order, external_pixmap_byte_estimate, external_release_order,
+    external_rounded_row_inset, external_symbolic_argb, external_text_measure,
+};
 pub use native::target::GeometryCommit;
 pub use native::{PresentationState, presenter_error};
 pub use runtime::*;

@@ -17,6 +17,10 @@ pub enum PaintCommand {
     Image {
         rect: Rect,
         asset: u16,
+        node: u32,
+        revision: u64,
+        treatment: ImageTreatment,
+        tint: Option<Color>,
     },
     Text {
         x: f32,
@@ -80,9 +84,8 @@ pub fn build_paint_commands_with_scroll(
     scroll: &dyn Fn(u32) -> ScrollState,
 ) -> Vec<PaintCommand> {
     let mut commands = Vec::with_capacity(document.document.nodes.len() * 2);
-    let mut indices: Vec<usize> = (0..document.document.nodes.len()).collect();
-    indices.sort_by_key(|index| (document.effective_z_index(*index as u32), *index as i64));
-    for index in indices {
+    for index in layout.z_order.iter().copied() {
+        let index = index as usize;
         let node = &document.document.nodes[index];
         if !document.is_effectively_visible(index as u32) {
             continue;
@@ -120,8 +123,28 @@ pub fn build_paint_commands_with_scroll(
         }
         match node.kind {
             NodeKind::Image => {
-                if let Some(asset) = node.image {
-                    commands.push(PaintCommand::Image { rect, asset });
+                let node_index = index as u32;
+                // Node-local identity: override revision when present; the
+                // asset id is the fallback descriptor, never pixel data.
+                let asset = node.image.unwrap_or(u16::MAX);
+                let revision = document.image_revision_for_node(node_index);
+                if document.image_for_node(node_index).is_some() {
+                    let (treatment, tint) = match style.image_treatment {
+                        ImageTreatment::Original => (ImageTreatment::Original, None),
+                        ImageTreatment::SymbolicForeground => {
+                            let tint =
+                                apply_opacity(document.resolve_color(style.color), style.opacity);
+                            (ImageTreatment::SymbolicForeground, Some(tint))
+                        }
+                    };
+                    commands.push(PaintCommand::Image {
+                        rect,
+                        asset,
+                        node: node_index,
+                        revision,
+                        treatment,
+                        tint,
+                    });
                 }
             }
             NodeKind::Text => {

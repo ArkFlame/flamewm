@@ -1,4 +1,5 @@
 use flamewm_render_core::RuntimeDocument;
+use flamewm_ui_core::style::UiLayer;
 
 pub struct UiDocument {
     pub(crate) document: RuntimeDocument,
@@ -43,14 +44,17 @@ pub trait UiDocumentAccess {
     fn size(&mut self, id: &str, width: f32, height: f32) -> Result<(), String>;
     fn background(&mut self, id: &str, color: UiColor) -> Result<(), String>;
     fn border(&mut self, id: &str, color: UiColor) -> Result<(), String>;
+    fn foreground(&mut self, id: &str, color: UiColor) -> Result<(), String>;
     fn background_clear(&mut self, id: &str) -> Result<(), String>;
     fn border_clear(&mut self, id: &str) -> Result<(), String>;
+    fn foreground_clear(&mut self, id: &str) -> Result<(), String>;
     fn overflow(
         &mut self,
         id: &str,
         x: flamewm_render_core::Overflow,
         y: flamewm_render_core::Overflow,
     ) -> Result<(), String>;
+    fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String>;
 }
 
 impl UiDocument {
@@ -105,12 +109,21 @@ impl UiDocument {
         self.document.set_border_color(id, color.into())
     }
 
+    pub fn foreground(&mut self, id: &str, color: UiColor) -> Result<(), String> {
+        self.document
+            .set_foreground_color(id, flamewm_render_core::ColorValue::Literal(color.into()))
+    }
+
     pub fn background_clear(&mut self, id: &str) -> Result<(), String> {
         self.document.clear_background_color(id)
     }
 
     pub fn border_clear(&mut self, id: &str) -> Result<(), String> {
         self.document.clear_border_color(id)
+    }
+
+    pub fn foreground_clear(&mut self, id: &str) -> Result<(), String> {
+        self.document.clear_foreground_color(id)
     }
 
     pub fn overflow(
@@ -120,6 +133,10 @@ impl UiDocument {
         y: flamewm_render_core::Overflow,
     ) -> Result<(), String> {
         self.document.set_overflow(id, x, y)
+    }
+
+    pub fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
+        self.document.set_z_index(id, layer.z_index())
     }
 }
 
@@ -160,12 +177,20 @@ impl UiDocumentAccess for UiDocument {
         self.border(id, color)
     }
 
+    fn foreground(&mut self, id: &str, color: UiColor) -> Result<(), String> {
+        self.foreground(id, color)
+    }
+
     fn background_clear(&mut self, id: &str) -> Result<(), String> {
         self.background_clear(id)
     }
 
     fn border_clear(&mut self, id: &str) -> Result<(), String> {
         self.border_clear(id)
+    }
+
+    fn foreground_clear(&mut self, id: &str) -> Result<(), String> {
+        self.foreground_clear(id)
     }
 
     fn overflow(
@@ -175,6 +200,10 @@ impl UiDocumentAccess for UiDocument {
         y: flamewm_render_core::Overflow,
     ) -> Result<(), String> {
         self.overflow(id, x, y)
+    }
+
+    fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
+        self.layer(id, layer)
     }
 }
 
@@ -237,12 +266,21 @@ impl<'a> UiDocumentAccess for UiDocumentView<'a> {
         self.document.set_border_color(id, color.into())
     }
 
+    fn foreground(&mut self, id: &str, color: UiColor) -> Result<(), String> {
+        self.document
+            .set_foreground_color(id, flamewm_render_core::ColorValue::Literal(color.into()))
+    }
+
     fn background_clear(&mut self, id: &str) -> Result<(), String> {
         self.document.clear_background_color(id)
     }
 
     fn border_clear(&mut self, id: &str) -> Result<(), String> {
         self.document.clear_border_color(id)
+    }
+
+    fn foreground_clear(&mut self, id: &str) -> Result<(), String> {
+        self.document.clear_foreground_color(id)
     }
 
     fn overflow(
@@ -252,6 +290,10 @@ impl<'a> UiDocumentAccess for UiDocumentView<'a> {
         y: flamewm_render_core::Overflow,
     ) -> Result<(), String> {
         self.document.set_overflow(id, x, y)
+    }
+
+    fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
+        self.document.set_z_index(id, layer.z_index())
     }
 }
 
@@ -390,10 +432,15 @@ mod tests {
             },
         )
         .expect("rgba replace");
+        // Node-local override wins; compiled asset stays immutable.
+        let (_, _, _, _, pixels) = doc.document.image_for_node(0).expect("override present");
+        assert_eq!(pixels, &[200, 30, 10, 128]);
         assert_eq!(
             doc.document.document.assets[0].pixels,
-            vec![200, 30, 10, 128]
+            vec![0, 0, 0, 255],
+            "compiled asset must stay immutable"
         );
+        assert_eq!(doc.document.image_revision_for_node(0), 1);
         let error = doc
             .image_rgba8(
                 "icon",
@@ -421,7 +468,208 @@ mod tests {
             },
         )
         .expect("magenta replace");
+        let (_, _, _, _, pixels) = doc.document.image_for_node(0).expect("override present");
+        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
         assert!(doc.document.document.assets[0].is_fully_opaque());
+    }
+
+    fn shared_placeholder_doc() -> UiDocument {
+        let asset = flamewm_render_core::ImageAsset {
+            source: "shared".to_string(),
+            width: 1,
+            height: 1,
+            pixels: vec![9, 9, 9, 255],
+        };
+        let mk = |id: &str| {
+            let mut style = flamewm_render_core::Style::default();
+            style.width = flamewm_render_core::Length::Px(10.0);
+            style.height = flamewm_render_core::Length::Px(10.0);
+            flamewm_render_core::CompiledNode {
+                kind: flamewm_render_core::NodeKind::Image,
+                parent: None,
+                first_child: None,
+                next_sibling: None,
+                id: id.to_string(),
+                action: String::new(),
+                text: String::new(),
+                image: Some(0),
+                style,
+                hover_style: None,
+                active_style: None,
+            }
+        };
+        fn with_parent(
+            mut node: flamewm_render_core::CompiledNode,
+            parent: Option<u32>,
+            next: Option<u32>,
+        ) -> flamewm_render_core::CompiledNode {
+            node.parent = parent;
+            node.next_sibling = next;
+            node
+        }
+        UiDocument {
+            document: RuntimeDocument::new(flamewm_render_core::CompiledDocument {
+                source_fingerprint: 0,
+                root: 0,
+                variables: Vec::new(),
+                assets: vec![asset],
+                nodes: vec![
+                    flamewm_render_core::CompiledNode {
+                        kind: flamewm_render_core::NodeKind::Element,
+                        parent: None,
+                        first_child: Some(1),
+                        next_sibling: None,
+                        id: "root".to_string(),
+                        action: String::new(),
+                        text: String::new(),
+                        image: None,
+                        style: flamewm_render_core::Style::default(),
+                        hover_style: None,
+                        active_style: None,
+                    },
+                    with_parent(mk("a"), Some(0), Some(2)),
+                    with_parent(mk("b"), Some(0), None),
+                ],
+            })
+            .expect("fixture validates"),
+        }
+    }
+
+    #[test]
+    fn shared_placeholder_nodes_keep_distinct_images() {
+        let mut doc = shared_placeholder_doc();
+        doc.image_rgba8(
+            "a",
+            RuntimeImage {
+                source: "red".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+            },
+        )
+        .expect("replace a");
+        doc.image_rgba8(
+            "b",
+            RuntimeImage {
+                source: "green".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![0, 255, 0, 255],
+            },
+        )
+        .expect("replace b");
+        let a = doc.document.node_by_id("a").expect("a index");
+        let b = doc.document.node_by_id("b").expect("b index");
+        let (_, _, _, _, pa) = doc.document.image_for_node(a).expect("a image");
+        let (_, _, _, _, pb) = doc.document.image_for_node(b).expect("b image");
+        assert_eq!(pa, &[255, 0, 0, 255]);
+        assert_eq!(pb, &[0, 255, 0, 255]);
+        // Compiled shared asset stays untouched: per-node overrides only.
+        assert_eq!(doc.document.document.assets[0].pixels, vec![9, 9, 9, 255]);
+        assert_eq!(doc.document.image_revision_for_node(a), 1);
+        assert_eq!(doc.document.image_revision_for_node(b), 1);
+    }
+
+    #[test]
+    fn update_one_shared_node_keeps_sibling_and_advances_revision() {
+        let mut doc = shared_placeholder_doc();
+        doc.image_rgba8(
+            "a",
+            RuntimeImage {
+                source: "red".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+            },
+        )
+        .expect("replace a");
+        doc.image_rgba8(
+            "b",
+            RuntimeImage {
+                source: "green".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![0, 255, 0, 255],
+            },
+        )
+        .expect("replace b");
+        doc.image_rgba8(
+            "a",
+            RuntimeImage {
+                source: "blue".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 255, 255],
+            },
+        )
+        .expect("update a");
+        let a = doc.document.node_by_id("a").expect("a index");
+        let b = doc.document.node_by_id("b").expect("b index");
+        let (_, _, _, _, pa) = doc.document.image_for_node(a).expect("a image");
+        let (_, _, _, _, pb) = doc.document.image_for_node(b).expect("b image");
+        assert_eq!(pa, &[0, 0, 255, 255]);
+        assert_eq!(pb, &[0, 255, 0, 255], "sibling override must survive");
+        assert_eq!(doc.document.image_revision_for_node(a), 2);
+        assert_eq!(doc.document.image_revision_for_node(b), 1);
+    }
+
+    #[test]
+    fn shared_placeholder_paint_commands_carry_per_node_revision() {
+        let mut doc = shared_placeholder_doc();
+        doc.image_rgba8(
+            "a",
+            RuntimeImage {
+                source: "red".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+            },
+        )
+        .expect("replace a");
+        doc.image_rgba8(
+            "b",
+            RuntimeImage {
+                source: "green".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![0, 255, 0, 255],
+            },
+        )
+        .expect("replace b");
+        doc.image_rgba8(
+            "a",
+            RuntimeImage {
+                source: "blue".to_string(),
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 255, 255],
+            },
+        )
+        .expect("update a");
+        let layout = flamewm_render_core::LayoutEngine::compute(
+            &doc.document,
+            50.0,
+            50.0,
+            flamewm_render_core::InteractionState::default(),
+        );
+        let commands = flamewm_render_core::build_paint_commands(
+            &doc.document,
+            &layout,
+            flamewm_render_core::InteractionState::default(),
+        );
+        let mut revisions: Vec<(u32, u64)> = commands
+            .iter()
+            .filter_map(|command| match command {
+                flamewm_render_core::PaintCommand::Image { node, revision, .. } => {
+                    Some((*node, *revision))
+                }
+                _ => None,
+            })
+            .collect();
+        revisions.sort();
+        let a = doc.document.node_by_id("a").expect("a index");
+        let b = doc.document.node_by_id("b").expect("b index");
+        assert_eq!(revisions, vec![(a, 2), (b, 1)]);
     }
 
     #[test]
@@ -449,5 +697,119 @@ mod tests {
     fn rounded_mask_degrades_to_full_rect_for_small_radius() {
         assert_eq!(rounded_rect_mask_spans(4, 2, 0), vec![(0, 0, 4), (1, 0, 4)]);
         assert!(rounded_rect_mask_spans(0, 8, 4).is_empty());
+    }
+
+    fn el(id: &str, parent: Option<u32>) -> flamewm_render_core::CompiledNode {
+        el_color(id, parent, flamewm_render_core::Color::rgb(10, 20, 30))
+    }
+
+    fn el_color(
+        id: &str,
+        parent: Option<u32>,
+        color: flamewm_render_core::Color,
+    ) -> flamewm_render_core::CompiledNode {
+        flamewm_render_core::CompiledNode {
+            kind: flamewm_render_core::NodeKind::Element,
+            parent,
+            first_child: None,
+            next_sibling: None,
+            id: id.to_string(),
+            action: "a".to_string(),
+            text: String::new(),
+            image: None,
+            style: flamewm_render_core::Style {
+                background: flamewm_render_core::ColorValue::Literal(color),
+                ..flamewm_render_core::Style::default()
+            },
+            hover_style: None,
+            active_style: None,
+        }
+    }
+
+    fn stacked_doc() -> (UiDocument, flamewm_render_core::LayoutResult) {
+        let nodes = vec![
+            el_color("base", None, flamewm_render_core::Color::rgb(10, 20, 30)),
+            el_color("top", None, flamewm_render_core::Color::rgb(200, 30, 40)),
+        ];
+        let mut doc = UiDocument {
+            document: RuntimeDocument::new(flamewm_render_core::CompiledDocument {
+                source_fingerprint: 0,
+                root: 0,
+                variables: Vec::new(),
+                assets: Vec::new(),
+                nodes,
+            })
+            .expect("fixture validates"),
+        };
+        doc.layer("base", UiLayer::Content).expect("base layer");
+        doc.layer("top", UiLayer::Popover).expect("top layer");
+        let base = doc.document.node_by_id("base").expect("base index");
+        let top = doc.document.node_by_id("top").expect("top index");
+        assert_eq!(doc.document.effective_z_index(base), 0);
+        assert_eq!(doc.document.effective_z_index(top), 1000);
+        let mut boxes =
+            vec![flamewm_render_core::LayoutBox::default(); doc.document.document.nodes.len()];
+        for entry in &mut boxes {
+            entry.rect = flamewm_render_core::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            };
+        }
+        let count = doc.document.document.nodes.len();
+        let layout = flamewm_render_core::LayoutResult {
+            boxes,
+            contents: vec![flamewm_render_core::Rect::default(); count],
+            revision: doc.document.revision(),
+            z_order: {
+                let mut order: Vec<u32> = (0..count as u32).collect();
+                order.sort_by_key(|index| (doc.document.effective_z_index(*index), *index as i64));
+                order
+            },
+        };
+        (doc, layout)
+    }
+
+    #[test]
+    fn layer_mutation_reaches_effective_z_index() {
+        let (mut doc, _) = stacked_doc();
+        let top = doc.document.node_by_id("top").expect("top index");
+        assert_eq!(
+            doc.document.effective_z_index(top),
+            UiLayer::Popover.z_index()
+        );
+        doc.layer("top", UiLayer::Background).expect("relayer");
+        assert_eq!(
+            doc.document.effective_z_index(top),
+            UiLayer::Background.z_index()
+        );
+    }
+
+    #[test]
+    fn paint_order_follows_layer() {
+        let (doc, layout) = stacked_doc();
+        let commands = flamewm_render_core::build_paint_commands(
+            &doc.document,
+            &layout,
+            flamewm_render_core::InteractionState::default(),
+        );
+        let base_bg = flamewm_render_core::Color::rgb(10, 20, 30);
+        let top_bg = flamewm_render_core::Color::rgb(200, 30, 40);
+        let fills: Vec<flamewm_render_core::Color> = commands
+            .iter()
+            .filter_map(|command| match command {
+                flamewm_render_core::PaintCommand::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills, vec![base_bg, top_bg]);
+    }
+
+    #[test]
+    fn hit_order_follows_layer() {
+        let (doc, layout) = stacked_doc();
+        let top = doc.document.node_by_id("top").expect("top index");
+        assert_eq!(layout.hit_test_action(&doc.document, 5.0, 5.0), Some(top));
     }
 }

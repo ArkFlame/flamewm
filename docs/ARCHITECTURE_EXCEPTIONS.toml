@@ -1,2 +1,9 @@
 # Exact path-level exceptions only. Wildcards, globs, and directory-wide
 # exemptions are invalid. Each entry is a ratchet for one current violation.
+
+[[exception]]
+path = "crates/flamewm-shell/Cargo.toml"
+capability = "facade-source-loc>5000"
+reason = "0.0.8 convergence keeps shell Start/status/calendar/anchored-popover owners in one facade; split deferred to avoid half-migration."
+canonical_target = "crates/flamewm-shell/src"
+remove_by = "0.0.9"

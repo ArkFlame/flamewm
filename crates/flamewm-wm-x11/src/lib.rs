@@ -4,8 +4,10 @@ mod atoms;
 mod chrome;
 mod classifier;
 mod client;
+pub(crate) mod decoration;
 mod geometry;
 mod runtime;
+pub(crate) mod snap_preview;
 mod wm;
 
 pub use runtime::run;
@@ -53,13 +55,18 @@ pub struct X11Desktop {
     conn: Rc<RustConnection>,
     screen: usize,
     root: Window,
+    catalog: std::sync::Arc<ApplicationCatalog>,
     atoms: BTreeMap<String, Atom>,
     next_transaction: u64,
     pending_mode: Option<PendingMode>,
 }
 
 impl X11Desktop {
-    pub(crate) fn from_connection(conn: Rc<RustConnection>, screen: usize) -> FlameResult<Self> {
+    pub(crate) fn from_connection(
+        conn: Rc<RustConnection>,
+        screen: usize,
+        catalog: std::sync::Arc<ApplicationCatalog>,
+    ) -> FlameResult<Self> {
         let root = conn.setup().roots[screen].root;
         let names = [
             "_NET_ACTIVE_WINDOW",
@@ -110,6 +117,7 @@ impl X11Desktop {
             conn,
             screen,
             root,
+            catalog,
             atoms,
             next_transaction: 0,
             pending_mode: None,
@@ -559,9 +567,7 @@ impl ApplicationPort for X11Desktop {
         app: &DesktopAppId,
         options: &ApplicationLaunchOptions,
     ) -> FlameResult<()> {
-        ApplicationCatalog::discover()?
-            .launch(app, options)
-            .map(|_| ())
+        self.catalog.launch(app, options).map(|_| ())
     }
     fn launch_uri(&mut self, uri: &str) -> FlameResult<()> {
         Command::new("xdg-open")

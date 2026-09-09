@@ -9,6 +9,7 @@ use crate::ffi::dynamic_library::DynamicLibrary;
 use crate::xlib::{Display, Window};
 
 pub(crate) const SHAPE_BOUNDING: c_int = 0;
+pub(crate) const SHAPE_INPUT: c_int = 2;
 pub(crate) const SHAPE_SET: c_int = 0;
 pub(crate) const SHAPE_YX_SORTED: c_int = 1;
 type ShapeRectanglesFn = unsafe extern "C" fn(
@@ -64,6 +65,47 @@ impl XShapeBridge {
         window: Window,
         spans: &[(u32, u32, u32)],
     ) -> Result<(), String> {
+        unsafe { self.apply_mask_kind(window, SHAPE_BOUNDING, spans) }
+    }
+
+    /// Apply an input-region mask. Pass-through surfaces call this with an
+    /// empty span list, producing an empty XShape input region so pointer
+    /// events fall through. Empty input is legal here (unlike bounding).
+    ///
+    /// # Safety
+    ///
+    /// `window` must be a live X window on this bridge's display.
+    pub(crate) unsafe fn apply_input_mask(
+        &self,
+        window: Window,
+        spans: &[(u32, u32, u32)],
+    ) -> Result<(), String> {
+        if spans.is_empty() {
+            let empty: [XRectangle; 0] = [];
+            unsafe {
+                (self.shape_rectangles)(
+                    self.display,
+                    window,
+                    SHAPE_INPUT,
+                    0,
+                    0,
+                    empty.as_ptr(),
+                    0,
+                    SHAPE_SET,
+                    SHAPE_YX_SORTED,
+                )
+            };
+            return Ok(());
+        }
+        unsafe { self.apply_mask_kind(window, SHAPE_INPUT, spans) }
+    }
+
+    unsafe fn apply_mask_kind(
+        &self,
+        window: Window,
+        kind: c_int,
+        spans: &[(u32, u32, u32)],
+    ) -> Result<(), String> {
         let rects: Vec<XRectangle> = spans
             .iter()
             .filter(|(_, start, end)| end > start)
@@ -85,7 +127,7 @@ impl XShapeBridge {
             (self.shape_rectangles)(
                 self.display,
                 window,
-                SHAPE_BOUNDING,
+                kind,
                 0,
                 0,
                 rects.as_ptr(),
@@ -101,6 +143,9 @@ impl XShapeBridge {
 /// Pure geometry shared with the `flamewm-ui-x11` span tests: row spans
 /// (y, x_start, x_end_exclusive) for a rounded rect of `width`x`height`
 /// with corner radius `radius` (already clamped to half the min side).
+/// Coverage spans from `native::coverage` reuse this rasterization so the
+/// Shape bounding mask and the painted pixels agree.
+#[allow(dead_code)]
 pub(crate) fn rounded_mask_spans(width: u32, height: u32, radius: u32) -> Vec<(u32, u32, u32)> {
     if width == 0 || height == 0 {
         return Vec::new();

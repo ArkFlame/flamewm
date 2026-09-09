@@ -1,21 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use flamewm_api::applications::ApplicationLaunchOptions;
 use flamewm_api::{OutputId, Point, Rect};
 use flamewm_applications::DesktopEntry;
 use flamewm_control_core::{ControlRequest, ControlResponse};
-use flamewm_control_dbus::ControlClient;
+use flamewm_control_dbus::{ControlClient, ControlSignalClient};
 use flamewm_dbus_reactor::BusKind;
 use flamewm_desktop_core::file_actions::{
     CommandIntent, EntryMenuAction, LauncherOpen, create_new_folder, desktop_settings,
-    entry_context_menu, launcher_open_kind, open_terminal, shortcut_destination, terminal_program,
+    entry_context_menu, launcher_open_kind, open_terminal, rename_entry_no_replace,
+    shortcut_destination, terminal_program, validate_rename_name,
 };
 use flamewm_desktop_core::layout::{
     Cell, DragItem, GridConfig, drag_cell_delta, group_drag_transaction, threshold_passed,
@@ -29,18 +31,160 @@ use flamewm_desktop_core::presentation::{
     context_menu_rect, menu_height_for_rows,
 };
 use flamewm_desktop_core::selection::{SelectionModel, double_click_opens, rubber_visible};
-use flamewm_desktop_core::sticky::{StickyNote, StickyNoteStore};
+use flamewm_desktop_core::sticky::{
+    ResizeCorner, StickyNote, StickyNoteStore, move_rect, resize_rect,
+};
 use flamewm_desktop_core::sticky_persistence;
 use flamewm_desktop_core::trash::{Trash, TrashLocation, TrashScope};
 use flamewm_integrations_linux::icons::IconResolver;
+use flamewm_profiler::{CounterPoint, MemoryGauge, ProfilePoint, report_window};
+use flamewm_reactor::{FdAction, Reactor};
 use flamewm_ui_x11::PointerButton;
 use flamewm_ui_x11::{
     UiActionEvent, UiActionPhase, UiColor, UiControllerEvent, UiDocumentAccess, UiWindowConfig,
     UiWindowRole, decode_document, pointer_button_from_raw, root_geometry,
-    run_with_controller_events_role,
+    run_with_controller_events_role_with_reactor,
 };
 
 mod projection;
+
+use std::sync::OnceLock;
+
+fn scan_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.scan"))
+}
+
+fn sync_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.sync_document"))
+}
+
+fn rescan_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.rescan"))
+}
+
+fn icon_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.icon.resolve"))
+}
+
+fn inotify_wakeup_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.inotify.wakeup"))
+}
+
+fn inotify_rescan_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.inotify.rescan"))
+}
+
+fn selection_begin_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.selection.begin"))
+}
+
+fn selection_visible_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.selection.visible"))
+}
+
+fn selection_end_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.selection.end"))
+}
+
+fn context_secondary_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.context.secondary"))
+}
+
+fn context_open_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.context.open"))
+}
+
+fn context_action_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.context.action"))
+}
+
+fn render_sync_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.render.sync"))
+}
+
+fn drag_ghost_show_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.drag.ghost.show"))
+}
+
+fn drag_ghost_motion_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.drag.ghost.motion"))
+}
+
+fn rename_open_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.rename.open"))
+}
+
+fn rename_success_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.rename.success"))
+}
+
+fn rename_failure_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.rename.failure"))
+}
+
+fn sticky_edit_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.sticky.edit"))
+}
+
+fn sticky_move_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.sticky.move"))
+}
+
+fn sticky_resize_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.sticky.resize"))
+}
+
+fn sticky_persist_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.sticky.persist"))
+}
+
+fn workspace_change_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.workspace.change"))
+}
+
+fn model_gauge() -> &'static MemoryGauge {
+    static GAUGE: OnceLock<MemoryGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| MemoryGauge::new("desktop.model"))
+}
+
+fn launcher_gauge() -> &'static MemoryGauge {
+    static GAUGE: OnceLock<MemoryGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| MemoryGauge::new("desktop.launcher"))
+}
+
+fn icon_gauge() -> &'static MemoryGauge {
+    static GAUGE: OnceLock<MemoryGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| MemoryGauge::new("desktop.icon"))
+}
+
+fn update_gauges(state: &DesktopState) {
+    model_gauge().set((state.model.items().count() as u64).saturating_mul(256));
+    launcher_gauge().set((state.launchers.len() as u64).saturating_mul(320));
+    icon_gauge().set(state.icon_resolver.memory_estimate_bytes() as u64);
+}
 
 const SLOT_COUNT: usize = 128;
 const BLANK_ROW_IDS: [&str; 5] = [
@@ -50,8 +194,9 @@ const BLANK_ROW_IDS: [&str; 5] = [
     "menu-row-desktop",
     "menu-row-settings",
 ];
-const ENTRY_ROW_IDS: [&str; 3] = [
+const ENTRY_ROW_IDS: [&str; 4] = [
     "menu-row-empty-trash",
+    "menu-row-rename",
     "menu-row-shortcut",
     "menu-row-delete",
 ];
@@ -96,8 +241,53 @@ struct DesktopState {
     menu: Option<MenuState>,
     pending_delete: Option<PathBuf>,
     last_click: Option<ClickRecord>,
-    watch: Receiver<SystemTime>,
-    stamp: SystemTime,
+    dirty: Arc<AtomicBool>,
+    rename: Option<RenameState>,
+    drag_ghost: Option<DragGhost>,
+    active_workspace: usize,
+    sticky_edit: Option<StickyEdit>,
+    sticky_gesture: Option<StickyGesture>,
+    sticky_persist_pending: bool,
+    sticky_persist_armed: bool,
+    sticky_persist_due: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct RenameState {
+    item_id: String,
+    source_path: PathBuf,
+    buffer: String,
+}
+
+struct DragGhost {
+    kind: DesktopItemKind,
+    icon_override: Option<String>,
+    label: String,
+    offset_x: f32,
+    offset_y: f32,
+    count: usize,
+    visible: bool,
+}
+
+#[derive(Clone)]
+struct StickyEdit {
+    note_id: String,
+    buffer: String,
+}
+
+#[derive(Clone)]
+struct StickyGesture {
+    note_id: String,
+    mode: StickyGestureMode,
+    start_x: f32,
+    start_y: f32,
+    original: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StickyGestureMode {
+    Move,
+    Resize,
 }
 
 #[derive(Clone)]
@@ -121,6 +311,7 @@ struct OriginalItem {
 }
 
 fn main() -> Result<(), String> {
+    flamewm_profiler::init_process("flamewm-desktop");
     let home = PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?);
     let user_dirs = home.join(".config/user-dirs.dirs");
     let user_dirs = fs::read_to_string(user_dirs).ok();
@@ -131,9 +322,12 @@ fn main() -> Result<(), String> {
     let grid = GridConfig::compute(work_area, 100);
     let mut model = DesktopModel::default();
     let output = OutputId::new("default");
-    model
-        .rescan(&directory, &output, grid)
-        .map_err(|error| format!("{error:?}"))?;
+    {
+        let _span = scan_point().start();
+        model
+            .rescan(&directory, &output, grid)
+            .map_err(|error| format!("{error:?}"))?;
+    }
     let layout_path = state_path("desktop-layout.state")?;
     if let Ok(text) = fs::read_to_string(&layout_path) {
         for (path, position) in LayoutStore::parse(&text).map_err(|error| format!("{error:?}"))? {
@@ -145,35 +339,155 @@ fn main() -> Result<(), String> {
     }
     let sticky_path = sticky_persistence::state_path().map_err(|error| format!("{error:?}"))?;
     let sticky = sticky_persistence::load(&sticky_path).map_err(|error| format!("{error:?}"))?;
-    let stamp = directory_stamp(&directory);
-    let watch = directory_watcher(directory.clone());
-    let mut state = DesktopState {
-        directory,
-        model,
-        grid,
-        icon_resolver: IconResolver::from_environment(packaged_root(), 0),
-        layout_path,
-        sticky,
-        sticky_path,
-        selection: SelectionModel::default(),
-        selection_start: None,
-        item_drag: None,
-        launchers: BTreeMap::new(),
-        menu: None,
-        pending_delete: None,
-        last_click: None,
-        watch,
-        stamp,
-    };
-    refresh_launchers(&mut state);
+    let dirty = Arc::new(AtomicBool::new(false));
+    let mut inotify = inotify::Inotify::init().map_err(|error| format!("init inotify: {error}"))?;
+    inotify
+        .watches()
+        .add(
+            &directory,
+            inotify::WatchMask::CREATE
+                | inotify::WatchMask::DELETE
+                | inotify::WatchMask::MOVED_FROM
+                | inotify::WatchMask::MOVED_TO
+                | inotify::WatchMask::CLOSE_WRITE
+                | inotify::WatchMask::ATTRIB,
+        )
+        .map_err(|error| format!("watch desktop directory: {error}"))?;
+    let active_workspace = query_active_workspace();
+    let state_cell = std::rc::Rc::new(std::cell::RefCell::new({
+        let mut state = DesktopState {
+            directory,
+            model,
+            grid,
+            icon_resolver: IconResolver::from_environment(packaged_root(), 0),
+            layout_path,
+            sticky,
+            sticky_path,
+            selection: SelectionModel::default(),
+            selection_start: None,
+            item_drag: None,
+            launchers: BTreeMap::new(),
+            menu: None,
+            pending_delete: None,
+            last_click: None,
+            dirty: Arc::clone(&dirty),
+            rename: None,
+            drag_ghost: None,
+            active_workspace,
+            sticky_edit: None,
+            sticky_gesture: None,
+            sticky_persist_pending: false,
+            sticky_persist_armed: false,
+            sticky_persist_due: None,
+        };
+        refresh_launchers(&mut state);
+        update_gauges(&state);
+        state
+    }));
 
     let mut document = decode_document(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/flamewm-desktop.rwr"
     )))?;
     projection::project_background(&mut document, None)?;
-    sync_document(&mut document, &mut state)?;
-    run_with_controller_events_role(
+    projection::assign_document_layers(&mut document)?;
+    projection::initialize_transient_visibility(&mut document)?;
+    {
+        let _span = sync_point().start();
+        sync_document(&mut document, &mut state_cell.borrow_mut())?;
+    }
+    update_gauges(&state_cell.borrow());
+    let mut reactor = Reactor::new().map_err(|error| format!("create reactor: {error}"))?;
+    reactor
+        .register_timer(
+            Duration::from_secs(flamewm_profiler::profile_interval_secs()),
+            true,
+            || {
+                if flamewm_profiler::enabled() {
+                    let report = report_window();
+                    if !report.is_empty() {
+                        eprintln!("{report}");
+                    }
+                }
+            },
+        )
+        .map_err(|error| format!("register profiler timer: {error}"))?;
+    register_sticky_persist_timer(&mut reactor)?;
+    // Best-effort workspace signal subscription: startup query already ran,
+    // WorkspacesChanged only refreshes the active index and sticky visibility.
+    match ControlSignalClient::connect(BusKind::Session) {
+        Ok(client) => {
+            let client: &'static ControlSignalClient = Box::leak(Box::new(client));
+            let watch = client.watch();
+            let watch_fd = watch.fd;
+            let watch_readable = watch
+                .events
+                .contains(flamewm_api::ports::FdEvents::READABLE);
+            let watch_writable = watch
+                .events
+                .contains(flamewm_api::ports::FdEvents::WRITABLE);
+            let interest = match (watch_readable, watch_writable) {
+                (true, true) => calloop::Interest::BOTH,
+                (false, true) => calloop::Interest::WRITE,
+                _ => calloop::Interest::READ,
+            };
+            let workspace_cell = std::rc::Rc::clone(&state_cell);
+            let registration = reactor.register_raw_fd_with_action(watch_fd, interest, {
+                move |_, _| {
+                    let state_cell = &workspace_cell;
+                    let _ = client.on_ready(|signal| {
+                        if let flamewm_control_wire::ControlSignal::WorkspacesChanged { .. } =
+                            signal
+                        {
+                            let mut state = state_cell.borrow_mut();
+                            // Exactly one GetWorkspaces per signal, then update + sync.
+                            let next = query_active_workspace();
+                            if next != state.active_workspace {
+                                state.active_workspace = next;
+                                workspace_change_counter().increment();
+                                let _ = refresh_if_changed_direct(&mut state);
+                            }
+                        }
+                    });
+                    FdAction::Continue
+                }
+            });
+            if let Err(error) = registration {
+                eprintln!("desktop: degraded workspaces signal subscription: {error}");
+            }
+            // ControlSignalClient is Box::leaked above; it lives for the process
+            // lifetime and owns the pump fd.
+        }
+        Err(error) => {
+            eprintln!("desktop: degraded workspaces signal subscription: {error:?}");
+        }
+    }
+    reactor
+        .register_fd_with_source_action(inotify, calloop::Interest::READ, move |_, source, _| {
+            let mut buffer = [0u8; 4096];
+            let mut changed = false;
+            inotify_wakeup_counter().increment();
+            loop {
+                match source.read_events(&mut buffer) {
+                    Ok(events) => {
+                        if events.count() == 0 {
+                            break;
+                        }
+                        changed = true;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            if changed {
+                dirty.store(true, Ordering::Release);
+            }
+            // Rearm until fd close/IGNORE/Q_OVERFLOW self-delete; level
+            // trigger keeps one rescan per burst via reduce below.
+            FdAction::Continue
+        })
+        .map_err(|error| format!("register inotify: {error}"))?;
+    run_with_controller_events_role_with_reactor(
         document,
         UiWindowConfig {
             width: work_area.width.max(1) as u32,
@@ -183,12 +497,101 @@ fn main() -> Result<(), String> {
             title: "FlameWM Desktop".to_owned(),
         },
         UiWindowRole::Desktop,
-        move |event, document| {
-            refresh_if_changed(document, &mut state)?;
-            let UiControllerEvent::Action(action) = event;
-            handle_event(action, document, &mut state)
+        &mut reactor,
+        {
+            let event_cell = std::rc::Rc::clone(&state_cell);
+            move |event, document| {
+                let state_cell = &event_cell;
+                let mut state = state_cell.borrow_mut();
+                refresh_if_changed(document, &mut state)?;
+                poll_sticky_persist(document, &mut state)?;
+                let UiControllerEvent::Action(action) = event;
+                handle_event(action, document, &mut state)
+            }
         },
-    )
+        {
+            let flush_cell = std::rc::Rc::clone(&state_cell);
+            move |document| {
+                let state_cell = &flush_cell;
+                let mut state = state_cell.borrow_mut();
+                refresh_if_changed(document, &mut state)?;
+                poll_sticky_persist(document, &mut state)?;
+                flush_sticky_persist_if_due(document, &mut state)
+            }
+        },
+    )?;
+    flush_sticky_now(&state_cell.borrow());
+    Ok(())
+}
+
+fn query_active_workspace() -> usize {
+    match control_client() {
+        Ok(client) => match client.call(&ControlRequest::GetWorkspaces) {
+            Ok(ControlResponse::Workspaces(snapshot)) => snapshot.active_index,
+            _ => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+fn refresh_if_changed_direct(state: &mut DesktopState) -> Result<(), String> {
+    // Workspace signal path has no document handle; sticky visibility sync
+    // happens on the next event/refresh tick through sync_document.
+    state.dirty.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn register_sticky_persist_timer(reactor: &mut Reactor) -> Result<(), String> {
+    // Debounce owner is the reactor tick: the flag is armed by mutations and
+    // flushed in poll_sticky_persist/flush_sticky_persist_if_due (<=500ms via
+    // a 100ms repeat). No threads.
+    reactor
+        .register_timer(Duration::from_millis(100), true, || {})
+        .map(|_| ())
+        .map_err(|error| format!("register sticky persist timer: {error}"))
+}
+
+fn poll_sticky_persist(
+    _document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    if state.sticky_persist_pending && !state.sticky_persist_armed {
+        state.sticky_persist_armed = true;
+        state.sticky_persist_due = Some(Instant::now() + Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+fn flush_sticky_persist_if_due(
+    _document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let Some(due) = state.sticky_persist_due else {
+        return Ok(());
+    };
+    if Instant::now() < due {
+        return Ok(());
+    }
+    state.sticky_persist_due = None;
+    state.sticky_persist_pending = false;
+    state.sticky_persist_armed = false;
+    persist_sticky(state)
+}
+
+fn persist_sticky(state: &mut DesktopState) -> Result<(), String> {
+    sticky_persist_counter().increment();
+    sticky_persistence::persist(&state.sticky_path, &state.sticky)
+        .map_err(|error| format!("{error:?}"))
+}
+
+fn schedule_sticky_persist(state: &mut DesktopState) {
+    state.sticky_persist_pending = true;
+}
+
+fn flush_sticky_now(state: &DesktopState) {
+    if state.sticky_persist_pending {
+        let _ = sticky_persistence::persist(&state.sticky_path, &state.sticky);
+    }
 }
 
 /// Root geometry comes from the actual X root through the X11 runtime owner.
@@ -271,54 +674,24 @@ fn state_path(name: &str) -> Result<PathBuf, String> {
     Ok(base.join(name))
 }
 
-fn directory_stamp(path: &Path) -> SystemTime {
-    fs::read_dir(path)
-        .ok()
-        .and_then(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter_map(|entry| entry.metadata().ok())
-                .filter_map(|meta| meta.modified().ok())
-                .max()
-        })
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-}
-
-fn directory_watcher(path: PathBuf) -> Receiver<SystemTime> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut previous = directory_stamp(&path);
-        loop {
-            thread::sleep(Duration::from_millis(350));
-            let current = directory_stamp(&path);
-            if current != previous {
-                previous = current;
-                if sender.send(current).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-    receiver
-}
-
 fn refresh_if_changed(
     document: &mut impl UiDocumentAccess,
     state: &mut DesktopState,
 ) -> Result<(), String> {
-    let Ok(stamp) = state.watch.try_recv() else {
-        return Ok(());
-    };
-    if stamp == state.stamp {
+    // One rescan per burst: reactor drains inotify, reduce consumes flag once.
+    if !state.dirty.swap(false, Ordering::Acquire) {
         return Ok(());
     }
-    state.stamp = stamp;
+    inotify_rescan_counter().increment();
+    let _span = rescan_point().start();
     state
         .model
         .rescan(&state.directory, &OutputId::new("default"), state.grid)
         .map_err(|error| format!("{error:?}"))?;
     refresh_launchers(state);
-    sync_document(document, state)
+    sync_document(document, state)?;
+    update_gauges(state);
+    Ok(())
 }
 
 /// Launcher metadata cache keyed by path, refreshed after every rescan.
@@ -365,32 +738,98 @@ fn sync_document(
     document: &mut impl UiDocumentAccess,
     state: &mut DesktopState,
 ) -> Result<(), String> {
+    let _span = sync_point().start();
+    render_sync_counter().increment();
     for index in 0..SLOT_COUNT {
         let item = state.model.items().nth(index);
         if let Some(item) = item {
             let point = state.grid.cell_to_pixel(item.cell);
             let icon = launcher_icon(state, &item.path);
-            projection::project_item(
-                document,
-                &mut state.icon_resolver,
-                index,
-                item.kind,
-                &item.display_name,
-                point,
-                icon.as_deref(),
-            )?;
+            {
+                let _icon = icon_point().start();
+                projection::project_item(
+                    document,
+                    &mut state.icon_resolver,
+                    index,
+                    item.kind,
+                    &item.display_name,
+                    point,
+                    icon.as_deref(),
+                )?;
+            }
         } else {
             projection::clear_item(document, index)?;
         }
     }
     sync_selection_visuals(document, state)?;
     sync_menu(document, state)?;
-    document.visible(
-        "sticky-note",
-        state.sticky.enabled() && !state.sticky.notes().is_empty(),
-    )?;
-    if let Some(note) = state.sticky.notes().first() {
-        document.text("sticky-text", note.text.clone())?;
+    sync_rename_editor(document, state)?;
+    sync_drag_ghost(document, state)?;
+    sync_sticky(document, state)?;
+    update_gauges(state);
+    Ok(())
+}
+
+const STICKY_SLOTS: usize = 16;
+
+fn visible_sticky_notes(state: &DesktopState) -> Vec<StickyNote> {
+    state
+        .sticky
+        .notes_for_workspace(state.active_workspace)
+        .into_iter()
+        .take(STICKY_SLOTS)
+        .cloned()
+        .collect()
+}
+
+fn sync_sticky(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let visible = visible_sticky_notes(state);
+    let show_any = state.sticky.enabled() && !visible.is_empty();
+    for slot in 0..STICKY_SLOTS {
+        let number = slot + 1;
+        let id = format!("sticky-{number}");
+        if let Some(note) = visible.get(slot) {
+            document.visible(&id, show_any)?;
+            document.position(&id, note.rect.x as f32, note.rect.y as f32)?;
+            document.size(&id, note.rect.width as f32, note.rect.height as f32)?;
+            document.background(
+                &id,
+                UiColor {
+                    r: note.background.red,
+                    g: note.background.green,
+                    b: note.background.blue,
+                    a: 255,
+                },
+            )?;
+            let number = slot + 1;
+            let text_id = format!("sticky-{number}-text");
+            let text = if state
+                .sticky_edit
+                .as_ref()
+                .is_some_and(|edit| edit.note_id == note.id)
+            {
+                state.sticky_edit.as_ref().map(|edit| edit.buffer.clone())
+            } else {
+                None
+            }
+            .unwrap_or_else(|| note.text.clone());
+            document.text(&text_id, text)?;
+            let number = slot + 1;
+            document.visible(&format!("sticky-{number}-drag"), show_any)?;
+            for corner in ["nw", "ne", "sw", "se"] {
+                document.visible(&format!("sticky-{number}-resize-{corner}"), show_any)?;
+            }
+        } else {
+            document.visible(&id, false)?;
+            let number = slot + 1;
+            let _ = document.visible(&format!("sticky-{number}-drag"), false);
+            for corner in ["nw", "ne", "sw", "se"] {
+                let _ = document.visible(&format!("sticky-{number}-resize-{corner}"), false);
+            }
+        }
     }
     Ok(())
 }
@@ -400,20 +839,35 @@ fn handle_event(
     document: &mut impl UiDocumentAccess,
     state: &mut DesktopState,
 ) -> Result<(), String> {
-    if action.action == "keyboard.input" && action.text.as_deref() == Some("") {
-        return cancel_transient(document, state);
+    if action.action == "keyboard.input" {
+        if action.text.as_deref() == Some("") {
+            return cancel_transient(document, state);
+        }
+        if state.rename.is_some() {
+            return handle_rename_input(action, document, state);
+        }
+        if let Some(edit) = state.sticky_edit.clone() {
+            return handle_sticky_text_input(action, document, state, &edit);
+        }
+    }
+    if action.action == "keyboard.confirm" && state.rename.is_some() {
+        return confirm_rename(document, state);
     }
     if action.phase == UiActionPhase::Release
         && action.inside
         && pointer_button(action) == PointerButton::Primary
         && is_menu_action(&action.action)
     {
+        context_action_counter().increment();
         return handle_menu_action(&action.action, document, state);
     }
     if matches!(
         action.action.as_str(),
         "desktop.menu.surface" | "desktop.entry-menu.surface" | "desktop.confirm.surface"
     ) {
+        return Ok(());
+    }
+    if action.action == "desktop.rename.surface" {
         return Ok(());
     }
     if action.action == "desktop.surface" {
@@ -446,6 +900,9 @@ fn handle_event(
     if action.action == "sticky.menu.surface" {
         return Ok(());
     }
+    if action.action.starts_with("sticky.") {
+        return handle_sticky_slot(action, document, state);
+    }
     if action.action == "sticky.move"
         && action.phase == UiActionPhase::Release
         && pointer_button(action) == PointerButton::Secondary
@@ -472,6 +929,7 @@ fn is_menu_action(action: &str) -> bool {
             | "menu.desktop"
             | "menu.settings"
             | "entry.empty-trash"
+            | "entry.rename"
             | "entry.shortcut"
             | "entry.delete"
             | "confirm.delete"
@@ -490,10 +948,16 @@ fn cancel_transient(
     state.last_click = None;
     state.menu = None;
     state.pending_delete = None;
+    state.rename = None;
+    state.sticky_edit = None;
+    state.sticky_gesture = None;
+    hide_drag_ghost(document, state)?;
     document.visible("desktop-selection", false)?;
     hide_menus(document)?;
     hide_confirm(document)?;
-    sync_selection_visuals(document, state)
+    sync_selection_visuals(document, state)?;
+    sync_rename_editor(document, state)?;
+    sync_sticky(document, state)
 }
 
 fn handle_surface(
@@ -508,6 +972,7 @@ fn handle_surface(
         if action.phase != UiActionPhase::Release {
             return Ok(());
         }
+        context_secondary_counter().increment();
         let anchor = pointer_point(action, state.grid.work_area);
         state.menu = Some(MenuState {
             kind: MenuKind::Blank,
@@ -535,6 +1000,7 @@ fn handle_surface(
             let start = pointer_point(action, state.grid.work_area);
             state.item_drag = None;
             state.selection_start = Some(start);
+            selection_begin_counter().increment();
             state.selection.clear();
             state.selection.set_rubber(normalized_selection_rect(
                 start,
@@ -554,6 +1020,7 @@ fn handle_surface(
                     point.x as f32 - start.x as f32,
                     point.y as f32 - start.y as f32,
                 ) {
+                    selection_visible_counter().increment();
                     set_selection_overlay(document, rect)?;
                 } else {
                     document.visible("desktop-selection", false)?;
@@ -570,6 +1037,7 @@ fn handle_surface(
             }
             state.selection_start = None;
             state.selection.clear_rubber();
+            selection_end_counter().increment();
             document.visible("desktop-selection", false)?;
             sync_selection_visuals(document, state)?;
         }
@@ -591,6 +1059,7 @@ fn handle_item(
         if action.phase != UiActionPhase::Release {
             return Ok(());
         }
+        context_secondary_counter().increment();
         let Some(item) = state.model.items().nth(index) else {
             return Ok(());
         };
@@ -669,7 +1138,11 @@ fn handle_item(
                 return Ok(());
             };
             let item_id = item.id.clone();
-            let Some(drag) = state.item_drag.as_mut() else {
+            let item_label = item.display_name.clone();
+            let item_kind = item.kind;
+            let item_path = item.path.clone();
+            let anchor_snapshot = state.item_drag.clone();
+            let Some(drag) = anchor_snapshot else {
                 return Ok(());
             };
             if drag.anchor_index != index || drag.anchor_id != item_id {
@@ -678,13 +1151,37 @@ fn handle_item(
             if !drag.moved && !threshold_passed(action.x - drag.start_x, action.y - drag.start_y) {
                 return Ok(());
             }
-            drag.moved = true;
+            // Threshold transition: capture icon+label once, then project the
+            // ghost; canonical desktop-item-N nodes stay untouched.
+            if state.drag_ghost.is_none() {
+                state.drag_ghost = Some(DragGhost {
+                    kind: item_kind,
+                    icon_override: launcher_icon(state, &item_path),
+                    label: item_label,
+                    offset_x: action.x - drag.start_x,
+                    offset_y: action.y - drag.start_y,
+                    count: drag.originals.len(),
+                    visible: false,
+                });
+            }
+            if let Some(drag_state) = state.item_drag.as_mut() {
+                drag_state.moved = true;
+            }
             state.last_click = None;
-            let snapshot = drag.clone();
-            apply_drag_visual(document, state, &snapshot, action.x, action.y)?;
+            if state
+                .drag_ghost
+                .as_ref()
+                .is_some_and(|ghost| !ghost.visible)
+            {
+                drag_ghost_show_counter().increment();
+            } else {
+                drag_ghost_motion_counter().increment();
+            }
+            show_drag_ghost(document, state, action.x, action.y)?;
         }
         UiActionPhase::Release => {
             let Some(drag) = state.item_drag.take() else {
+                hide_drag_ghost(document, state)?;
                 return Ok(());
             };
             if drag.anchor_index != index {
@@ -693,11 +1190,8 @@ fn handle_item(
             }
             let moved =
                 drag.moved || threshold_passed(action.x - drag.start_x, action.y - drag.start_y);
+            hide_drag_ghost(document, state)?;
             if moved {
-                if !drag.moved {
-                    let snapshot = drag.clone();
-                    apply_drag_visual(document, state, &snapshot, action.x, action.y)?;
-                }
                 commit_item_drag(document, state, &drag, action.x, action.y)?;
             }
         }
@@ -824,6 +1318,9 @@ fn handle_menu_action(
             state.menu = None;
             sync_document(document, state)?;
         }
+        "entry.rename" => {
+            open_rename(document, state)?;
+        }
         "entry.delete" => {
             let selected = state
                 .menu
@@ -885,6 +1382,145 @@ fn handle_menu_action(
         _ => {}
     }
     Ok(())
+}
+
+fn open_rename(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let selected = state
+        .menu
+        .as_ref()
+        .and_then(|menu| menu.selected_id.clone());
+    let Some(id) = selected else {
+        state.menu = None;
+        return sync_menu(document, state);
+    };
+    let source = state.model.items().find(|item| item.id == id).map(|item| {
+        (
+            item.id.clone(),
+            item.path.clone(),
+            item.display_name.clone(),
+        )
+    });
+    let Some((item_id, source_path, buffer)) = source else {
+        state.menu = None;
+        return sync_menu(document, state);
+    };
+    state.menu = None;
+    hide_menus(document)?;
+    rename_open_counter().increment();
+    state.rename = Some(RenameState {
+        item_id,
+        source_path,
+        buffer,
+    });
+    sync_rename_editor(document, state)
+}
+
+fn sync_rename_editor(
+    document: &mut impl UiDocumentAccess,
+    state: &DesktopState,
+) -> Result<(), String> {
+    let Some(rename) = state.rename.as_ref() else {
+        let _ = document.visible("desktop-rename", false);
+        return Ok(());
+    };
+    let anchor = state
+        .model
+        .items()
+        .find(|item| item.id == rename.item_id)
+        .map(|item| state.grid.cell_to_pixel(item.cell))
+        .unwrap_or(state.grid.work_area.origin());
+    let width = 220;
+    let height = 48;
+    let placed = clamp_menu_anchor(
+        state.grid.work_area,
+        Rect::new(anchor.x, anchor.y + 84, width, height),
+        (width, height),
+    );
+    document.position("desktop-rename", placed.x as f32, placed.y as f32)?;
+    document.size("desktop-rename", placed.width as f32, placed.height as f32)?;
+    document.text("desktop-rename-value", rename.buffer.clone())?;
+    document.visible("desktop-rename", true)?;
+    Ok(())
+}
+
+fn handle_rename_input(
+    action: &UiActionEvent,
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let text = action.text.clone().unwrap_or_default();
+    if text == "\n" || text == "\r" {
+        return confirm_rename(document, state);
+    }
+    let Some(rename) = state.rename.as_mut() else {
+        return Ok(());
+    };
+    if text == "\u{8}" || text == "\u{7f}" {
+        rename.buffer.pop();
+    } else {
+        for ch in text.chars() {
+            if !ch.is_control() {
+                rename.buffer.push(ch);
+            }
+        }
+    }
+    sync_rename_editor(document, state)
+}
+
+fn confirm_rename(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let Some(rename) = state.rename.clone() else {
+        return Ok(());
+    };
+    let validated = match validate_rename_name(&rename.buffer) {
+        Ok(name) => name,
+        Err(error) => {
+            rename_failure_counter().increment();
+            eprintln!("desktop: rename rejected: {error:?}; keeping editor open");
+            return Ok(());
+        }
+    };
+    let target = rename
+        .source_path
+        .parent()
+        .map(|parent| parent.join(&validated));
+    let Some(target) = target else {
+        rename_failure_counter().increment();
+        eprintln!("desktop: rename rejected: no parent; keeping editor open");
+        return Ok(());
+    };
+    if let Err(error) = rename_entry_no_replace(&rename.source_path, &target) {
+        rename_failure_counter().increment();
+        eprintln!("desktop: rename failed: {error:?}; keeping editor open");
+        return Ok(());
+    }
+    state.model.migrate_rename(&rename.source_path, &target);
+    if let Err(error) = state
+        .model
+        .rescan(&state.directory, &OutputId::new("default"), state.grid)
+    {
+        rename_failure_counter().increment();
+        eprintln!("desktop: rename rescan failed: {error:?}; keeping editor open");
+        return Ok(());
+    }
+    refresh_launchers(state);
+    if let Err(error) = LayoutStore::persist(&state.layout_path, state.model.positions()) {
+        rename_failure_counter().increment();
+        eprintln!("desktop: rename persist failed: {error:?}; keeping editor open");
+        return Ok(());
+    }
+    rename_success_counter().increment();
+    state.selection.clear();
+    state
+        .selection
+        .select(target.to_string_lossy().into_owned());
+    state.rename = None;
+    sync_document(document, state)
 }
 
 fn control_client() -> Result<ControlClient, String> {
@@ -996,6 +1632,7 @@ fn blank_row_id(action: BlankDesktopAction) -> &'static str {
 fn entry_row_id(action: EntryMenuAction) -> &'static str {
     match action {
         EntryMenuAction::EmptyTrash => "menu-row-empty-trash",
+        EntryMenuAction::Rename => "menu-row-rename",
         EntryMenuAction::CreateShortcut => "menu-row-shortcut",
         EntryMenuAction::Delete => "menu-row-delete",
     }
@@ -1082,44 +1719,85 @@ fn place_menu(
     let placed = context_menu_rect(state.grid.work_area, anchor, rows);
     document.position(id, placed.x as f32, placed.y as f32)?;
     document.size(id, placed.width as f32, placed.height as f32)?;
+    context_open_counter().increment();
     document.visible(id, true)
 }
 
-fn apply_drag_visual(
+fn show_drag_ghost(
     document: &mut impl UiDocumentAccess,
-    state: &DesktopState,
-    drag: &ItemDrag,
+    state: &mut DesktopState,
     x: f32,
     y: f32,
 ) -> Result<(), String> {
-    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
-    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for original in &drag.originals {
-        min_x = min_x.min(original.pixel.x as f32);
-        min_y = min_y.min(original.pixel.y as f32);
-        max_x = max_x.max(original.pixel.x as f32 + projection::DESKTOP_TILE_WIDTH);
-        max_y = max_y.max(original.pixel.y as f32 + projection::DESKTOP_TILE_HEIGHT);
-    }
-    let work_area = state.grid.work_area;
-    let dx = clamp_delta(
-        x - drag.start_x,
-        work_area.x as f32 - min_x,
-        work_area.right() as f32 - max_x,
-    );
-    let dy = clamp_delta(
-        y - drag.start_y,
-        work_area.y as f32 - min_y,
-        work_area.bottom() as f32 - max_y,
-    );
-    for original in &drag.originals {
-        let point = original.pixel;
-        document.position(
-            &format!("desktop-item-{}", original.index),
-            point.x as f32 + dx,
-            point.y as f32 + dy,
-        )?;
-    }
+    let Some(ghost) = state.drag_ghost.as_mut() else {
+        return Ok(());
+    };
+    let kind = ghost.kind;
+    let icon_override = ghost.icon_override.clone();
+    ghost.visible = true;
+    let gx = x - ghost.offset_x;
+    let gy = y - ghost.offset_y;
+    document.position("desktop-drag-ghost", gx, gy)?;
+    projection::project_drag_ghost_icon(
+        document,
+        &mut state.icon_resolver,
+        kind,
+        icon_override.as_deref(),
+    )?;
+    let (line1, line2) = split_label_lines(&ghost.label);
+    document.size(
+        "desktop-drag-ghost",
+        projection::DESKTOP_TILE_WIDTH,
+        projection::DESKTOP_TILE_HEIGHT,
+    )?;
+    document.text("desktop-drag-ghost-label-1", line1)?;
+    document.text("desktop-drag-ghost-label-2", line2)?;
+    document.text(
+        "desktop-drag-ghost-count",
+        format!("{}", ghost.count.max(1)),
+    )?;
+    document.visible("desktop-drag-ghost", true)?;
     Ok(())
+}
+
+fn split_label_lines(label: &str) -> (String, String) {
+    let mut words = label.split_whitespace();
+    let mut line1 = String::new();
+    let mut line2 = String::new();
+    for word in words.by_ref() {
+        if line1.len() + word.len() + usize::from(!line1.is_empty()) <= 12 {
+            if !line1.is_empty() {
+                line1.push(' ');
+            }
+            line1.push_str(word);
+        } else {
+            line2 = std::iter::once(word)
+                .chain(words)
+                .collect::<Vec<_>>()
+                .join(" ");
+            break;
+        }
+    }
+    (line1, line2)
+}
+
+fn sync_drag_ghost(
+    document: &mut impl UiDocumentAccess,
+    state: &DesktopState,
+) -> Result<(), String> {
+    let visible = state.drag_ghost.as_ref().is_some_and(|ghost| ghost.visible);
+    document.visible("desktop-drag-ghost", visible)
+}
+
+fn hide_drag_ghost(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    state.drag_ghost = None;
+    // Best effort: count node may not exist in the compiled
+    // document; the ghost id itself is authoritative for visibility.
+    let _ = document.visible("desktop-drag-ghost-count", false);
+    document.visible("desktop-drag-ghost", false)
 }
 
 fn commit_item_drag(
@@ -1208,6 +1886,181 @@ fn restore_original_positions(state: &mut DesktopState, drag: &ItemDrag) -> Resu
         .rescan(&state.directory, &OutputId::new("default"), state.grid)
         .map(|_| ())
         .map_err(|error| format!("{error:?}"))
+}
+
+fn handle_sticky_text_input(
+    action: &UiActionEvent,
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+    edit: &StickyEdit,
+) -> Result<(), String> {
+    let note_id = edit.note_id.clone();
+    if action.text.as_deref() == Some("") {
+        state.sticky_edit = None;
+        return sync_sticky(document, state);
+    }
+    if let Some(text) = action.text.clone() {
+        if text == "\u{8}" || text == "\u{7f}" {
+            if let Some(current) = state.sticky_edit.as_mut() {
+                current.buffer.pop();
+            }
+        } else {
+            for ch in text.chars() {
+                if ch == '\n' || !ch.is_control() {
+                    if let Some(current) = state.sticky_edit.as_mut() {
+                        current.buffer.push(ch);
+                    }
+                }
+            }
+        }
+        if let Some(buffer) = state
+            .sticky_edit
+            .as_ref()
+            .map(|current| current.buffer.clone())
+        {
+            state.sticky.set_text(&note_id, buffer);
+            sticky_edit_counter().increment();
+            schedule_sticky_persist(state);
+        }
+        return sync_sticky(document, state);
+    }
+    Ok(())
+}
+
+fn handle_sticky_slot(
+    action: &UiActionEvent,
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let visible = visible_sticky_notes(state);
+    let slot_index = slot_number(&action.action).and_then(|number| number.checked_sub(1));
+    let Some(position) = slot_index else {
+        return Ok(());
+    };
+    let Some(note) = visible.get(position).cloned() else {
+        return Ok(());
+    };
+    let note_id = note.id.clone();
+    if action.action.ends_with(".text") {
+        if action.phase == UiActionPhase::Press && pointer_button(action) == PointerButton::Primary
+        {
+            state.sticky_edit = Some(StickyEdit {
+                note_id,
+                buffer: note.text.clone(),
+            });
+            sticky_edit_counter().increment();
+            return sync_sticky(document, state);
+        }
+        return Ok(());
+    }
+    if action.action.ends_with(".drag") {
+        if pointer_button(action) != PointerButton::Primary {
+            return Ok(());
+        }
+        match action.phase {
+            UiActionPhase::Press => {
+                state.sticky_gesture = Some(StickyGesture {
+                    note_id,
+                    mode: StickyGestureMode::Move,
+                    start_x: action.x,
+                    start_y: action.y,
+                    original: note.rect,
+                });
+            }
+            UiActionPhase::Motion => {
+                if let Some(gesture) = state.sticky_gesture.clone() {
+                    if gesture.note_id == note_id {
+                        let rect = move_rect(
+                            gesture.original,
+                            (action.x - gesture.start_x) as i32,
+                            (action.y - gesture.start_y) as i32,
+                            state.grid.work_area,
+                        );
+                        state.sticky.set_rect(&note_id, rect);
+                        sticky_move_counter().increment();
+                        sync_sticky(document, state)?;
+                    }
+                }
+            }
+            UiActionPhase::Release => {
+                if let Some(gesture) = state.sticky_gesture.take() {
+                    if gesture.note_id == note_id {
+                        let rect = move_rect(
+                            gesture.original,
+                            (action.x - gesture.start_x) as i32,
+                            (action.y - gesture.start_y) as i32,
+                            state.grid.work_area,
+                        );
+                        state.sticky.set_rect(&note_id, rect);
+                        sticky_move_counter().increment();
+                        flush_sticky_now(state);
+                        sync_sticky(document, state)?;
+                    }
+                }
+            }
+            UiActionPhase::Hover => {}
+        }
+        return Ok(());
+    }
+    if action.action.contains(".resize-") {
+        if pointer_button(action) != PointerButton::Primary {
+            return Ok(());
+        }
+        let corner = if action.action.ends_with("-nw") {
+            ResizeCorner::TopLeft
+        } else if action.action.ends_with("-ne") {
+            ResizeCorner::TopRight
+        } else if action.action.ends_with("-sw") {
+            ResizeCorner::BottomLeft
+        } else {
+            ResizeCorner::BottomRight
+        };
+        match action.phase {
+            UiActionPhase::Press => {
+                state.sticky_gesture = Some(StickyGesture {
+                    note_id,
+                    mode: StickyGestureMode::Resize,
+                    start_x: action.x,
+                    start_y: action.y,
+                    original: note.rect,
+                });
+                state.sticky_gesture.as_mut().map(|gesture| {
+                    gesture.mode = StickyGestureMode::Resize;
+                });
+                let _ = corner;
+            }
+            UiActionPhase::Motion | UiActionPhase::Release => {
+                if let Some(gesture) = state.sticky_gesture.clone() {
+                    if gesture.note_id == note_id {
+                        let rect = resize_rect(
+                            gesture.original,
+                            corner,
+                            (action.x - gesture.start_x) as i32,
+                            (action.y - gesture.start_y) as i32,
+                            state.grid.work_area,
+                        );
+                        state.sticky.set_rect(&note_id, rect);
+                        sticky_resize_counter().increment();
+                        if action.phase == UiActionPhase::Release {
+                            state.sticky_gesture = None;
+                            flush_sticky_now(state);
+                        }
+                        sync_sticky(document, state)?;
+                    }
+                }
+            }
+            UiActionPhase::Hover => {}
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn slot_number(action: &str) -> Option<usize> {
+    action
+        .strip_prefix("sticky.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|number| number.parse::<usize>().ok())
 }
 
 fn update_selection_from_rubber(state: &mut DesktopState) {
@@ -1301,14 +2154,6 @@ fn normalized_selection_rect(start: Point, end: Point, bounds: Rect) -> Rect {
         (start_x - end_x).unsigned_abs().max(1) as i32,
         (start_y - end_y).unsigned_abs().max(1) as i32,
     )
-}
-
-fn clamp_delta(value: f32, minimum: f32, maximum: f32) -> f32 {
-    if minimum > maximum {
-        0.0
-    } else {
-        value.clamp(minimum, maximum)
-    }
 }
 
 fn packaged_root() -> PathBuf {
