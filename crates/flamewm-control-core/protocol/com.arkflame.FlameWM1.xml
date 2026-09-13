@@ -9,6 +9,9 @@
     <method name="GetCapabilities">
       <arg name="capabilities" type="as" direction="out"/>
     </method>
+    <method name="GetShellBootstrap">
+      <arg name="snapshot" type="a{sv}" direction="out"/>
+    </method>
     <method name="Ping">
       <arg name="reply" type="s" direction="out"/>
     </method>
@@ -19,6 +22,13 @@
     <method name="GetWindows">
       <arg name="windows" type="aa{sv}" direction="out"/>
     </method>
+    <signal name="WindowsChanged">
+      <arg name="revision" type="t"/>
+    </signal>
+    <signal name="WindowsSnapshotChanged">
+      <arg name="revision" type="t"/>
+      <arg name="windows" type="aa{sv}"/>
+    </signal>
     <method name="ActivateWindow">
       <arg name="windowId" type="t" direction="in"/>
       <arg name="generation" type="t" direction="in"/>
@@ -28,6 +38,10 @@
       <arg name="generation" type="t" direction="in"/>
     </method>
     <method name="RestoreWindow">
+      <arg name="windowId" type="t" direction="in"/>
+      <arg name="generation" type="t" direction="in"/>
+    </method>
+    <method name="CloseWindow">
       <arg name="windowId" type="t" direction="in"/>
       <arg name="generation" type="t" direction="in"/>
     </method>
@@ -85,6 +99,9 @@
     </method>
     <signal name="WorkspacesChanged">
       <arg name="revision" type="t"/>
+    </signal>
+    <signal name="WorkspacesSnapshotChanged">
+      <arg name="snapshot" type="a{sv}"/>
     </signal>
   </interface>
 
@@ -173,6 +190,9 @@
     </method>
     <signal name="PanelsChanged">
       <arg name="revision" type="t"/>
+    </signal>
+    <signal name="PanelsSnapshotChanged">
+      <arg name="snapshot" type="a{sv}"/>
     </signal>
   </interface>
 

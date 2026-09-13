@@ -16,6 +16,7 @@ pub use memory::{MemoryGauge, SmapsSummary, parse_smaps_text};
 pub use point::{CounterPoint, ProfilePoint, SpanGuard, start};
 pub use process::{cpu_percent, process_pss_kb, smaps_rollup_kb, vmrss_fallback_kb};
 pub use report::report_window;
+pub use span::record_elapsed;
 pub use stats::{SpanAgg, by_highest_count, by_highest_total, by_slowest_single};
 
 use std::sync::OnceLock;

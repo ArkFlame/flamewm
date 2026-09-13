@@ -64,7 +64,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledDocument, String> {
     // existing PPM build artifacts keep decoding. Unknown versions are
     // rejected explicitly; no silent reinterpretation of pixel bytes.
     let bytes_per_pixel: u32 = match version {
-        FORMAT_VERSION | FORMAT_VERSION_RGBA8_LEGACY => 4,
+        FORMAT_VERSION | FORMAT_VERSION_TREATMENT_LEGACY | FORMAT_VERSION_RGBA8_LEGACY => 4,
         FORMAT_VERSION_RGB8_LEGACY => 3,
         other => {
             return Err(format!(
@@ -342,6 +342,11 @@ impl Writer {
             ImageTreatment::Original => 0,
             ImageTreatment::SymbolicForeground => 1,
         });
+        self.u8(match style.text_wrap {
+            TextWrap::NoWrap => 0,
+            TextWrap::Wrap => 1,
+        });
+        self.u8(u8::from(style.break_anywhere));
     }
 }
 
@@ -529,7 +534,9 @@ impl<'a> Reader<'a> {
                     v => return Err(format!("invalid overflow {v}")),
                 }
             },
-            image_treatment: if version == FORMAT_VERSION {
+            image_treatment: if version == FORMAT_VERSION
+                || version == FORMAT_VERSION_TREATMENT_LEGACY
+            {
                 match self.u8()? {
                     0 => ImageTreatment::Original,
                     1 => ImageTreatment::SymbolicForeground,
@@ -537,6 +544,24 @@ impl<'a> Reader<'a> {
                 }
             } else {
                 ImageTreatment::Original
+            },
+            text_wrap: if version == FORMAT_VERSION {
+                match self.u8()? {
+                    0 => TextWrap::NoWrap,
+                    1 => TextWrap::Wrap,
+                    v => return Err(format!("invalid text wrap {v}")),
+                }
+            } else {
+                TextWrap::NoWrap
+            },
+            break_anywhere: if version == FORMAT_VERSION {
+                match self.u8()? {
+                    0 => false,
+                    1 => true,
+                    v => return Err(format!("invalid break anywhere {v}")),
+                }
+            } else {
+                false
             },
         })
     }
@@ -723,32 +748,81 @@ mod tests {
     }
 
     #[test]
+    fn v4_roundtrip_preserves_wrap_fields() {
+        let mut style = Style::default();
+        style.text_wrap = TextWrap::Wrap;
+        style.break_anywhere = true;
+        let document = CompiledDocument {
+            source_fingerprint: 1,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![CompiledNode {
+                kind: NodeKind::Element,
+                parent: None,
+                first_child: None,
+                next_sibling: None,
+                id: String::new(),
+                action: String::new(),
+                text: String::new(),
+                image: None,
+                style,
+                hover_style: None,
+                active_style: None,
+            }],
+        };
+        let decoded = decode(&encode(&document).unwrap()).unwrap();
+        assert_eq!(decoded, document);
+    }
+
+    #[test]
     fn v3_style_decodes_with_original_treatment_default() {
         let document = roundtrip_node(ImageTreatment::SymbolicForeground);
         let mut bytes = encode(&document).unwrap();
         bytes[4..6].copy_from_slice(&FORMAT_VERSION_RGBA8_LEGACY.to_le_bytes());
-        // v4 appends 1 treatment byte per style; strip the trailing byte of
-        // the single node style so the payload matches v3 layout.
-        let treatment_offset = bytes.len() - 3;
-        bytes.remove(treatment_offset);
+        // v5 appends 3 wrap bytes per style (treatment+wrap+break);
+        // strip them so the payload matches v3 layout.
+        assert_eq!(FORMAT_VERSION, 5);
+        let tail = bytes.len() - 5;
+        bytes.drain(tail..tail + 3);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(
             decoded.nodes[0].style.image_treatment,
             ImageTreatment::Original
         );
+        assert_eq!(decoded.nodes[0].style.text_wrap, TextWrap::NoWrap);
+        assert!(!decoded.nodes[0].style.break_anywhere);
         assert_eq!(decoded.nodes[0].style.overflow_x, Overflow::Visible);
         assert_eq!(decoded.nodes[0].style.overflow_y, Overflow::Visible);
+    }
+
+    #[test]
+    fn v4_style_decodes_with_wrap_defaults() {
+        let document = roundtrip_node(ImageTreatment::SymbolicForeground);
+        let mut bytes = encode(&document).unwrap();
+        assert_eq!(FORMAT_VERSION, 5);
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION_TREATMENT_LEGACY.to_le_bytes());
+        // v5 appends wrap+break after treatment; strip those 2 bytes.
+        let tail = bytes.len() - 4;
+        bytes.drain(tail..tail + 2);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.nodes[0].style.image_treatment,
+            ImageTreatment::SymbolicForeground
+        );
+        assert_eq!(decoded.nodes[0].style.text_wrap, TextWrap::NoWrap);
+        assert!(!decoded.nodes[0].style.break_anywhere);
     }
 
     #[test]
     fn v2_style_decodes_with_original_treatment_and_overflow_defaults() {
         let document = roundtrip_node(ImageTreatment::Original);
         let mut bytes = encode(&document).unwrap();
-        assert_eq!(FORMAT_VERSION, 4);
-        // Convert to v2 layout: version=2 plus strip treatment byte and the
+        assert_eq!(FORMAT_VERSION, 5);
+        // Convert to v2 layout: version=2 plus strip 3 wrap bytes and the
         // 2 overflow bytes from the single node style (v2 predates both).
-        let style_tail = bytes.len() - 5;
-        bytes.drain(style_tail..style_tail + 3);
+        let style_tail = bytes.len() - 7;
+        bytes.drain(style_tail..style_tail + 5);
         bytes[4..6].copy_from_slice(&FORMAT_VERSION_RGB8_LEGACY.to_le_bytes());
         let decoded = decode(&bytes).unwrap();
         assert_eq!(

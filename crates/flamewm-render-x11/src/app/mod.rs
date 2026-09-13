@@ -17,6 +17,9 @@ use super::native::surface_format::{SurfaceAlphaMode, fallback_mode, validate_ar
 use super::native::target::{
     GeometryCommit, NativeSurfaceTarget, PresentationState, presenter_error,
 };
+use super::native::xresource::{
+    X11ResourceAllocator, refresh_backbuffer_gauge, refresh_image_gauge,
+};
 use super::xft::XftBackend;
 use super::xlib::*;
 use super::xrender::XRenderBackend;
@@ -55,6 +58,8 @@ struct CachedImage {
     pixmap: Pixmap,
     picture: u64,
     mask: Pixmap,
+    mask_bytes: usize,
+    bytes: usize,
 }
 
 /// Retained paint cache entry: commands rendered once per layout
@@ -67,12 +72,20 @@ pub(crate) struct CachedPaint {
     pub(crate) scroll_fingerprint: u64,
 }
 
-unsafe fn free_cached_image(display: *mut Display, image: CachedImage) {
+unsafe fn free_cached_image(
+    display: *mut Display,
+    allocator: &mut X11ResourceAllocator,
+    image: CachedImage,
+) {
     unsafe {
         let _ = image.picture;
-        XFreePixmap(display, image.pixmap);
+        allocator.free_pixmap(
+            display,
+            image.pixmap,
+            image.bytes.saturating_sub(image.mask_bytes),
+        );
         if image.mask != 0 {
-            XFreePixmap(display, image.mask);
+            allocator.free_pixmap(display, image.mask, image.mask_bytes);
         }
     }
 }
@@ -118,6 +131,8 @@ pub(crate) struct X11App {
     pub(crate) colormap: Colormap,
     pub(crate) colors: HashMap<Color, u64>,
     images: HashMap<ImageCacheKey, CachedImage>,
+    pub(crate) allocator: X11ResourceAllocator,
+    backbuffer_bytes: usize,
     pub(crate) cursors: HashMap<CursorKind, Cursor>,
     pub(crate) current_cursor: Option<CursorKind>,
     pub(crate) xcursor: Option<NativeCursorSession>,
@@ -142,6 +157,12 @@ pub(crate) struct X11App {
     pub(crate) cached_paint: Option<CachedPaint>,
     pub(crate) cached_viewport: (u32, u32),
     pub(crate) pending_damage: SurfaceDamage,
+    /// Pixmap currently bound via XSetWindowBackgroundPixmap (0 = none).
+    /// Only ever a fully painted backbuffer; never an unpainted replacement.
+    pub(crate) background_bound: Pixmap,
+    /// Stale backbuffer kept alive across resize until the replacement is
+    /// painted and bound. (pixmap, bytes).
+    pub(crate) retired_backbuffer: Option<(Pixmap, usize)>,
     pub(crate) pointer_button: Option<u32>,
     pub(crate) pointer_grabbed: bool,
     pub(crate) super_chord_used: bool,
@@ -283,6 +304,11 @@ impl X11App {
             XStoreName(display, window, title.as_ptr());
         }
         set_window_role(display, window, config.role);
+        if config.role == X11WindowRole::Dock {
+            let root_w = unsafe { XDisplayWidth(display, screen).max(1) as u32 };
+            let root_h = unsafe { XDisplayHeight(display, screen).max(1) as u32 };
+            apply_dock_strut(display, window, root_w, root_h, x, y, width, height);
+        }
         let gc = unsafe { XCreateGC(display, window, 0, ptr::null_mut()) };
         if gc.is_null() {
             if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
@@ -299,25 +325,43 @@ impl X11App {
         unsafe {
             XSetGraphicsExposures(display, gc, 0);
         }
-        let backbuffer = unsafe {
-            XCreatePixmap(
-                display,
-                window,
-                config.width.max(1),
-                config.height.max(1),
-                depth as u32,
-            )
-        };
-        if backbuffer == 0 {
-            unsafe {
-                XFreeGC(display, gc);
-                if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
-                    XFreeColormap(display, colormap);
+        let backbuffer = {
+            let root_geom = unsafe {
+                (
+                    XDisplayWidth(display, screen).max(1) as u32,
+                    XDisplayHeight(display, screen).max(1) as u32,
+                )
+            };
+            let mut owned = X11ResourceAllocator::new();
+            let created = unsafe {
+                owned.create_pixmap(
+                    display,
+                    window,
+                    config.width.max(1),
+                    config.height.max(1),
+                    depth as u32,
+                    root_geom.0,
+                    root_geom.1,
+                )
+            };
+            match created {
+                Ok((pixmap, bytes)) => {
+                    refresh_backbuffer_gauge(bytes as u64);
+                    (owned, pixmap, bytes)
                 }
-                XDestroyWindow(display, window);
+                Err(error) => {
+                    unsafe {
+                        XFreeGC(display, gc);
+                        if depth == 32 && alpha_mode == SurfaceAlphaMode::CompositedArgb32 {
+                            XFreeColormap(display, colormap);
+                        }
+                        XDestroyWindow(display, window);
+                    }
+                    return Err(format!("retained backbuffer: {error}"));
+                }
             }
-            return Err("XCreatePixmap failed for retained backbuffer".to_string());
-        }
+        };
+        let (allocator, backbuffer, backbuffer_bytes) = backbuffer;
         let mut fonts = HashMap::new();
         for (bucket, name) in [
             (10u8, "6x10"),
@@ -467,6 +511,8 @@ impl X11App {
             colormap,
             colors: HashMap::new(),
             images: HashMap::new(),
+            allocator,
+            backbuffer_bytes,
             cursors,
             current_cursor: None,
             xcursor: Some(xcursor),
@@ -488,6 +534,8 @@ impl X11App {
             cached_paint: None,
             cached_viewport: (config.width.max(1), config.height.max(1)),
             pending_damage: SurfaceDamage::Full,
+            background_bound: 0,
+            retired_backbuffer: None,
             pointer_button: None,
             pointer_grabbed: false,
             super_chord_used: false,
@@ -495,6 +543,25 @@ impl X11App {
             single_event: false,
             close_requested: false,
         })
+    }
+
+    pub(crate) fn root_extent(&self) -> (u32, u32) {
+        unsafe {
+            (
+                XDisplayWidth(self.display, self.screen).max(1) as u32,
+                XDisplayHeight(self.display, self.screen).max(1) as u32,
+            )
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_ledger(&self) -> super::native::xresource::ResourceLedger {
+        self.allocator.ledger()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn backbuffer_bytes(&self) -> usize {
+        self.backbuffer_bytes
     }
 }
 
@@ -556,6 +623,64 @@ unsafe fn visual_alpha_mask(display: *mut Display, visual: *mut Visual) -> u32 {
     0
 }
 
+/// Dock strut owner: sets `_NET_WM_STRUT_PARTIAL` (authority) +
+/// `_NET_WM_STRUT` for dock windows from a root-space panel rect, or
+/// deletes both when the rect touches no root edge. Must run before the
+/// first map; callers re-apply on move/resize.
+pub(crate) fn apply_dock_strut(
+    display: *mut Display,
+    window: Window,
+    root_w: u32,
+    root_h: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+) {
+    use std::ffi::CString;
+    let partial_name = CString::new("_NET_WM_STRUT_PARTIAL").expect("static atom contains no NUL");
+    let strut_name = CString::new("_NET_WM_STRUT").expect("static atom contains no NUL");
+    let partial = unsafe { XInternAtom(display, partial_name.as_ptr(), 0) };
+    let strut = unsafe { XInternAtom(display, strut_name.as_ptr(), 0) };
+    if partial == 0 || strut == 0 {
+        return;
+    }
+    match crate::config::DockStrut::from_root_and_rect(root_w, root_h, x, y, w, h) {
+        Some(reserved) => {
+            let values12 = reserved.partial12();
+            unsafe {
+                XChangeProperty(
+                    display,
+                    window,
+                    partial,
+                    XA_CARDINAL,
+                    32,
+                    PROP_MODE_REPLACE,
+                    &values12 as *const [u64; 12] as *const u8,
+                    12,
+                );
+            }
+            let values4 = reserved.strut4();
+            unsafe {
+                XChangeProperty(
+                    display,
+                    window,
+                    strut,
+                    XA_CARDINAL,
+                    32,
+                    PROP_MODE_REPLACE,
+                    &values4 as *const [u64; 4] as *const u8,
+                    4,
+                );
+            }
+        }
+        None => unsafe {
+            XDeleteProperty(display, window, partial);
+            XDeleteProperty(display, window, strut);
+        },
+    }
+}
+
 fn set_window_role(display: *mut Display, window: Window, role: X11WindowRole) {
     let property_name = CString::new("_NET_WM_WINDOW_TYPE").expect("static atom contains no NUL");
     let role_name = CString::new(crate::config::overlay_window_type_name(match role {
@@ -587,6 +712,16 @@ fn set_window_role(display: *mut Display, window: Window, role: X11WindowRole) {
 
 impl Drop for X11App {
     fn drop(&mut self) {
+        if x_io_broken() {
+            // Broken-connection backstop mirrors SurfaceController::drop:
+            // leak X-backed backends instead of issuing protocol calls
+            // on a dead Display. The normal path below is unchanged.
+            let xft = self.xft.take();
+            let xrender = self.xrender.take();
+            std::mem::forget(xft);
+            std::mem::forget(xrender);
+            return;
+        }
         // XftDraw owns resources associated with the drawable. Destroy it before
         // the X window so its teardown never observes an invalid drawable.
         drop(self.xft.take());
@@ -601,8 +736,9 @@ impl Drop for X11App {
                 self.pointer_grabbed = false;
             }
             for image in self.images.values().copied() {
-                free_cached_image(self.display, image);
+                free_cached_image(self.display, &mut self.allocator, image);
             }
+            refresh_image_gauge(0);
             for cursor in self.cursors.values().copied() {
                 XFreeCursor(self.display, cursor);
             }
@@ -610,8 +746,15 @@ impl Drop for X11App {
                 XFreeFont(self.display, font);
             }
             if self.backbuffer != 0 {
-                XFreePixmap(self.display, self.backbuffer);
+                self.allocator
+                    .free_pixmap(self.display, self.backbuffer, self.backbuffer_bytes);
+                refresh_backbuffer_gauge(0);
                 self.backbuffer = 0;
+            }
+            if let Some((pixmap, bytes)) = self.retired_backbuffer.take() {
+                if pixmap != 0 && pixmap != self.background_bound {
+                    self.allocator.free_pixmap(self.display, pixmap, bytes);
+                }
             }
             if !self.gc.is_null() {
                 XFreeGC(self.display, self.gc);

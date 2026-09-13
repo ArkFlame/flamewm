@@ -88,7 +88,6 @@ pub fn build_launch_plan_with_appearance(
     existing_env: &BTreeMap<String, String>,
     cursor_library_path: Option<&str>,
     appearance: AppearanceMode,
-    toolkit: ToolkitThemeAvailability,
 ) -> SessionLaunchPlan {
     let mut plan = build_launch_plan_with_cursor_library_path(
         paths,
@@ -96,7 +95,7 @@ pub fn build_launch_plan_with_appearance(
         existing_env,
         cursor_library_path,
     );
-    let overlay = appearance_environment(appearance, toolkit, existing_env);
+    let overlay = appearance_environment(appearance);
     for process in &mut plan.processes {
         for (key, value) in &overlay {
             process.environment.insert(key.clone(), value.clone());
@@ -212,31 +211,11 @@ fn flame_environment(
     environment
 }
 
-/// Guarded toolkit theme availability for the appearance env overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolkitThemeAvailability {
-    pub gtk_theme_available: bool,
-    pub qt_style_available: bool,
-}
-
-impl Default for ToolkitThemeAvailability {
-    fn default() -> Self {
-        Self {
-            gtk_theme_available: false,
-            qt_style_available: false,
-        }
-    }
-}
-
-/// Appearance overlay for the env producer side only.
-/// GTK_THEME/QT_STYLE_OVERRIDE are set only when the matching toolkit theme is
-/// installed; callers pass availability discovered from the filesystem.
+/// Appearance markers for the env producer side only: FLAMEWM_APPEARANCE and
+/// FLAMEWM_DARK_MODE. Never synthesizes generic GTK_THEME/QT_STYLE_OVERRIDE
+/// defaults; explicit inherited toolkit values pass through untouched.
 #[must_use]
-pub fn appearance_environment(
-    appearance: AppearanceMode,
-    toolkit: ToolkitThemeAvailability,
-    existing_env: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+pub fn appearance_environment(appearance: AppearanceMode) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::new();
     let dark = appearance.prefers_dark();
     environment.insert(
@@ -247,23 +226,6 @@ pub fn appearance_environment(
         "FLAMEWM_DARK_MODE".to_owned(),
         if dark { "1".to_owned() } else { "0".to_owned() },
     );
-    let (gtk_theme, qt_style) = if dark {
-        ("Flame-Dark", "Flame-Dark")
-    } else {
-        ("Flame-Light", "Flame-Light")
-    };
-    if toolkit.gtk_theme_available
-        && !existing_env.contains_key("GTK_THEME")
-        && appearance != AppearanceMode::System
-    {
-        environment.insert("GTK_THEME".to_owned(), gtk_theme.to_owned());
-    }
-    if toolkit.qt_style_available
-        && !existing_env.contains_key("QT_STYLE_OVERRIDE")
-        && appearance != AppearanceMode::System
-    {
-        environment.insert("QT_STYLE_OVERRIDE".to_owned(), qt_style.to_owned());
-    }
     environment
 }
 
@@ -488,16 +450,8 @@ mod tests {
     }
 
     #[test]
-    fn appearance_overlay_guards_toolkit_themes_and_marks_identity() {
-        let existing = BTreeMap::new();
-        let overlay = appearance_environment(
-            AppearanceMode::Dark,
-            ToolkitThemeAvailability {
-                gtk_theme_available: true,
-                qt_style_available: true,
-            },
-            &existing,
-        );
+    fn appearance_overlay_marks_identity_without_toolkit_defaults() {
+        let overlay = appearance_environment(AppearanceMode::Dark);
         assert_eq!(
             overlay.get("FLAMEWM_APPEARANCE").map(String::as_str),
             Some("dark")
@@ -506,30 +460,15 @@ mod tests {
             overlay.get("FLAMEWM_DARK_MODE").map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            overlay.get("GTK_THEME").map(String::as_str),
-            Some("Flame-Dark")
-        );
-        assert_eq!(
-            overlay.get("QT_STYLE_OVERRIDE").map(String::as_str),
-            Some("Flame-Dark")
-        );
-        let guarded = appearance_environment(
-            AppearanceMode::Dark,
-            ToolkitThemeAvailability::default(),
-            &existing,
-        );
-        assert!(!guarded.contains_key("GTK_THEME"));
-        assert!(!guarded.contains_key("QT_STYLE_OVERRIDE"));
+        // No generic toolkit defaults even when themes are installed.
+        assert!(!overlay.contains_key("GTK_THEME"));
+        assert!(!overlay.contains_key("QT_STYLE_OVERRIDE"));
+        // Negative control: Breeze plugin present + QML absent + no explicit
+        // override => no QT_STYLE_OVERRIDE exported for ordinary plans.
+        let existing = BTreeMap::new();
         let paths = default_paths_from_home("/usr/bin", "/home/test");
-        let plan = build_launch_plan_with_appearance(
-            &paths,
-            &[],
-            &existing,
-            None,
-            AppearanceMode::Dark,
-            ToolkitThemeAvailability::default(),
-        );
+        let plan =
+            build_launch_plan_with_appearance(&paths, &[], &existing, None, AppearanceMode::Dark);
         let environment = &plan.processes[0].environment;
         assert_eq!(
             environment.get("FLAMEWM_DESKTOP").map(String::as_str),
@@ -539,6 +478,8 @@ mod tests {
             environment.get("FLAMEWM_APPEARANCE").map(String::as_str),
             Some("dark")
         );
+        assert!(!environment.contains_key("GTK_THEME"));
+        assert!(!environment.contains_key("QT_STYLE_OVERRIDE"));
     }
 
     #[test]

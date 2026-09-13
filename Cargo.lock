@@ -237,6 +237,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flamewm-debug"
+version = "0.0.8"
+
+[[package]]
 name = "flamewm-desktop"
 version = "0.0.8"
 dependencies = [
@@ -247,6 +251,7 @@ dependencies = [
  "flamewm-control-dbus",
  "flamewm-control-wire",
  "flamewm-dbus-reactor",
+ "flamewm-debug",
  "flamewm-desktop-core",
  "flamewm-integrations-linux",
  "flamewm-profiler",
@@ -287,6 +292,7 @@ dependencies = [
  "dbus",
  "flamewm-api",
  "flamewm-dbus-reactor",
+ "flamewm-debug",
  "flamewm-image-core",
  "flamewm-integrations-core",
  "flamewm-profiler",
@@ -369,11 +375,14 @@ dependencies = [
 name = "flamewm-shell"
 version = "0.0.8"
 dependencies = [
+ "calloop",
  "chrono",
  "flamewm-api",
  "flamewm-control-core",
  "flamewm-control-dbus",
+ "flamewm-control-wire",
  "flamewm-dbus-reactor",
+ "flamewm-debug",
  "flamewm-integrations-linux",
  "flamewm-platform",
  "flamewm-profiler",
@@ -382,6 +391,7 @@ dependencies = [
  "flamewm-shell-core",
  "flamewm-ui-core",
  "flamewm-ui-x11",
+ "rustix",
 ]
 
 [[package]]
@@ -447,8 +457,10 @@ dependencies = [
  "calloop",
  "flamewm-api",
  "flamewm-applications",
+ "flamewm-control-core",
  "flamewm-control-dbus",
  "flamewm-control-wire",
+ "flamewm-debug",
  "flamewm-image-core",
  "flamewm-integrations-linux",
  "flamewm-platform",

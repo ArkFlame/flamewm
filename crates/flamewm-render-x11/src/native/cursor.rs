@@ -128,6 +128,8 @@ impl XcursorBackend {
     }
 
     /// Define the cursor for `kind` on `window`, falling back to Default.
+    /// Callers pass the WM-computed semantic kind (resize edges, hover);
+    /// this manager is the single renderer-side cursor owner.
     ///
     /// # Safety
     /// `window` must be live on this backend's display.

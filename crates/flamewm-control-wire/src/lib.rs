@@ -12,6 +12,7 @@ use flamewm_api::display::{DisplayMode, DisplaySnapshot, OutputSnapshot, Pending
 use flamewm_api::panels::{PanelSnapshot, PanelsSnapshot, TaskEntry, TaskEntryKind};
 use flamewm_api::session::{SessionAction, SessionCapabilities};
 use flamewm_api::settings::{SettingValue, SettingsChange, SettingsSnapshot, SettingsTransaction};
+use flamewm_api::shell_bootstrap::ShellBootstrapSnapshot;
 use flamewm_api::shortcuts::{KeyBinding, ShortcutSnapshot};
 use flamewm_api::system::{
     AudioEndpointKind, AudioEndpointSnapshot, AudioMuteAction, AudioSnapshot, AudioStreamSnapshot,
@@ -197,6 +198,9 @@ pub fn decode_call(call: &WireCall) -> Result<ControlRequest, ControlError> {
         (IFACE_ROOT, "GetVersion") => expect_arity(call, 0).map(|()| ControlRequest::GetVersion),
         (IFACE_ROOT, "GetCapabilities") => {
             expect_arity(call, 0).map(|()| ControlRequest::GetCapabilities)
+        }
+        (IFACE_ROOT, "GetShellBootstrap") => {
+            expect_arity(call, 0).map(|()| ControlRequest::GetShellBootstrap)
         }
         (IFACE_WINDOWS, "GetWindows") => expect_arity(call, 0).map(|()| ControlRequest::GetWindows),
         (IFACE_APPLICATIONS, "GetApplications") => {
@@ -411,6 +415,9 @@ pub fn encode_call(request: &ControlRequest) -> Result<WireCall, ControlError> {
         ControlRequest::Ping => WireCall::new(IFACE_ROOT, "Ping", Vec::new()),
         ControlRequest::GetVersion => WireCall::new(IFACE_ROOT, "GetVersion", Vec::new()),
         ControlRequest::GetCapabilities => WireCall::new(IFACE_ROOT, "GetCapabilities", Vec::new()),
+        ControlRequest::GetShellBootstrap => {
+            WireCall::new(IFACE_ROOT, "GetShellBootstrap", Vec::new())
+        }
         ControlRequest::GetWindows => WireCall::new(IFACE_WINDOWS, "GetWindows", Vec::new()),
         ControlRequest::GetApplications => {
             WireCall::new(IFACE_APPLICATIONS, "GetApplications", Vec::new())
@@ -658,6 +665,9 @@ pub fn encode_reply(
         (IFACE_ROOT, "GetCapabilities", ControlResponse::Capabilities(items)) => {
             vec![WireValue::StringArray(items.clone())]
         }
+        (IFACE_ROOT, "GetShellBootstrap", ControlResponse::ShellBootstrap(snapshot)) => {
+            vec![WireValue::Dict(shell_bootstrap_dict(snapshot))]
+        }
         (IFACE_WINDOWS, "GetWindows", ControlResponse::Windows(windows)) => {
             vec![WireValue::Array(
                 windows.iter().map(window_wire_value).collect(),
@@ -731,6 +741,12 @@ pub fn decode_reply(call: &WireCall, reply: &WireReply) -> Result<ControlRespons
             Ok(ControlResponse::Capabilities(
                 required_string_array(&reply.values[0], "capabilities")?.to_vec(),
             ))
+        }
+        (IFACE_ROOT, "GetShellBootstrap") => {
+            expect_reply_arity(reply, 1)?;
+            Ok(ControlResponse::ShellBootstrap(shell_bootstrap_snapshot(
+                required_dict(&reply.values[0], "snapshot")?,
+            )?))
         }
         (IFACE_WINDOWS, "GetWindows") => {
             expect_reply_arity(reply, 1)?;
@@ -935,6 +951,28 @@ fn workspace_snapshot(dict: &WireDict) -> Result<WorkspaceSnapshot, ControlError
     };
     snapshot.validate().map_err(ControlError::from)?;
     Ok(snapshot)
+}
+
+fn shell_bootstrap_snapshot(dict: &WireDict) -> Result<ShellBootstrapSnapshot, ControlError> {
+    Ok(ShellBootstrapSnapshot {
+        windows_revision: dict_u64(dict, "windowsRevision")?,
+        windows: required_array(dict_value(dict, "windows")?, "windows")?
+            .iter()
+            .map(window_snapshot)
+            .collect::<Result<Vec<_>, _>>()?,
+        workspaces: workspace_snapshot(required_dict(
+            dict_value(dict, "workspaces")?,
+            "workspaces",
+        )?)?,
+        panels: panels_snapshot(required_dict(dict_value(dict, "panels")?, "panels")?)?,
+        applications: required_array(dict_value(dict, "applications")?, "applications")?
+            .iter()
+            .map(application_snapshot)
+            .collect::<Result<Vec<_>, _>>()?,
+        session: session_capabilities(dict_string_array(dict, "sessionCapabilities")?),
+        displays: display_snapshot(required_dict(dict_value(dict, "displays")?, "displays")?)?,
+        system: system_snapshot(required_dict(dict_value(dict, "system")?, "system")?)?,
+    })
 }
 
 fn display_snapshot(dict: &WireDict) -> Result<DisplaySnapshot, ControlError> {
@@ -1157,12 +1195,22 @@ fn dict_string_array<'a>(dict: &'a WireDict, key: &str) -> Result<&'a [String], 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlSignal {
+    WindowsChanged {
+        revision: u64,
+    },
+    WindowsSnapshotChanged {
+        revision: u64,
+        windows: Vec<WindowSnapshot>,
+    },
     SettingsChanged {
         revision: u64,
         keys: Vec<String>,
     },
     WorkspacesChanged {
         revision: u64,
+    },
+    WorkspacesSnapshotChanged {
+        snapshot: WorkspaceSnapshot,
     },
     TopologyChanged {
         generation: u64,
@@ -1177,6 +1225,9 @@ pub enum ControlSignal {
     },
     PanelsChanged {
         revision: u64,
+    },
+    PanelsSnapshotChanged {
+        snapshot: PanelsSnapshot,
     },
     SystemChanged {
         revision: u64,
@@ -1193,6 +1244,17 @@ pub struct WireSignal {
 #[must_use]
 pub fn encode_signal(signal: &ControlSignal) -> WireSignal {
     match signal {
+        ControlSignal::WindowsChanged { revision } => {
+            revision_signal(IFACE_WINDOWS, "WindowsChanged", *revision)
+        }
+        ControlSignal::WindowsSnapshotChanged { revision, windows } => WireSignal {
+            interface: IFACE_WINDOWS.to_owned(),
+            member: "WindowsSnapshotChanged".to_owned(),
+            args: vec![
+                WireValue::U64(*revision),
+                WireValue::Array(windows.iter().map(window_wire_value).collect()),
+            ],
+        },
         ControlSignal::SystemChanged { revision } => WireSignal {
             interface: IFACE_SYSTEM.to_owned(),
             member: "SystemChanged".to_owned(),
@@ -1209,6 +1271,11 @@ pub fn encode_signal(signal: &ControlSignal) -> WireSignal {
         ControlSignal::WorkspacesChanged { revision } => {
             revision_signal(IFACE_WORKSPACES, "WorkspacesChanged", *revision)
         }
+        ControlSignal::WorkspacesSnapshotChanged { snapshot } => WireSignal {
+            interface: IFACE_WORKSPACES.to_owned(),
+            member: "WorkspacesSnapshotChanged".to_owned(),
+            args: vec![WireValue::Dict(workspace_dict(snapshot))],
+        },
         ControlSignal::TopologyChanged { generation } => {
             revision_signal(IFACE_DISPLAYS, "TopologyChanged", *generation)
         }
@@ -1218,6 +1285,11 @@ pub fn encode_signal(signal: &ControlSignal) -> WireSignal {
         ControlSignal::PanelsChanged { revision } => {
             revision_signal(IFACE_PANELS, "PanelsChanged", *revision)
         }
+        ControlSignal::PanelsSnapshotChanged { snapshot } => WireSignal {
+            interface: IFACE_PANELS.to_owned(),
+            member: "PanelsSnapshotChanged".to_owned(),
+            args: vec![WireValue::Dict(panels_dict(snapshot))],
+        },
         ControlSignal::DisplayTransactionChanged {
             transaction,
             state,
@@ -1237,6 +1309,19 @@ pub fn encode_signal(signal: &ControlSignal) -> WireSignal {
 pub fn decode_signal(signal: &WireSignal) -> Result<ControlSignal, ControlError> {
     let call = WireCall::new(&signal.interface, &signal.member, signal.args.clone());
     match (signal.interface.as_str(), signal.member.as_str()) {
+        (IFACE_WINDOWS, "WindowsChanged") => Ok(ControlSignal::WindowsChanged {
+            revision: signal_revision(&call)?,
+        }),
+        (IFACE_WINDOWS, "WindowsSnapshotChanged") => {
+            expect_arity(&call, 2)?;
+            Ok(ControlSignal::WindowsSnapshotChanged {
+                revision: required_u64(&call.args[0], "revision")?,
+                windows: required_array(&call.args[1], "windows")?
+                    .iter()
+                    .map(window_snapshot)
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
         (IFACE_SYSTEM, "SystemChanged") => Ok(ControlSignal::SystemChanged {
             revision: signal_revision(&call)?,
         }),
@@ -1250,6 +1335,12 @@ pub fn decode_signal(signal: &WireSignal) -> Result<ControlSignal, ControlError>
         (IFACE_WORKSPACES, "WorkspacesChanged") => Ok(ControlSignal::WorkspacesChanged {
             revision: signal_revision(&call)?,
         }),
+        (IFACE_WORKSPACES, "WorkspacesSnapshotChanged") => {
+            expect_arity(&call, 1)?;
+            Ok(ControlSignal::WorkspacesSnapshotChanged {
+                snapshot: workspace_snapshot(required_dict(&call.args[0], "snapshot")?)?,
+            })
+        }
         (IFACE_DISPLAYS, "TopologyChanged") => Ok(ControlSignal::TopologyChanged {
             generation: signal_revision(&call)?,
         }),
@@ -1259,6 +1350,12 @@ pub fn decode_signal(signal: &WireSignal) -> Result<ControlSignal, ControlError>
         (IFACE_PANELS, "PanelsChanged") => Ok(ControlSignal::PanelsChanged {
             revision: signal_revision(&call)?,
         }),
+        (IFACE_PANELS, "PanelsSnapshotChanged") => {
+            expect_arity(&call, 1)?;
+            Ok(ControlSignal::PanelsSnapshotChanged {
+                snapshot: panels_snapshot(required_dict(&call.args[0], "snapshot")?)?,
+            })
+        }
         _ => Err(invalid("unknown Flame Control signal")),
     }
 }
@@ -1305,6 +1402,50 @@ pub fn workspace_dict(snapshot: &WorkspaceSnapshot) -> WireDict {
     out.insert(
         "names".to_owned(),
         WireValue::StringArray(snapshot.names.clone()),
+    );
+    out
+}
+
+#[must_use]
+pub fn shell_bootstrap_dict(snapshot: &ShellBootstrapSnapshot) -> WireDict {
+    let mut out = WireDict::new();
+    out.insert(
+        "windowsRevision".to_owned(),
+        WireValue::U64(snapshot.windows_revision),
+    );
+    out.insert(
+        "windows".to_owned(),
+        WireValue::Array(snapshot.windows.iter().map(window_wire_value).collect()),
+    );
+    out.insert(
+        "workspaces".to_owned(),
+        WireValue::Dict(workspace_dict(&snapshot.workspaces)),
+    );
+    out.insert(
+        "panels".to_owned(),
+        WireValue::Dict(panels_dict(&snapshot.panels)),
+    );
+    out.insert(
+        "applications".to_owned(),
+        WireValue::Array(
+            snapshot
+                .applications
+                .iter()
+                .map(application_wire_value)
+                .collect(),
+        ),
+    );
+    out.insert(
+        "sessionCapabilities".to_owned(),
+        WireValue::StringArray(session_capability_names(snapshot.session)),
+    );
+    out.insert(
+        "displays".to_owned(),
+        WireValue::Dict(display_dict(&snapshot.displays)),
+    );
+    out.insert(
+        "system".to_owned(),
+        WireValue::Dict(system_dict(&snapshot.system)),
     );
     out
 }
@@ -2606,6 +2747,54 @@ mod tests {
     }
 
     #[test]
+    fn shell_bootstrap_round_trips_aggregate_snapshots() {
+        use flamewm_api::display::DisplaySnapshot;
+        use flamewm_api::panels::PanelsSnapshot;
+        use flamewm_api::session::SessionCapabilities;
+        use flamewm_api::shell_bootstrap::ShellBootstrapSnapshot;
+        use flamewm_api::system::SystemSnapshot;
+        use flamewm_api::workspace::WorkspaceSnapshot;
+        let call = WireCall::new(IFACE_ROOT, "GetShellBootstrap", Vec::new());
+        let source = ShellBootstrapSnapshot {
+            windows_revision: 9,
+            windows: vec![window_fixture()],
+            workspaces: WorkspaceSnapshot {
+                revision: 3,
+                count: 2,
+                active_index: 0,
+                last_index: None,
+                names: vec!["1".to_owned(), "2".to_owned()],
+            },
+            panels: PanelsSnapshot {
+                revision: 4,
+                panels: Vec::new(),
+                tasks: Vec::new(),
+                pinned_apps: Vec::new(),
+            },
+            applications: vec![application_fixture()],
+            session: SessionCapabilities {
+                lock: true,
+                logout: true,
+                suspend: false,
+                reboot: false,
+                shutdown: true,
+            },
+            displays: DisplaySnapshot {
+                generation: 5,
+                outputs: Vec::new(),
+                pending: None,
+            },
+            system: SystemSnapshot::default(),
+        };
+        let reply =
+            encode_reply(&call, &ControlResponse::ShellBootstrap(source.clone())).expect("encode");
+        assert_eq!(
+            decode_reply(&call, &reply).expect("decode"),
+            ControlResponse::ShellBootstrap(source)
+        );
+    }
+
+    #[test]
     fn shell_snapshot_requests_round_trip_through_wire_mapping() {
         for request in [ControlRequest::GetWindows, ControlRequest::GetApplications] {
             let call = encode_call(&request).expect("encode");
@@ -2823,6 +3012,58 @@ mod tests {
         assert_eq!(
             decode_call(&call).expect_err("out of range").code,
             ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn snapshot_signals_round_trip_revision_and_snapshot() {
+        let windows = ControlSignal::WindowsSnapshotChanged {
+            revision: 9,
+            windows: vec![window_fixture()],
+        };
+        assert_eq!(
+            decode_signal(&encode_signal(&windows)).expect("decode"),
+            windows
+        );
+        let legacy_windows = ControlSignal::WindowsChanged { revision: 9 };
+        assert_eq!(
+            decode_signal(&encode_signal(&legacy_windows)).expect("decode"),
+            legacy_windows
+        );
+        let workspaces = ControlSignal::WorkspacesSnapshotChanged {
+            snapshot: WorkspaceSnapshot {
+                revision: 12,
+                count: 2,
+                active_index: 1,
+                last_index: Some(0),
+                names: vec!["1".to_owned(), "2".to_owned()],
+            },
+        };
+        assert_eq!(
+            decode_signal(&encode_signal(&workspaces)).expect("decode"),
+            workspaces
+        );
+        let legacy_workspaces = ControlSignal::WorkspacesChanged { revision: 12 };
+        assert_eq!(
+            decode_signal(&encode_signal(&legacy_workspaces)).expect("decode"),
+            legacy_workspaces
+        );
+        let panels = ControlSignal::PanelsSnapshotChanged {
+            snapshot: PanelsSnapshot {
+                revision: 4,
+                panels: Vec::new(),
+                tasks: Vec::new(),
+                pinned_apps: Vec::new(),
+            },
+        };
+        assert_eq!(
+            decode_signal(&encode_signal(&panels)).expect("decode"),
+            panels
+        );
+        let legacy_panels = ControlSignal::PanelsChanged { revision: 4 };
+        assert_eq!(
+            decode_signal(&encode_signal(&legacy_panels)).expect("decode"),
+            legacy_panels
         );
     }
 }

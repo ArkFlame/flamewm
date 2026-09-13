@@ -15,7 +15,6 @@ fn main() {
     let sources = [
         "panel.html",
         "start.html",
-        "start-apps.html",
         "task-menu.html",
         "media.html",
         "audio.html",
@@ -25,7 +24,6 @@ fn main() {
     let artifacts = [
         ("flamewm-panel.rwr", "panel.html"),
         ("flamewm-start.rwr", "start.html"),
-        ("flamewm-start-submenu.rwr", "start-apps.html"),
         ("flamewm-task-menu.rwr", "task-menu.html"),
         ("flamewm-media.rwr", "media.html"),
         ("flamewm-audio.rwr", "audio.html"),

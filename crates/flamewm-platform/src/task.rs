@@ -406,4 +406,101 @@ mod tests {
             vec!["pin:b", "pin:c", "pin:a"]
         );
     }
+
+    fn snapshot(
+        app: DesktopAppId,
+        id: u64,
+        generation: u64,
+        state: flamewm_api::window::WindowState,
+    ) -> flamewm_api::window::WindowSnapshot {
+        flamewm_api::window::WindowSnapshot {
+            reference: WindowRef::new(id, generation),
+            title: format!("w{id}"),
+            app_id: app,
+            outer_geometry: flamewm_api::Rect::new(0, 0, 100, 100),
+            restore_geometry: flamewm_api::Rect::new(0, 0, 100, 100),
+            state,
+            sticky: false,
+            focused: false,
+            workspace: flamewm_api::WorkspaceRef::new(0, 0),
+            output: flamewm_api::OutputId::new("eDP-1"),
+            state_generation: generation,
+        }
+    }
+
+    #[test]
+    fn three_windows_minimize_restore_close_keep_identity_and_state() {
+        use flamewm_api::window::WindowState;
+        let mut strip = TaskStrip::default();
+        let apps = [app("a"), app("b"), app("c")];
+        let mut snapshots: Vec<flamewm_api::window::WindowSnapshot> = [1u64, 2, 3]
+            .iter()
+            .zip(apps.iter().cloned())
+            .map(|(id, app)| snapshot(app, *id, *id, WindowState::Normal))
+            .collect();
+        for snap in &snapshots {
+            assert!(strip.add_window(snap.app_id.clone(), snap.reference));
+        }
+        assert_eq!(
+            strip
+                .current_ids()
+                .iter()
+                .map(TaskEntryId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["win:1:1", "win:2:2", "win:3:3"]
+        );
+        for snap in snapshots.iter_mut() {
+            let old = snap.reference;
+            snap.state = WindowState::Minimized;
+            snap.state_generation += 10;
+            snap.reference = WindowRef::new(old.id, snap.state_generation);
+            assert!(strip.remove_window(old));
+            assert!(strip.add_window(snap.app_id.clone(), snap.reference));
+            assert_eq!(
+                TaskEntryId::window(snap.reference).as_str(),
+                format!("win:{}:{}", old.id, snap.state_generation)
+            );
+        }
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|s| s.state_generation)
+                .collect::<Vec<_>>(),
+            vec![11, 12, 13]
+        );
+        assert!(snapshots.iter().all(|s| s.state == WindowState::Minimized));
+        for snap in snapshots.iter_mut() {
+            let old = snap.reference;
+            snap.state = WindowState::Normal;
+            snap.state_generation += 10;
+            snap.reference = WindowRef::new(old.id, snap.state_generation);
+            assert!(strip.remove_window(old));
+            assert!(strip.add_window(snap.app_id.clone(), snap.reference));
+            assert_eq!(
+                TaskEntryId::window(snap.reference).as_str(),
+                format!("win:{}:{}", old.id, snap.state_generation)
+            );
+        }
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|s| s.state_generation)
+                .collect::<Vec<_>>(),
+            vec![21, 22, 23]
+        );
+        assert!(snapshots.iter().all(|s| s.state == WindowState::Normal));
+        let revisions: Vec<u64> = snapshots.iter().map(|s| s.state_generation).collect();
+        assert!(revisions.iter().all(|g| *g != 0));
+        assert_eq!(
+            revisions
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        for snap in &snapshots {
+            assert!(strip.remove_window(snap.reference));
+        }
+        assert!(strip.entries().is_empty());
+    }
 }

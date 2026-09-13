@@ -235,6 +235,9 @@ pub fn workspace_action(
 /// Visible context-menu row count for a menu kind. Row identity is the
 /// row id, never the label. Used to size the native surface to its content
 /// rows so no spare (black) area remains.
+/// Visible context-menu parts (C08): one `MenuPart::Row` per visible row.
+/// Height derives from these parts via `menu_policy::context_menu_size`;
+/// minimum width is the canonical `MIN_ROW_WIDTH`.
 #[must_use]
 pub fn visible_row_count_for_kind(
     panels: &PanelsSnapshot,

@@ -16,6 +16,7 @@ pub mod panels;
 pub mod ports;
 pub mod session;
 pub mod settings;
+pub mod shell_bootstrap;
 pub mod shortcuts;
 pub mod system;
 pub mod window;

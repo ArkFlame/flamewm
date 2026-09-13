@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use flamewm_render_core::{
     fnv1a64, AlignItems, Color, ColorValue, ColorVariable, CompiledDocument, CompiledNode,
     CursorKind, Display, Edges, FlexDirection, ImageAsset, ImageTreatment, JustifyContent, Length,
-    NodeKind, Overflow, Position, Style,
+    NodeKind, Overflow, Position, Style, TextWrap,
 };
 
 use crate::css::{parse_declarations, parse_stylesheet, Declaration, PseudoState, Rule};
@@ -463,6 +463,25 @@ impl<'a> Compiler<'a> {
                     other => return self.unsupported(format!("cursor: {other}")),
                 }
             }
+            "white-space" => match value {
+                "normal" => {
+                    style.text_wrap = TextWrap::Wrap;
+                }
+                "nowrap" => {
+                    style.text_wrap = TextWrap::NoWrap;
+                }
+                other => return self.unsupported(format!("white-space: {other}")),
+            },
+            "overflow-wrap" | "word-wrap" => match value {
+                "normal" => {
+                    style.break_anywhere = false;
+                }
+                "anywhere" | "break-word" => {
+                    style.break_anywhere = true;
+                    style.text_wrap = TextWrap::Wrap;
+                }
+                other => return self.unsupported(format!("overflow-wrap: {other}")),
+            },
             "box-sizing" if value == "border-box" => {}
             "overflow" | "overflow-x" | "overflow-y" => {
                 let overflow = match value {
@@ -536,6 +555,8 @@ fn inherit_text_style(target: &mut Style, inherited: &Style) {
     target.color = inherited.color;
     target.font_size = inherited.font_size;
     target.font_weight = inherited.font_weight;
+    target.text_wrap = inherited.text_wrap;
+    target.break_anywhere = inherited.break_anywhere;
     target.opacity = inherited.opacity;
 }
 
@@ -804,6 +825,72 @@ mod tests {
             .find(|node| node.id == "open")
             .unwrap();
         assert_eq!(node.style.cursor, CursorKind::Pointer);
+    }
+
+    #[test]
+    fn compiles_wrap_and_break_anywhere() {
+        use flamewm_render_core::TextWrap;
+        let output = compile_str(
+            r#"<body><style>.a { white-space: normal; } .b { white-space: nowrap; } .c { overflow-wrap: anywhere; }</style><div class="a" id="a">x</div><div class="b" id="b">x</div><div class="c" id="c">x</div></body>"#,
+            "",
+            CompileOptions::default(),
+        )
+        .unwrap();
+        let find = |id: &str| {
+            output
+                .document
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .unwrap()
+                .style
+                .clone()
+        };
+        assert_eq!(find("a").text_wrap, TextWrap::Wrap);
+        assert!(!find("a").break_anywhere);
+        assert_eq!(find("b").text_wrap, TextWrap::NoWrap);
+        assert_eq!(find("c").text_wrap, TextWrap::Wrap);
+        assert!(find("c").break_anywhere);
+    }
+
+    #[test]
+    fn desktop_sticky_text_wraps_while_other_ui_stays_nowrap() {
+        use flamewm_render_core::TextWrap;
+        let css = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../ui/desktop/desktop.css"
+        ))
+        .expect("read desktop UI CSS");
+        assert!(
+            css.contains(".sticky-text")
+                && css.contains("white-space:normal")
+                && css.contains("overflow-wrap:anywhere"),
+            "desktop CSS must enable wrap only on .sticky-text"
+        );
+        let output = compile_str(
+            r#"<body><div class="desktop-label-line" id="label">x</div><div class="desktop-menu-row" id="row">x</div><div class="sticky-text" id="sticky">x</div></body>"#,
+            &css,
+            CompileOptions::default(),
+        )
+        .unwrap();
+        let find = |id: &str| {
+            output
+                .document
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .unwrap()
+                .style
+                .clone()
+        };
+        let sticky = find("sticky");
+        assert_eq!(sticky.text_wrap, TextWrap::Wrap);
+        assert!(sticky.break_anywhere);
+        assert_eq!(sticky.overflow_x, flamewm_render_core::Overflow::Auto);
+        assert_eq!(find("label").text_wrap, TextWrap::NoWrap);
+        assert!(!find("label").break_anywhere);
+        assert_eq!(find("row").text_wrap, TextWrap::NoWrap);
+        assert!(!find("row").break_anywhere);
     }
 
     #[test]

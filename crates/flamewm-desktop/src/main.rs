@@ -27,8 +27,8 @@ use flamewm_desktop_core::model::{
 };
 use flamewm_desktop_core::persistence::LayoutStore;
 use flamewm_desktop_core::presentation::{
-    BlankDesktopAction, CONTEXT_MENU_WIDTH, blank_context_menu, clamp_menu_anchor,
-    context_menu_rect, menu_height_for_rows,
+    BlankDesktopAction, blank_context_menu, blank_menu_parts, clamp_menu_anchor,
+    confirm_menu_parts, context_menu_size, entry_menu_parts, parts_menu_rect, sticky_menu_parts,
 };
 use flamewm_desktop_core::selection::{SelectionModel, double_click_opens, rubber_visible};
 use flamewm_desktop_core::sticky::{
@@ -36,9 +36,10 @@ use flamewm_desktop_core::sticky::{
 };
 use flamewm_desktop_core::sticky_persistence;
 use flamewm_desktop_core::trash::{Trash, TrashLocation, TrashScope};
-use flamewm_integrations_linux::icons::IconResolver;
+use flamewm_integrations_linux::icons::IconKey;
 use flamewm_profiler::{CounterPoint, MemoryGauge, ProfilePoint, report_window};
 use flamewm_reactor::{FdAction, Reactor};
+use flamewm_ui_core::context_menu::MenuPart;
 use flamewm_ui_x11::PointerButton;
 use flamewm_ui_x11::{
     UiActionEvent, UiActionPhase, UiColor, UiControllerEvent, UiDocumentAccess, UiWindowConfig,
@@ -105,6 +106,36 @@ fn context_open_counter() -> &'static CounterPoint {
     COUNTER.get_or_init(|| CounterPoint::new("desktop.context.open"))
 }
 
+fn context_open_total_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.context.open.total"))
+}
+
+fn context_open_project_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.context.open.project"))
+}
+
+fn context_open_measure_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.context.open.measure"))
+}
+
+fn context_open_place_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.context.open.place"))
+}
+
+fn context_open_present_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.context.open.present"))
+}
+
+fn context_open_close_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.context.open.close"))
+}
+
 fn context_action_counter() -> &'static CounterPoint {
     static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
     COUNTER.get_or_init(|| CounterPoint::new("desktop.context.action"))
@@ -138,6 +169,21 @@ fn rename_success_counter() -> &'static CounterPoint {
 fn rename_failure_counter() -> &'static CounterPoint {
     static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
     COUNTER.get_or_init(|| CounterPoint::new("desktop.rename.failure"))
+}
+
+fn action_failure_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.action.failure"))
+}
+
+fn spawn_failure_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.spawn.failure"))
+}
+
+fn report_action_failure(context: &str, error: String) {
+    action_failure_counter().increment();
+    eprintln!("desktop: {context} failed: {error}; keeping event loop alive");
 }
 
 fn sticky_edit_counter() -> &'static CounterPoint {
@@ -183,7 +229,7 @@ fn icon_gauge() -> &'static MemoryGauge {
 fn update_gauges(state: &DesktopState) {
     model_gauge().set((state.model.items().count() as u64).saturating_mul(256));
     launcher_gauge().set((state.launchers.len() as u64).saturating_mul(320));
-    icon_gauge().set(state.icon_resolver.memory_estimate_bytes() as u64);
+    icon_gauge().set(state.icons.memory_estimate_bytes() as u64);
 }
 
 const SLOT_COUNT: usize = 128;
@@ -230,7 +276,8 @@ struct DesktopState {
     directory: PathBuf,
     model: DesktopModel,
     grid: GridConfig,
-    icon_resolver: IconResolver,
+    icons: projection::ParallelIconService,
+    icon_slots: Vec<Option<IconKey>>,
     layout_path: PathBuf,
     sticky: StickyNoteStore,
     sticky_path: PathBuf,
@@ -242,6 +289,7 @@ struct DesktopState {
     pending_delete: Option<PathBuf>,
     last_click: Option<ClickRecord>,
     dirty: Arc<AtomicBool>,
+    icons_pending: Arc<AtomicBool>,
     rename: Option<RenameState>,
     drag_ghost: Option<DragGhost>,
     active_workspace: usize,
@@ -302,16 +350,15 @@ struct ItemDrag {
 
 #[derive(Clone)]
 struct OriginalItem {
-    index: usize,
     id: String,
     path: PathBuf,
     output: OutputId,
     cell: Cell,
-    pixel: Point,
 }
 
 fn main() -> Result<(), String> {
     flamewm_profiler::init_process("flamewm-desktop");
+    flamewm_debug::init_process("desktop");
     let home = PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?);
     let user_dirs = home.join(".config/user-dirs.dirs");
     let user_dirs = fs::read_to_string(user_dirs).ok();
@@ -340,7 +387,8 @@ fn main() -> Result<(), String> {
     let sticky_path = sticky_persistence::state_path().map_err(|error| format!("{error:?}"))?;
     let sticky = sticky_persistence::load(&sticky_path).map_err(|error| format!("{error:?}"))?;
     let dirty = Arc::new(AtomicBool::new(false));
-    let mut inotify = inotify::Inotify::init().map_err(|error| format!("init inotify: {error}"))?;
+    let icons_pending = Arc::new(AtomicBool::new(false));
+    let inotify = inotify::Inotify::init().map_err(|error| format!("init inotify: {error}"))?;
     inotify
         .watches()
         .add(
@@ -359,7 +407,8 @@ fn main() -> Result<(), String> {
             directory,
             model,
             grid,
-            icon_resolver: IconResolver::from_environment(packaged_root(), 0),
+            icons: projection::ParallelIconService::spawn(packaged_root()),
+            icon_slots: vec![None; SLOT_COUNT],
             layout_path,
             sticky,
             sticky_path,
@@ -371,6 +420,7 @@ fn main() -> Result<(), String> {
             pending_delete: None,
             last_click: None,
             dirty: Arc::clone(&dirty),
+            icons_pending: Arc::clone(&icons_pending),
             rename: None,
             drag_ghost: None,
             active_workspace,
@@ -487,6 +537,21 @@ fn main() -> Result<(), String> {
             FdAction::Continue
         })
         .map_err(|error| format!("register inotify: {error}"))?;
+    // IconService wake FD: worker completions only set the pending flag;
+    // the next event/flush tick drains and repaints affected tiles.
+    if let Some(icon_fd) = state_cell.borrow().icons.wake_fd() {
+        let icon_cell = std::rc::Rc::clone(&state_cell);
+        let icon_pending = Arc::clone(&icons_pending);
+        let registration =
+            reactor.register_raw_fd_with_action(icon_fd, calloop::Interest::READ, move |_, _| {
+                icon_cell.borrow_mut().icons.wake_drain();
+                icon_pending.store(true, Ordering::Release);
+                FdAction::Continue
+            });
+        if let Err(error) = registration {
+            eprintln!("desktop: degraded icon completion subscription: {error}");
+        }
+    }
     run_with_controller_events_role_with_reactor(
         document,
         UiWindowConfig {
@@ -504,6 +569,7 @@ fn main() -> Result<(), String> {
                 let state_cell = &event_cell;
                 let mut state = state_cell.borrow_mut();
                 refresh_if_changed(document, &mut state)?;
+                apply_pending_icon_results(document, &mut state)?;
                 poll_sticky_persist(document, &mut state)?;
                 let UiControllerEvent::Action(action) = event;
                 handle_event(action, document, &mut state)
@@ -515,6 +581,7 @@ fn main() -> Result<(), String> {
                 let state_cell = &flush_cell;
                 let mut state = state_cell.borrow_mut();
                 refresh_if_changed(document, &mut state)?;
+                apply_pending_icon_results(document, &mut state)?;
                 poll_sticky_persist(document, &mut state)?;
                 flush_sticky_persist_if_due(document, &mut state)
             }
@@ -740,24 +807,35 @@ fn sync_document(
 ) -> Result<(), String> {
     let _span = sync_point().start();
     render_sync_counter().increment();
+    apply_ready_icons(document, state)?;
     for index in 0..SLOT_COUNT {
         let item = state.model.items().nth(index);
         if let Some(item) = item {
             let point = state.grid.cell_to_pixel(item.cell);
             let icon = launcher_icon(state, &item.path);
+            let kind = item.kind;
+            let label = item.display_name.clone();
             {
                 let _icon = icon_point().start();
-                projection::project_item(
+                let key = projection::project_item(
                     document,
-                    &mut state.icon_resolver,
+                    &mut state.icons,
                     index,
-                    item.kind,
-                    &item.display_name,
+                    kind,
+                    &label,
                     point,
                     icon.as_deref(),
                 )?;
+                state.icon_slots[index] = Some(projection::ParallelIconService::icon_key(
+                    kind,
+                    icon.as_deref(),
+                ));
+                let _ = key;
             }
         } else {
+            if index < state.icon_slots.len() {
+                state.icon_slots[index] = None;
+            }
             projection::clear_item(document, index)?;
         }
     }
@@ -770,7 +848,54 @@ fn sync_document(
     Ok(())
 }
 
-const STICKY_SLOTS: usize = 16;
+/// Wake-driven icon completion: the IconService wake FD sets the pending
+/// flag (no inotify/click dependency); this drains the service and applies
+/// each result only to slots whose tracked [`IconKey`] still matches, then
+/// redraws each affected tile surface exactly once via the document marks.
+fn apply_pending_icon_results(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    if !state.icons_pending.swap(false, Ordering::Acquire) {
+        return Ok(());
+    }
+    apply_ready_icons(document, state)
+}
+fn apply_ready_icons(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    let ready = state.icons.drain_ready();
+    if ready.is_empty() {
+        return Ok(());
+    }
+    for (key, raster) in ready {
+        let Some(raster) = raster else { continue };
+        for index in 0..SLOT_COUNT {
+            let matches = state
+                .icon_slots
+                .get(index)
+                .and_then(|slot| slot.as_ref())
+                .is_some_and(|expected| expected == &key);
+            if !matches {
+                continue;
+            }
+            let Some(item) = state.model.items().nth(index) else {
+                continue;
+            };
+            let kind = item.kind;
+            let Some(expected) = state.icon_slots[index].clone() else {
+                continue;
+            };
+            state
+                .icons
+                .apply_if_current(document, index, kind, &expected, &key, raster.clone())?;
+        }
+    }
+    Ok(())
+}
+
+const STICKY_SLOTS: usize = projection::STICKY_SLOT_COUNT;
 
 fn visible_sticky_notes(state: &DesktopState) -> Vec<StickyNote> {
     state
@@ -806,17 +931,27 @@ fn sync_sticky(
             )?;
             let number = slot + 1;
             let text_id = format!("sticky-{number}-text");
-            let text = if state
+            let editing = state
                 .sticky_edit
                 .as_ref()
-                .is_some_and(|edit| edit.note_id == note.id)
-            {
-                state.sticky_edit.as_ref().map(|edit| edit.buffer.clone())
-            } else {
-                None
-            }
-            .unwrap_or_else(|| note.text.clone());
+                .filter(|edit| edit.note_id == note.id)
+                .map(|edit| edit.buffer.clone());
+            let text = match editing {
+                Some(buffer) => projection::caret_text(&buffer, true),
+                None => note.text.clone(),
+            };
             document.text(&text_id, text)?;
+            document.font_size(&text_id, note.text_size as f32)?;
+            document.font_weight(&text_id, if note.bold { 700 } else { 400 })?;
+            document.foreground(
+                &text_id,
+                UiColor {
+                    r: note.foreground.red,
+                    g: note.foreground.green,
+                    b: note.foreground.blue,
+                    a: 255,
+                },
+            )?;
             let number = slot + 1;
             document.visible(&format!("sticky-{number}-drag"), show_any)?;
             for corner in ["nw", "ne", "sw", "se"] {
@@ -825,6 +960,7 @@ fn sync_sticky(
         } else {
             document.visible(&id, false)?;
             let number = slot + 1;
+            document.text(&format!("sticky-{number}-text"), String::new())?;
             let _ = document.visible(&format!("sticky-{number}-drag"), false);
             for corner in ["nw", "ne", "sw", "se"] {
                 let _ = document.visible(&format!("sticky-{number}-resize-{corner}"), false);
@@ -873,23 +1009,32 @@ fn handle_event(
     if action.action == "desktop.surface" {
         return handle_surface(action, document, state);
     }
-    if action.action == "sticky.move"
+    // Sticky Secondary opens the sticky context menu for the exact note under
+    // the pointer. This routes BEFORE the generic sticky.* primary dispatch
+    // below; otherwise the generic branch shadows it and it is unreachable.
+    if action.action.starts_with("sticky.")
         && action.phase == UiActionPhase::Release
-        && pointer_button(action) == PointerButton::Primary
-        && state.sticky.enabled()
-        && state.sticky.notes().is_empty()
+        && pointer_button(action) == PointerButton::Secondary
     {
-        let note = StickyNote::new(
-            "sticky-1",
-            OutputId::new("default"),
-            0,
-            action.x as i32,
-            action.y as i32,
-        );
-        state.sticky.create(note);
-        sticky_persistence::persist(&state.sticky_path, &state.sticky)
-            .map_err(|error| format!("{error:?}"))?;
-        sync_document(document, state)?;
+        let visible = visible_sticky_notes(state);
+        let slot_index = slot_number(&action.action).and_then(|number| number.checked_sub(1));
+        if let Some(position) = slot_index {
+            if let Some(note) = visible.get(position) {
+                context_secondary_counter().increment();
+                let anchor = pointer_point(action, state.grid.work_area);
+                state.menu = Some(MenuState {
+                    kind: MenuKind::Sticky,
+                    anchor,
+                    selected_id: Some(note.id.clone()),
+                });
+                state.pending_delete = None;
+                hide_confirm(document)?;
+                return sync_menu(document, state);
+            }
+        }
+        return Ok(());
+    }
+    if action.action == "sticky.move" {
         return Ok(());
     }
     if let Some(raw) = action.action.strip_prefix("desktop.item.") {
@@ -902,20 +1047,6 @@ fn handle_event(
     }
     if action.action.starts_with("sticky.") {
         return handle_sticky_slot(action, document, state);
-    }
-    if action.action == "sticky.move"
-        && action.phase == UiActionPhase::Release
-        && pointer_button(action) == PointerButton::Secondary
-    {
-        let anchor = pointer_point(action, state.grid.work_area);
-        state.menu = Some(MenuState {
-            kind: MenuKind::Sticky,
-            anchor,
-            selected_id: state.sticky.notes().first().map(|note| note.id.clone()),
-        });
-        state.pending_delete = None;
-        hide_confirm(document)?;
-        return sync_menu(document, state);
     }
     Ok(())
 }
@@ -934,6 +1065,11 @@ fn is_menu_action(action: &str) -> bool {
             | "entry.delete"
             | "confirm.delete"
             | "confirm.cancel"
+            | "sticky.menu.yellow"
+            | "sticky.menu.green"
+            | "sticky.menu.pink"
+            | "sticky.menu.blue"
+            | "sticky.menu.bold"
             | "sticky.menu.delete"
     )
 }
@@ -949,7 +1085,7 @@ fn cancel_transient(
     state.menu = None;
     state.pending_delete = None;
     state.rename = None;
-    state.sticky_edit = None;
+    commit_sticky_edit(state);
     state.sticky_gesture = None;
     hide_drag_ghost(document, state)?;
     document.visible("desktop-selection", false)?;
@@ -974,6 +1110,7 @@ fn handle_surface(
         }
         context_secondary_counter().increment();
         let anchor = pointer_point(action, state.grid.work_area);
+        commit_sticky_edit(state);
         state.menu = Some(MenuState {
             kind: MenuKind::Blank,
             anchor,
@@ -997,6 +1134,7 @@ fn handle_surface(
             hide_confirm(document)?;
             state.pending_delete = None;
             state.last_click = None;
+            commit_sticky_edit(state);
             let start = pointer_point(action, state.grid.work_area);
             state.item_drag = None;
             state.selection_start = Some(start);
@@ -1065,6 +1203,7 @@ fn handle_item(
         };
         let item_id = item.id.clone();
         state.selection.select_exclusive(item_id.clone());
+        commit_sticky_edit(state);
         state.item_drag = None;
         state.selection_start = None;
         state.selection.clear_rubber();
@@ -1088,6 +1227,7 @@ fn handle_item(
             hide_menus(document)?;
             hide_confirm(document)?;
             state.pending_delete = None;
+            commit_sticky_edit(state);
             let Some(item) = state.model.items().nth(index) else {
                 return Ok(());
             };
@@ -1113,13 +1253,11 @@ fn handle_item(
                 .items()
                 .enumerate()
                 .filter(|(_, candidate)| state.selection.selected().contains(&candidate.id))
-                .map(|(candidate_index, candidate)| OriginalItem {
-                    index: candidate_index,
+                .map(|(_, candidate)| OriginalItem {
                     id: candidate.id.clone(),
                     path: candidate.path.clone(),
                     output: candidate.output.clone(),
                     cell: candidate.cell,
-                    pixel: state.grid.cell_to_pixel(candidate.cell),
                 })
                 .collect();
             state.item_drag = Some(ItemDrag {
@@ -1214,23 +1352,30 @@ fn open_item(state: &DesktopState, index: usize) -> Result<(), String> {
     let Some(item) = state.model.items().nth(index) else {
         return Ok(());
     };
-    match launcher_open_kind(item.kind == DesktopItemKind::DesktopLauncher) {
+    let outcome = open_item_inner(state, item.kind.clone(), &item.path);
+    if let Err(error) = &outcome {
+        // Double-click/open boundary: spawn intent failure is logged and
+        // counted; the event loop stays alive. Child exit after a successful
+        // spawn is not a Flame error and never reaches this path.
+        report_action_failure("open item", error.clone());
+        spawn_failure_counter().increment();
+    }
+    Ok(())
+}
+
+fn open_item_inner(state: &DesktopState, kind: DesktopItemKind, path: &Path) -> Result<(), String> {
+    match launcher_open_kind(kind == DesktopItemKind::DesktopLauncher) {
         LauncherOpen::DesktopEntry => {
-            let launchable = state
-                .launchers
-                .get(&item.path)
-                .is_some_and(|meta| meta.valid);
+            let launchable = state.launchers.get(path).is_some_and(|meta| meta.valid);
             if !launchable {
                 return Err(format!(
                     "desktop entry is not launchable: {}",
-                    item.path.display()
+                    path.display()
                 ));
             }
-            let entry = DesktopEntry::from_file(&item.path)
+            let entry = DesktopEntry::from_file(path)
                 .map_err(|error| format!("{error:?}"))?
-                .ok_or_else(|| {
-                    format!("desktop entry is not launchable: {}", item.path.display())
-                })?;
+                .ok_or_else(|| format!("desktop entry is not launchable: {}", path.display()))?;
             entry
                 .launch(&ApplicationLaunchOptions::default())
                 .map(|_| ())
@@ -1239,8 +1384,9 @@ fn open_item(state: &DesktopState, index: usize) -> Result<(), String> {
         }
         LauncherOpen::RegularFile => {
             Command::new("xdg-open")
-                .arg(&item.path)
+                .arg(path)
                 .spawn()
+                .map(|_| ())
                 .map_err(|error| error.to_string())?;
             Ok(())
         }
@@ -1268,7 +1414,10 @@ fn handle_menu_action(
     match action {
         "menu.terminal" => {
             let intent = open_terminal(&terminal_program(), &state.directory);
-            spawn_intent(&intent)?;
+            if let Err(error) = spawn_intent(&intent) {
+                report_action_failure("open terminal", error);
+                spawn_failure_counter().increment();
+            }
             state.menu = None;
             sync_menu(document, state)?;
         }
@@ -1289,16 +1438,19 @@ fn handle_menu_action(
             let anchor = state.menu.as_ref().map(|menu| menu.anchor);
             let anchor = anchor.unwrap_or(state.grid.work_area.origin());
             if state.sticky.enabled() {
-                let id = format!("sticky-{}", state.sticky.notes().len() + 1);
-                state.sticky.create(StickyNote::new(
-                    id,
-                    OutputId::new("default"),
-                    0,
-                    anchor.x,
-                    anchor.y,
-                ));
-                sticky_persistence::persist(&state.sticky_path, &state.sticky)
-                    .map_err(|error| format!("{error:?}"))?;
+                let workspace = state.active_workspace;
+                let sequence = state.sticky.count_for_workspace(workspace) + 1;
+                let id = format!("sticky-{workspace}-{sequence}");
+                if state.sticky.count_for_workspace(workspace) < STICKY_SLOTS {
+                    state.sticky.create(StickyNote::new(
+                        id,
+                        OutputId::new("default"),
+                        workspace,
+                        anchor.x,
+                        anchor.y,
+                    ));
+                    schedule_sticky_persist(state);
+                }
             }
             state.menu = None;
             sync_document(document, state)?;
@@ -1309,7 +1461,10 @@ fn handle_menu_action(
             sync_menu(document, state)?;
         }
         "menu.settings" => {
-            spawn_intent(&desktop_settings())?;
+            if let Err(error) = spawn_intent(&desktop_settings()) {
+                report_action_failure("open desktop settings", error);
+                spawn_failure_counter().increment();
+            }
             state.menu = None;
             sync_menu(document, state)?;
         }
@@ -1373,8 +1528,46 @@ fn handle_menu_action(
                 .or_else(|| state.sticky.notes().first().map(|note| note.id.clone()));
             if let Some(note_id) = note_id {
                 state.sticky.remove(&note_id);
+                if state
+                    .sticky_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.note_id == note_id)
+                {
+                    state.sticky_edit = None;
+                }
+                sticky_persist_counter().increment();
                 sticky_persistence::persist(&state.sticky_path, &state.sticky)
                     .map_err(|error| format!("{error:?}"))?;
+            }
+            state.menu = None;
+            sync_document(document, state)?;
+        }
+        "sticky.menu.yellow" | "sticky.menu.green" | "sticky.menu.pink" | "sticky.menu.blue" => {
+            let preset = match action {
+                "sticky.menu.yellow" => 0,
+                "sticky.menu.green" => 1,
+                "sticky.menu.pink" => 2,
+                _ => 3,
+            };
+            let note_id = state
+                .menu
+                .as_ref()
+                .and_then(|menu| menu.selected_id.clone());
+            if let Some(note_id) = note_id {
+                state.sticky.set_color(&note_id, preset);
+                schedule_sticky_persist(state);
+            }
+            state.menu = None;
+            sync_document(document, state)?;
+        }
+        "sticky.menu.bold" => {
+            let note_id = state
+                .menu
+                .as_ref()
+                .and_then(|menu| menu.selected_id.clone());
+            if let Some(note_id) = note_id {
+                state.sticky.toggle_bold(&note_id);
+                schedule_sticky_persist(state);
             }
             state.menu = None;
             sync_document(document, state)?;
@@ -1650,7 +1843,9 @@ fn hide_confirm(document: &mut impl UiDocumentAccess) -> Result<(), String> {
 }
 
 fn show_confirm(document: &mut impl UiDocumentAccess, state: &DesktopState) -> Result<(), String> {
-    let size = (CONTEXT_MENU_WIDTH, menu_height_for_rows(2));
+    let parts = confirm_menu_parts();
+    let measured = context_menu_size(&parts, flamewm_ui_core::context_menu::MIN_ROW_WIDTH);
+    let size = (measured.width, measured.height);
     let center = Point::new(
         state.grid.work_area.x + (state.grid.work_area.width - size.0) / 2,
         state.grid.work_area.y + (state.grid.work_area.height - size.1) / 2,
@@ -1666,18 +1861,31 @@ fn show_confirm(document: &mut impl UiDocumentAccess, state: &DesktopState) -> R
 }
 
 fn sync_menu(document: &mut impl UiDocumentAccess, state: &DesktopState) -> Result<(), String> {
-    hide_menus(document)?;
+    let _total = context_open_total_point().start();
+    {
+        let _close = context_open_close_point().start();
+        hide_menus(document)?;
+    }
     let Some(menu) = state.menu.as_ref() else {
         return Ok(());
     };
     match menu.kind {
         MenuKind::Blank => {
-            let rows = blank_context_menu(state.sticky.enabled());
+            let rows = {
+                let _project = context_open_project_point().start();
+                blank_context_menu(state.sticky.enabled())
+            };
             let visible: BTreeSet<&str> = rows.iter().map(|action| blank_row_id(*action)).collect();
             for id in BLANK_ROW_IDS {
                 document.visible(id, visible.contains(id))?;
             }
-            place_menu(document, state, "desktop-menu", menu.anchor, rows.len())?;
+            place_menu_parts(
+                document,
+                state,
+                "desktop-menu",
+                menu.anchor,
+                &blank_menu_parts(rows.len()),
+            )?;
         }
         MenuKind::Entry => {
             let selected_kind = menu
@@ -1686,40 +1894,52 @@ fn sync_menu(document: &mut impl UiDocumentAccess, state: &DesktopState) -> Resu
                 .and_then(|id| state.model.items().find(|item| &item.id == id))
                 .map(|item| item.kind);
             let is_trash = selected_kind == Some(DesktopItemKind::TrashPseudo);
-            let rows = entry_context_menu(is_trash);
+            let rows = {
+                let _project = context_open_project_point().start();
+                entry_context_menu(is_trash)
+            };
             let visible: BTreeSet<&str> = rows.iter().map(|action| entry_row_id(*action)).collect();
             for id in ENTRY_ROW_IDS {
                 document.visible(id, visible.contains(id))?;
             }
-            place_menu(
+            place_menu_parts(
                 document,
                 state,
                 "desktop-entry-menu",
                 menu.anchor,
-                rows.len(),
+                &entry_menu_parts(rows.len()),
             )?;
         }
         MenuKind::Sticky => {
-            place_menu(document, state, "sticky-menu", menu.anchor, 1)?;
+            let parts = {
+                let _project = context_open_project_point().start();
+                sticky_menu_parts()
+            };
+            place_menu_parts(document, state, "sticky-menu", menu.anchor, &parts)?;
         }
     }
     Ok(())
 }
 
-fn place_menu(
+fn place_menu_parts(
     document: &mut impl UiDocumentAccess,
     state: &DesktopState,
     id: &str,
     anchor: Point,
-    rows: usize,
+    parts: &[MenuPart],
 ) -> Result<(), String> {
-    // Canonical popover measurement: pointer-anchored rect through
-    // PopoverGeometry, clamped to the work area. Position/size land first so
-    // the first presented frame already shows the menu above the contents.
-    let placed = context_menu_rect(state.grid.work_area, anchor, rows);
+    // Shared C08 contract: size from actual parts, clamp through menu_rect.
+    // Position/size land first so the first presented frame already shows
+    // the menu above the contents.
+    let placed = {
+        let _measure = context_open_measure_point().start();
+        let _place = context_open_place_point().start();
+        parts_menu_rect(state.grid.work_area, anchor, parts)
+    };
     document.position(id, placed.x as f32, placed.y as f32)?;
     document.size(id, placed.width as f32, placed.height as f32)?;
     context_open_counter().increment();
+    let _present = context_open_present_point().start();
     document.visible(id, true)
 }
 
@@ -1740,7 +1960,7 @@ fn show_drag_ghost(
     document.position("desktop-drag-ghost", gx, gy)?;
     projection::project_drag_ghost_icon(
         document,
-        &mut state.icon_resolver,
+        &mut state.icons,
         kind,
         icon_override.as_deref(),
     )?;
@@ -1888,6 +2108,12 @@ fn restore_original_positions(state: &mut DesktopState, drag: &ItemDrag) -> Resu
         .map_err(|error| format!("{error:?}"))
 }
 
+fn commit_sticky_edit(state: &mut DesktopState) {
+    if state.sticky_edit.take().is_some() {
+        schedule_sticky_persist(state);
+    }
+}
+
 fn handle_sticky_text_input(
     action: &UiActionEvent,
     document: &mut impl UiDocumentAccess,
@@ -1941,6 +2167,23 @@ fn handle_sticky_slot(
         return Ok(());
     };
     let note_id = note.id.clone();
+    // Primary press anywhere on the note body (root sticky.N.move action,
+    // title excluded) activates the edit buffer, not just the text node.
+    if action.action.ends_with(".move")
+        && action.phase == UiActionPhase::Press
+        && pointer_button(action) == PointerButton::Primary
+    {
+        hide_menus(document)?;
+        state.menu = None;
+        state.sticky_edit = Some(StickyEdit {
+            note_id,
+            buffer: note.text.clone(),
+        });
+        sticky_edit_counter().increment();
+        return sync_sticky(document, state);
+    }
+    // Primary click elsewhere (desktop surface or another note) commits the
+    // active buffer, persists, and clears sticky_edit.
     if action.action.ends_with(".text") {
         if action.phase == UiActionPhase::Press && pointer_button(action) == PointerButton::Primary
         {

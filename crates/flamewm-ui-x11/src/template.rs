@@ -48,6 +48,8 @@ pub trait UiDocumentAccess {
     fn background_clear(&mut self, id: &str) -> Result<(), String>;
     fn border_clear(&mut self, id: &str) -> Result<(), String>;
     fn foreground_clear(&mut self, id: &str) -> Result<(), String>;
+    fn font_size(&mut self, id: &str, size_px: f32) -> Result<(), String>;
+    fn font_weight(&mut self, id: &str, weight: u16) -> Result<(), String>;
     fn overflow(
         &mut self,
         id: &str,
@@ -135,6 +137,14 @@ impl UiDocument {
         self.document.set_overflow(id, x, y)
     }
 
+    pub fn font_size(&mut self, id: &str, size_px: f32) -> Result<(), String> {
+        self.document.set_font_size_px(id, size_px)
+    }
+
+    pub fn font_weight(&mut self, id: &str, weight: u16) -> Result<(), String> {
+        self.document.set_font_weight(id, weight)
+    }
+
     pub fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
         self.document.set_z_index(id, layer.z_index())
     }
@@ -200,6 +210,14 @@ impl UiDocumentAccess for UiDocument {
         y: flamewm_render_core::Overflow,
     ) -> Result<(), String> {
         self.overflow(id, x, y)
+    }
+
+    fn font_size(&mut self, id: &str, size_px: f32) -> Result<(), String> {
+        self.font_size(id, size_px)
+    }
+
+    fn font_weight(&mut self, id: &str, weight: u16) -> Result<(), String> {
+        self.font_weight(id, weight)
     }
 
     fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
@@ -290,6 +308,14 @@ impl<'a> UiDocumentAccess for UiDocumentView<'a> {
         y: flamewm_render_core::Overflow,
     ) -> Result<(), String> {
         self.document.set_overflow(id, x, y)
+    }
+
+    fn font_size(&mut self, id: &str, size_px: f32) -> Result<(), String> {
+        self.document.set_font_size_px(id, size_px)
+    }
+
+    fn font_weight(&mut self, id: &str, weight: u16) -> Result<(), String> {
+        self.document.set_font_weight(id, weight)
     }
 
     fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
@@ -697,10 +723,6 @@ mod tests {
     fn rounded_mask_degrades_to_full_rect_for_small_radius() {
         assert_eq!(rounded_rect_mask_spans(4, 2, 0), vec![(0, 0, 4), (1, 0, 4)]);
         assert!(rounded_rect_mask_spans(0, 8, 4).is_empty());
-    }
-
-    fn el(id: &str, parent: Option<u32>) -> flamewm_render_core::CompiledNode {
-        el_color(id, parent, flamewm_render_core::Color::rgb(10, 20, 30))
     }
 
     fn el_color(

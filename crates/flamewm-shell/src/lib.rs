@@ -2,10 +2,12 @@
 
 pub mod async_projection;
 pub mod calendar;
+pub mod control_actions;
 pub mod icon_loader;
 pub mod panel;
 pub mod popovers;
 pub mod projection;
+pub mod quick_controls;
 pub mod runtime;
 pub mod start;
 pub mod status;
@@ -27,5 +29,6 @@ pub mod taskbar {
 }
 
 pub use runtime::{
-    ContextMenuKind, ContextMenuState, ShellControl, ShellRuntime, ShellSnapshot, ShellSurfaces,
+    ChangedDomains, ContextMenuKind, ContextMenuState, ProjectionKind, ShellControl, ShellDirty,
+    ShellRuntime, ShellSnapshot, ShellSurfaces,
 };

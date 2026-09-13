@@ -12,6 +12,14 @@ use flamewm_render_core::ImageTreatment;
 
 static MASK_LOG_ONCE: Once = Once::new();
 
+const MAX_IMAGE_CACHE_ENTRIES: usize = 64;
+const MAX_IMAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+#[allow(dead_code)]
+fn pixmap_bytes(width: u32, height: u32, depth: u32) -> usize {
+    super::native::xresource::pixmap_byte_estimate(width, height, depth)
+}
+
 fn log_degraded_mask_once(asset_id: u16) {
     MASK_LOG_ONCE.call_once(|| {
         eprintln!(
@@ -48,6 +56,85 @@ pub(crate) fn image_cache_key(
 }
 
 impl X11App {
+    fn refresh_image_cache_gauges(&self) {
+        let total: usize = self.images.values().map(|image| image.bytes).sum();
+        refresh_image_gauge(total as u64);
+    }
+
+    fn alloc_pixmap(
+        &mut self,
+        drawable: Drawable,
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) -> Result<(Pixmap, usize), String> {
+        let (root_w, root_h) = self.root_extent();
+        unsafe {
+            self.allocator.create_pixmap(
+                self.display,
+                drawable,
+                width,
+                height,
+                depth,
+                root_w,
+                root_h,
+            )
+        }
+    }
+
+    fn free_pixmap_tracked(&mut self, pixmap: Pixmap, bytes: usize) {
+        unsafe { self.allocator.free_pixmap(self.display, pixmap, bytes) };
+    }
+
+    unsafe fn evict_node_images(&mut self, key: ImageCacheKey) {
+        let stale_keys: Vec<ImageCacheKey> = self
+            .images
+            .keys()
+            .filter(|cached| cached.node == key.node && **cached != key)
+            .copied()
+            .collect();
+        for stale_key in stale_keys {
+            if let Some(stale) = self.images.remove(&stale_key) {
+                let display = self.display;
+                unsafe { free_cached_image(display, &mut self.allocator, stale) };
+            }
+        }
+        self.refresh_image_cache_gauges();
+    }
+
+    unsafe fn insert_cached_image(
+        &mut self,
+        key: ImageCacheKey,
+        cached: CachedImage,
+    ) -> Result<(), String> {
+        if cached.bytes > MAX_IMAGE_CACHE_BYTES {
+            let display = self.display;
+            unsafe { free_cached_image(display, &mut self.allocator, cached) };
+            return Err(format!(
+                "image asset {}x{} exceeds {MAX_IMAGE_CACHE_BYTES}-byte cache budget",
+                key.width, key.height
+            ));
+        }
+        let mut cache_bytes = self.images.values().map(|image| image.bytes).sum::<usize>();
+        while self.images.len() >= MAX_IMAGE_CACHE_ENTRIES
+            || cache_bytes.saturating_add(cached.bytes) > MAX_IMAGE_CACHE_BYTES
+        {
+            let Some(eviction_key) = self.images.keys().next().copied() else {
+                break;
+            };
+            let evicted = self
+                .images
+                .remove(&eviction_key)
+                .expect("cache key must exist");
+            cache_bytes = cache_bytes.saturating_sub(evicted.bytes);
+            let display = self.display;
+            unsafe { free_cached_image(display, &mut self.allocator, evicted) };
+        }
+        self.images.insert(key, cached);
+        self.refresh_image_cache_gauges();
+        Ok(())
+    }
+
     pub(super) unsafe fn image_pixmap(
         &mut self,
         node: u32,
@@ -71,19 +158,7 @@ impl X11App {
         if let Some(cached) = self.images.get(&key).copied() {
             return Ok(cached);
         }
-        let stale_keys: Vec<ImageCacheKey> = self
-            .images
-            .keys()
-            .filter(|cached| {
-                cached.node == node && cached.asset == asset_id && cached.revision != revision
-            })
-            .copied()
-            .collect();
-        for stale_key in stale_keys {
-            if let Some(stale) = self.images.remove(&stale_key) {
-                unsafe { free_cached_image(self.display, stale) };
-            }
-        }
+        unsafe { self.evict_node_images(key) };
         let argb = match treatment {
             ImageTreatment::Original => crate::native::image::scale_and_premultiply(
                 pixels, src_width, src_height, width, height,
@@ -103,22 +178,26 @@ impl X11App {
                 XMatchVisualInfo(self.display, self.screen, 32, TRUE_COLOR_CLASS, &mut vinfo)
             };
             if matched != 0 && !vinfo.visual.is_null() {
-                let pixmap = unsafe { XCreatePixmap(self.display, root, width, height, 32) };
-                if pixmap == 0 {
-                    return Err(format!("XCreatePixmap failed for image asset {asset_id}"));
-                }
+                let (pixmap, pix_bytes) = match self.alloc_pixmap(root, width, height, 32) {
+                    Ok(created) => created,
+                    Err(error) => {
+                        return Err(format!("image asset {asset_id}: {error}"));
+                    }
+                };
                 if let Err(error) =
                     unsafe { self.upload_argb32_words(pixmap, vinfo.visual, &argb, width, height) }
                 {
-                    unsafe { XFreePixmap(self.display, pixmap) };
+                    self.free_pixmap_tracked(pixmap, pix_bytes);
                     return Err(error);
                 }
                 let cached = CachedImage {
                     pixmap,
                     picture: 1,
                     mask: 0,
+                    mask_bytes: 0,
+                    bytes: pix_bytes,
                 };
-                self.images.insert(key, cached);
+                unsafe { self.insert_cached_image(key, cached) }?;
                 return Ok(cached);
             }
             eprintln!(
@@ -127,26 +206,39 @@ impl X11App {
         }
         // Degraded path (no XRender): depth pixmap + 1-bit threshold mask.
         log_degraded_mask_once(asset_id);
-        let pixmap =
-            unsafe { XCreatePixmap(self.display, self.window, width, height, self.depth as u32) };
-        if pixmap == 0 {
-            return Err(format!("XCreatePixmap failed for image asset {asset_id}"));
-        }
+        let (pixmap, pix_bytes) =
+            match self.alloc_pixmap(self.window, width, height, self.depth as u32) {
+                Ok(created) => created,
+                Err(error) => return Err(format!("image asset {asset_id}: {error}")),
+            };
         if let Err(error) = unsafe {
             self.upload_opaque_fallback(pixmap, pixels, src_width, src_height, width, height)
         } {
-            unsafe { XFreePixmap(self.display, pixmap) };
+            self.free_pixmap_tracked(pixmap, pix_bytes);
             return Err(error);
         }
-        let mask = unsafe {
-            self.build_threshold_mask(pixels, src_width, src_height, width, height, asset_id)?
+        let mask = match unsafe {
+            self.build_threshold_mask(pixels, src_width, src_height, width, height, asset_id)
+        } {
+            Ok(mask) => mask,
+            Err(error) => {
+                self.free_pixmap_tracked(pixmap, pix_bytes);
+                return Err(error);
+            }
+        };
+        let mask_bytes = if mask == 0 {
+            0
+        } else {
+            super::native::xresource::pixmap_byte_estimate(width, height, 1)
         };
         let cached = CachedImage {
             pixmap,
             picture: 0,
             mask,
+            mask_bytes,
+            bytes: pix_bytes.saturating_add(mask_bytes),
         };
-        self.images.insert(key, cached);
+        unsafe { self.insert_cached_image(key, cached) }?;
         Ok(cached)
     }
 
@@ -328,15 +420,25 @@ impl X11App {
         if !transparent.iter().any(|t| *t) {
             return Ok(0);
         }
-        let mask = unsafe { XCreatePixmap(self.display, self.window, width, height, 1) };
-        if mask == 0 {
-            return Err(format!(
-                "XCreatePixmap failed for transparency mask asset {asset_id}"
-            ));
+        let (root_w, root_h) = self.root_extent();
+        let (mask, _) = unsafe {
+            self.allocator.create_pixmap(
+                self.display,
+                self.window,
+                width,
+                height,
+                1,
+                root_w,
+                root_h,
+            )
         }
+        .map_err(|error| format!("transparency mask asset {asset_id}: {error}"))?;
         let mask_gc = unsafe { XCreateGC(self.display, mask, 0, ptr::null_mut()) };
         if mask_gc.is_null() {
-            unsafe { XFreePixmap(self.display, mask) };
+            self.free_pixmap_tracked(
+                mask,
+                super::native::xresource::pixmap_byte_estimate(width, height, 1),
+            );
             return Err(format!(
                 "XCreateGC failed for transparency mask asset {asset_id}"
             ));
@@ -398,5 +500,12 @@ mod tests {
             Color::rgb(10, 20, 30),
         );
         assert_ne!(a_resized, a_tinted, "treatment+palette are part of the key");
+    }
+
+    #[test]
+    fn pixmap_accounting_includes_depth() {
+        use super::super::native::xresource::pixmap_byte_estimate;
+        assert_eq!(pixmap_byte_estimate(2, 3, 32), 24);
+        assert_eq!(pixmap_byte_estimate(2, 3, 1), 6);
     }
 }

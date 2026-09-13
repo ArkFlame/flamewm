@@ -3,6 +3,8 @@ mod xlib;
 mod xrender;
 mod xshape;
 
+pub mod backdrop;
+
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -13,6 +15,7 @@ pub use flamewm_render_core::{ActionEvent, ActionPhase, ControllerEvent};
 
 mod app;
 mod config;
+mod external_decoration;
 mod external_drawable;
 mod ffi;
 mod native;
@@ -21,6 +24,7 @@ mod surface_controller;
 
 use app::X11App;
 pub use config::*;
+pub use external_decoration::ExternalDecorationRenderer;
 pub use external_drawable::{
     ExternalDrawableSession, ExternalDrawableTarget, NativeDrawableRenderer,
     external_font_pattern_order, external_pixmap_byte_estimate, external_release_order,

@@ -65,7 +65,10 @@ impl X11App {
                     let _ = self.note_mapped();
                 }
                 CONFIGURE_NOTIFY => {
-                    // SAFETY: The discriminator identifies XConfigureEvent in this match arm.
+                    // Reconcile-only: adopt the WM-driven size into retained
+                    // state (recreate backbuffer, mark Full, shape follows).
+                    // No XMoveResizeWindow echo: the native move is owned by
+                    // SurfaceController::move_resize only.
                     let configure = unsafe { event.xconfigure };
                     let width = configure.width.max(1) as u32;
                     let height = configure.height.max(1) as u32;
@@ -574,21 +577,23 @@ impl X11App {
     }
 
     pub(crate) unsafe fn recreate_backbuffer(&mut self) -> Result<(), String> {
-        // Resize retarget lifecycle: new pixmap first, retarget Xft/XRender
-        // (Pictures freed before Pixmaps on failure paths), then swap.
+        // Resize retarget lifecycle: checked replacement first, retarget
+        // Xft/XRender (Pictures freed before Pixmaps on failure paths),
+        // then swap + free the stale pixmap through the allocator ledger.
         // SAFETY: self.display and self.window are live handles owned by this app.
-        let replacement = unsafe {
-            XCreatePixmap(
+        let (root_w, root_h) = self.root_extent();
+        let (replacement, replacement_bytes) = unsafe {
+            self.allocator.create_pixmap(
                 self.display,
                 self.window,
                 self.width,
                 self.height,
                 self.depth as u32,
+                root_w,
+                root_h,
             )
-        };
-        if replacement == 0 {
-            return Err("XCreatePixmap failed while resizing retained backbuffer".to_string());
         }
+        .map_err(|error| format!("retained backbuffer resize: {error}"))?;
         // Free the old XRender destination Picture before the old Pixmap:
         // retarget creates the replacement picture first, then the backend
         // drops the stale picture; the stale pixmap is freed only after swap.
@@ -603,19 +608,41 @@ impl X11App {
                     // SAFETY: restore the previous live backbuffer on the same display.
                     unsafe { xft.set_drawable(self.backbuffer) };
                 }
-                // SAFETY: replacement was created by XCreatePixmap on self.display.
-                unsafe { XFreePixmap(self.display, replacement) };
+                // SAFETY: replacement is allocator-owned on self.display.
+                unsafe {
+                    self.allocator
+                        .free_pixmap(self.display, replacement, replacement_bytes)
+                };
                 return Err(error);
             }
         }
         let previous = self.backbuffer;
+        let previous_bytes = self.backbuffer_bytes;
         self.backbuffer = replacement;
+        self.backbuffer_bytes = replacement_bytes;
+        refresh_backbuffer_gauge(replacement_bytes as u64);
         if let Some(surface) = self.surface.as_mut() {
             surface.pixmap = replacement;
         }
         if previous != 0 {
-            // SAFETY: previous is the app-owned pixmap replaced above.
-            unsafe { XFreePixmap(self.display, previous) };
+            // Keep the old backbuffer alive until the replacement is
+            // painted and bound via
+            // bind_presented_backbuffer_as_window_background (first full
+            // redraw after this swap). The server may still reference the
+            // old pixmap as the window background; freeing it now would
+            // leave a dangling background reference. Never bind the
+            // unpainted replacement here.
+            if let Some((stale, stale_bytes)) =
+                self.retired_backbuffer.replace((previous, previous_bytes))
+            {
+                // Defensive: only one retired generation is expected; free
+                // any superseded stale id that is not the bound background.
+                if stale != 0 && stale != self.background_bound && stale != replacement {
+                    unsafe {
+                        self.allocator.free_pixmap(self.display, stale, stale_bytes);
+                    }
+                }
+            }
         }
         Ok(())
     }

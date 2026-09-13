@@ -14,9 +14,10 @@
 //! `DEFAULT_PREVIEW_OPACITY_PERCENT` unless they already hold a live value.
 
 use flamewm_api::Rect;
+use flamewm_render_x11::backdrop;
 use flamewm_ui_x11::{
-    SurfaceConfig, SurfaceHandle, SurfaceInputMode, SurfaceRole, SurfaceRuntime, UiColor,
-    UiDocumentAccess, UiTemplate, decode_document,
+    RuntimeImage, SurfaceConfig, SurfaceHandle, SurfaceInputMode, SurfaceRole, SurfaceRuntime,
+    UiColor, UiDocumentAccess, UiTemplate, decode_document,
 };
 
 use flamewm_window_core::SnapTarget;
@@ -26,22 +27,60 @@ const COMPILED_UI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flamewm-sna
 /// Default fill opacity when live settings are unavailable (no new protocol).
 pub const DEFAULT_PREVIEW_OPACITY_PERCENT: u8 = 20;
 
-/// Accent red backing the preview border/fill (`#ef4048`).
-pub const ACCENT_RGB: (u8, u8, u8) = (0xef, 0x40, 0x48);
+/// Accent red backing the preview border/fill (`#ef4048`): shared with
+/// the desktop-selection material owner, one material two consumers.
+pub const ACCENT_RGB: (u8, u8, u8) = backdrop::BACKDROP_ACCENT_RGB;
 
 /// Node in the compiled document that carries the preview fill.
 const FILL_NODE: &str = "snap-preview";
 
-/// Translucent accent fill for an opacity percent. Pure and headless-testable.
-#[must_use]
-pub fn fill_color(opacity_percent: u8) -> UiColor {
-    let opacity = u16::from(opacity_percent.min(100));
+/// Image node filling the preview rect with composited backdrop pixels.
+const BACKDROP_NODE: &str = "snap-preview-backdrop";
+
+/// Source label for the retained composited backdrop override.
+const BACKDROP_SOURCE: &str = "snap-preview-backdrop-retained";
+
+/// Strong accent border over the captured backdrop (shared accent family).
+fn border_color() -> UiColor {
     UiColor {
         r: ACCENT_RGB.0,
         g: ACCENT_RGB.1,
         b: ACCENT_RGB.2,
-        a: ((opacity * 255 + 50) / 100) as u8,
+        a: backdrop::BACKDROP_BORDER_ALPHA,
     }
+}
+
+/// Translucent accent fill for an opacity percent. Pure and headless-testable.
+/// Delegates to the shared desktop-selection material owner.
+#[cfg(test)]
+#[must_use]
+pub fn fill_color(opacity_percent: u8) -> UiColor {
+    let (r, g, b, a) = backdrop::fill_color(opacity_percent);
+    UiColor { r, g, b, a }
+}
+
+/// Material for one upload: composited RGBA sized to the captured rect,
+/// or `None` when capture failed (border-only preview, no fill, no image).
+#[must_use]
+pub fn preview_image(
+    captured: &Result<backdrop::BackdropCapture, String>,
+    opacity: u8,
+) -> Option<RuntimeImage> {
+    let captured = captured.as_ref().ok()?;
+    let (fill, border) = backdrop::selection_material(opacity);
+    let pixels = backdrop::composite_selection_material(captured, Some(fill), border);
+    if captured.width == 0 || captured.height == 0 {
+        return None;
+    }
+    if pixels.len() != (captured.width as usize) * (captured.height as usize) * 4 {
+        return None;
+    }
+    Some(RuntimeImage {
+        source: BACKDROP_SOURCE.to_string(),
+        width: captured.width,
+        height: captured.height,
+        pixels,
+    })
 }
 
 fn checked_size(value: i32) -> Option<u32> {
@@ -71,16 +110,19 @@ impl SnapPreviewSurface {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn visible(&self) -> bool {
         self.visible
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn candidate(&self) -> Option<SnapTarget> {
         self.candidate
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn geometry(&self) -> Option<Rect> {
         self.geometry
@@ -130,11 +172,47 @@ impl SnapPreviewSurface {
             self.hide();
             return;
         }
-        let fill = fill_color(opacity);
+        // C12 flow, gated by is_current above: capture only on target/rect
+        // change. Retained composited pixels land as exact RGBA on the
+        // backdrop image node filling the preview rect; the accent border
+        // stays as the only extra tint. No second translucent red bg.
+        // Capture failure -> clear/hide the image, clear the fill, keep
+        // the border.
+        let captured = backdrop::capture_root_rect_auto((geometry.x, geometry.y, width, height));
+        let image = preview_image(&captured, opacity);
         let styled = runtime.with_document(surface, |document| {
             document
-                .background(FILL_NODE, fill)
-                .map_err(|error: String| error)
+                .border(FILL_NODE, border_color())
+                .map_err(|error: String| error)?;
+            document
+                .background_clear(FILL_NODE)
+                .map_err(|error: String| error)?;
+            match image {
+                Some(image) => {
+                    document
+                        .image_rgba8(BACKDROP_NODE, image)
+                        .map_err(|error: String| error)?;
+                    document
+                        .visible(BACKDROP_NODE, true)
+                        .map_err(|error: String| error)?;
+                }
+                None => {
+                    // Failure path: hide retained pixels, keep border only.
+                    let _ = document.visible(BACKDROP_NODE, false);
+                    document
+                        .image_rgba8(
+                            BACKDROP_NODE,
+                            RuntimeImage {
+                                source: BACKDROP_SOURCE.to_string(),
+                                width: 1,
+                                height: 1,
+                                pixels: vec![0, 0, 0, 0],
+                            },
+                        )
+                        .map_err(|error: String| error)?;
+                }
+            }
+            Ok(())
         });
         if styled.is_err() {
             self.hide();
@@ -285,6 +363,25 @@ mod tests {
                 a: 51,
             }
         );
+    }
+
+    #[test]
+    fn preview_image_consumes_shared_material_pixels() {
+        let captured: Result<backdrop::BackdropCapture, String> = Ok(backdrop::BackdropCapture {
+            width: 6,
+            height: 6,
+            pixels: vec![0, 0, 0, 255].repeat(36),
+        });
+        let image = preview_image(&captured, 20).expect("composited image");
+        assert_eq!((image.width, image.height), (6, 6));
+        assert_eq!(image.pixels.len(), 36 * 4);
+        // Interior carries the shared translucent fill; border ring strong.
+        let inner = &image.pixels[(3 * 6 + 3) * 4..][..4];
+        assert_eq!((inner[0], inner[1], inner[2], inner[3]), (48, 13, 14, 255));
+        assert!(image.pixels[0] > 200);
+        // Failure -> no image: caller clears/hides the node, keeps border.
+        let failed: Result<backdrop::BackdropCapture, String> = Err("no display".to_string());
+        assert!(preview_image(&failed, 20).is_none());
     }
 
     #[test]

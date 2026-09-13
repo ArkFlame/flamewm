@@ -1,6 +1,9 @@
 //! Desktop presentation contracts learned from the current native desktop renderer.
 
 use flamewm_api::{Point, Rect, Size};
+use flamewm_ui_core::context_menu::{
+    self, MIN_ROW_WIDTH, MenuMetrics, MenuPart, permanent_delete_parts,
+};
 use flamewm_ui_core::popover::{PopoverEdge, PopoverGeometry};
 
 pub const WATERMARK_WIDTH: i32 = 220;
@@ -194,8 +197,48 @@ pub fn blank_context_menu(sticky_enabled: bool) -> Vec<BlankDesktopAction> {
 }
 
 /// Fixed context-menu footprint used for work-area clamping.
-pub const CONTEXT_MENU_WIDTH: i32 = 220;
-pub const CONTEXT_MENU_ROW_HEIGHT: i32 = 32;
+/// Canonical shared row minimum; the outer container minimum is derived in
+/// `context_menu_size` as content width plus shared container padding.
+pub const CONTEXT_MENU_WIDTH: i32 = MIN_ROW_WIDTH + 2 * flamewm_ui_core::context_menu::MENU_PADDING;
+pub const CONTEXT_MENU_ROW_HEIGHT: i32 = flamewm_ui_core::context_menu::ROW_HEIGHT;
+
+/// Blank-menu part shape: one row per visible action.
+#[must_use]
+pub fn blank_menu_parts(row_count: usize) -> Vec<MenuPart> {
+    vec![MenuPart::Row; row_count]
+}
+
+/// Entry-menu part shape: one row per visible action.
+#[must_use]
+pub fn entry_menu_parts(row_count: usize) -> Vec<MenuPart> {
+    vec![MenuPart::Row; row_count]
+}
+
+/// Sticky-menu part shape: six color/bold/delete rows (J05).
+#[must_use]
+pub fn sticky_menu_parts() -> Vec<MenuPart> {
+    vec![
+        MenuPart::Row,
+        MenuPart::Row,
+        MenuPart::Row,
+        MenuPart::Row,
+        MenuPart::Row,
+        MenuPart::Row,
+    ]
+}
+
+/// Confirm-menu part shape: shared permanent-delete header + Delete/Cancel.
+#[must_use]
+pub fn confirm_menu_parts() -> Vec<MenuPart> {
+    permanent_delete_parts()
+}
+
+/// Outer menu size from actual parts through the shared C08 contract.
+/// `measured_min_width` may expand the menu; only `menu_rect` clamps.
+#[must_use]
+pub fn context_menu_size(parts: &[MenuPart], measured_min_width: i32) -> Size {
+    context_menu::menu_size(parts, measured_min_width, MenuMetrics::canonical())
+}
 
 /// Clamp a menu anchor so the menu rect stays inside the work area.
 #[must_use]
@@ -205,10 +248,10 @@ pub fn clamp_menu_anchor(work_area: Rect, anchor: Rect, menu_size: (i32, i32)) -
     Rect::new(anchor.x, anchor.y, width, height).clamp_inside(work_area)
 }
 
-/// Menu height for a row count at the fixed row height.
+/// Menu height for a row count at the shared canonical row height.
 #[must_use]
 pub fn menu_height_for_rows(rows: usize) -> i32 {
-    (rows as i32).saturating_mul(CONTEXT_MENU_ROW_HEIGHT).max(0)
+    context_menu_size(&blank_menu_parts(rows), MIN_ROW_WIDTH).height
 }
 
 /// Canonical popover placement for a context menu anchored at a pointer.
@@ -217,10 +260,18 @@ pub fn menu_height_for_rows(rows: usize) -> i32 {
 /// canonical `PopoverGeometry` owner. Returns the placed rect.
 #[must_use]
 pub fn context_menu_rect(work_area: Rect, anchor: Point, rows: usize) -> Rect {
-    let size = Size::new(CONTEXT_MENU_WIDTH, menu_height_for_rows(rows));
+    let size = context_menu_size(&blank_menu_parts(rows), MIN_ROW_WIDTH);
     let source = Rect::new(anchor.x, anchor.y, 1, 1);
     let placed = PopoverGeometry::place(source, size, PopoverEdge::Below, work_area, 0);
     Rect::from_parts(placed.origin, size)
+}
+
+/// Pointer-anchored menu rect for actual parts through the shared C08
+/// contract: size from `menu_size`, clamp through shared `menu_rect`.
+#[must_use]
+pub fn parts_menu_rect(work_area: Rect, anchor: Point, parts: &[MenuPart]) -> Rect {
+    let size = context_menu_size(parts, MIN_ROW_WIDTH);
+    context_menu::menu_rect(work_area, anchor, size)
 }
 
 pub const SELECTION_ACCENT_RGB: u32 = 0xff5533;
@@ -292,31 +343,31 @@ mod tests {
     #[test]
     fn menu_anchor_clamps_inside_work_area() {
         let work_area = Rect::new(0, 0, 1920, 1040);
-        let clamped = clamp_menu_anchor(work_area, Rect::new(1900, 1020, 220, 160), (220, 160));
-        assert_eq!(clamped, Rect::new(1700, 880, 220, 160));
-        assert_eq!(menu_height_for_rows(4), 128);
+        let clamped = clamp_menu_anchor(work_area, Rect::new(1900, 1020, 205, 165), (205, 165));
+        assert_eq!(clamped, Rect::new(1715, 875, 205, 165));
+        assert_eq!(menu_height_for_rows(4), 134);
     }
     #[test]
     fn menu_rows_map_to_fixed_row_geometry() {
-        assert_eq!(CONTEXT_MENU_WIDTH, 220);
-        assert_eq!(CONTEXT_MENU_ROW_HEIGHT, 32);
-        assert_eq!(menu_height_for_rows(1), 32);
-        assert_eq!(menu_height_for_rows(2), 64);
-        assert_eq!(menu_height_for_rows(5), 160);
+        assert_eq!(CONTEXT_MENU_WIDTH, 205);
+        assert_eq!(CONTEXT_MENU_ROW_HEIGHT, 31);
+        assert_eq!(menu_height_for_rows(1), 41);
+        assert_eq!(menu_height_for_rows(2), 72);
+        assert_eq!(menu_height_for_rows(5), 165);
     }
     #[test]
     fn blank_menu_row_visibility_follows_sticky_flag() {
         // 4 rows without sticky, 5 with: hidden rows stay display:none.
-        assert_eq!(menu_height_for_rows(blank_context_menu(false).len()), 128);
-        assert_eq!(menu_height_for_rows(blank_context_menu(true).len()), 160);
+        assert_eq!(menu_height_for_rows(blank_context_menu(false).len()), 134);
+        assert_eq!(menu_height_for_rows(blank_context_menu(true).len()), 165);
         assert!(!blank_context_menu(false).contains(&BlankDesktopAction::NewStickyNote));
         assert!(blank_context_menu(true).contains(&BlankDesktopAction::NewStickyNote));
     }
     #[test]
     fn menu_anchor_clamps_zero_sized_menu_inside_work_area() {
         let work_area = Rect::new(0, 0, 1920, 1040);
-        let clamped = clamp_menu_anchor(work_area, Rect::new(100, 100, 220, 0), (220, 0));
-        assert_eq!(clamped, Rect::new(100, 100, 220, 0));
+        let clamped = clamp_menu_anchor(work_area, Rect::new(100, 100, 205, 0), (205, 0));
+        assert_eq!(clamped, Rect::new(100, 100, 205, 0));
     }
     #[test]
     fn material_blend_matches_native_integer_blend() {

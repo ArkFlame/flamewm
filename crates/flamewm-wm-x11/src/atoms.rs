@@ -45,6 +45,17 @@ pub struct Atoms {
     pub net_wm_strut: Atom,
     pub net_wm_strut_partial: Atom,
     pub net_wm_icon: Atom,
+    pub net_wm_allowed_actions: Atom,
+    pub net_wm_action_move: Atom,
+    pub net_wm_action_resize: Atom,
+    pub net_wm_action_minimize: Atom,
+    pub net_wm_action_maximize_horz: Atom,
+    pub net_wm_action_maximize_vert: Atom,
+    pub net_wm_action_fullscreen: Atom,
+    pub net_wm_action_close: Atom,
+    pub net_wm_action_change_desktop: Atom,
+    pub net_wm_moveresize: Atom,
+    pub wm_change_state: Atom,
 }
 
 impl Atoms {
@@ -91,6 +102,17 @@ impl Atoms {
             net_wm_strut: atom(conn, "_NET_WM_STRUT")?,
             net_wm_strut_partial: atom(conn, "_NET_WM_STRUT_PARTIAL")?,
             net_wm_icon: atom(conn, "_NET_WM_ICON")?,
+            net_wm_allowed_actions: atom(conn, "_NET_WM_ALLOWED_ACTIONS")?,
+            net_wm_action_move: atom(conn, "_NET_WM_ACTION_MOVE")?,
+            net_wm_action_resize: atom(conn, "_NET_WM_ACTION_RESIZE")?,
+            net_wm_action_minimize: atom(conn, "_NET_WM_ACTION_MINIMIZE")?,
+            net_wm_action_maximize_horz: atom(conn, "_NET_WM_ACTION_MAXIMIZE_HORZ")?,
+            net_wm_action_maximize_vert: atom(conn, "_NET_WM_ACTION_MAXIMIZE_VERT")?,
+            net_wm_action_fullscreen: atom(conn, "_NET_WM_ACTION_FULLSCREEN")?,
+            net_wm_action_close: atom(conn, "_NET_WM_ACTION_CLOSE")?,
+            net_wm_action_change_desktop: atom(conn, "_NET_WM_ACTION_CHANGE_DESKTOP")?,
+            net_wm_moveresize: atom(conn, "_NET_WM_MOVERESIZE")?,
+            wm_change_state: atom(conn, "WM_CHANGE_STATE")?,
         })
     }
 
@@ -129,6 +151,16 @@ impl Atoms {
             self.net_wm_strut,
             self.net_wm_strut_partial,
             self.net_wm_icon,
+            self.net_wm_allowed_actions,
+            self.net_wm_action_move,
+            self.net_wm_action_resize,
+            self.net_wm_action_minimize,
+            self.net_wm_action_maximize_horz,
+            self.net_wm_action_maximize_vert,
+            self.net_wm_action_fullscreen,
+            self.net_wm_action_close,
+            self.net_wm_action_change_desktop,
+            self.net_wm_moveresize,
         ]
     }
 }

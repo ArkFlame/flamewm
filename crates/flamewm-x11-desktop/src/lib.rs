@@ -18,14 +18,15 @@ use flamewm_api::{
     TransactionId, WindowRef, WorkspaceRef,
 };
 use flamewm_applications::ApplicationCatalog;
+use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrConnectionExt};
 use x11rb::protocol::xproto::{
-    self, Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt, EventMask,
-    PropMode, Window,
+    self, Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt, EventMask, Window,
 };
 use x11rb::rust_connection::RustConnection;
-use x11rb::{CURRENT_TIME, NONE};
+
+pub const ICONIC_STATE: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingMode {
@@ -40,7 +41,6 @@ struct PendingMode {
 
 pub struct X11Desktop {
     conn: RustConnection,
-    screen: usize,
     root: Window,
     atoms: BTreeMap<String, Atom>,
     next_transaction: u64,
@@ -82,6 +82,7 @@ impl X11Desktop {
             "WM_CLASS",
             "WM_PROTOCOLS",
             "WM_DELETE_WINDOW",
+            "WM_CHANGE_STATE",
         ];
         let mut atoms = BTreeMap::new();
         for name in names {
@@ -95,7 +96,6 @@ impl X11Desktop {
         }
         Ok(Self {
             conn,
-            screen,
             root,
             atoms,
             next_transaction: 0,
@@ -159,6 +159,9 @@ impl X11Desktop {
             self.descendants(window, windows)?;
         }
         Ok(())
+    }
+    pub fn minimize_message(window: Window) -> (Window, &'static str, [u32; 5]) {
+        (window, "WM_CHANGE_STATE", [ICONIC_STATE, 0, 0, 0, 0])
     }
     fn client_message(&self, window: Window, name: &str, data: [u32; 5]) -> FlameResult<()> {
         let event = ClientMessageEvent {
@@ -357,12 +360,9 @@ impl WindowPort for X11Desktop {
         )
     }
     fn minimize(&mut self, w: WindowRef) -> FlameResult<()> {
-        self.conn
-            .unmap_window(self.check_window(w)?)
-            .map_err(io_error)?
-            .check()
-            .map_err(io_error)?;
-        self.flush()
+        let window = self.check_window(w)?;
+        let (target, name, data) = Self::minimize_message(window);
+        self.client_message(target, name, data)
     }
     fn maximize(&mut self, w: WindowRef) -> FlameResult<()> {
         let window = self.check_window(w)?;

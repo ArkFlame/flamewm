@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# J01 private nested D-Bus: outer invocation re-execs the harness under a
+# private session bus so the nested WM never touches the host bus.
+# Default ON; FLAMEWM_XEPHYR_PRIVATE_DBUS=0 opts out (debugging only).
+if [[ "${FLAMEWM_XEPHYR_PRIVATE_DBUS_INNER:-}" != "1" ]]; then
+  if [[ "${FLAMEWM_XEPHYR_PRIVATE_DBUS:-1}" == "0" ]]; then
+    export FLAMEWM_XEPHYR_PRIVATE_DBUS_INNER=1
+    exec "$0" "$@"
+  fi
+  if ! command -v dbus-run-session >/dev/null 2>&1; then
+    echo 'FLAMEWM_XEPHYR_ENVIRONMENT-BLOCKED: dbus-run-session missing; private D-Bus required (opt out with FLAMEWM_XEPHYR_PRIVATE_DBUS=0 for debugging only)' >&2
+    exit 3
+  fi
+  export FLAMEWM_XEPHYR_PRIVATE_DBUS_INNER=1
+  exec dbus-run-session -- "$0" "$@"
+fi
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)"
 cd "$ROOT"
+export PATH="$ROOT/.target/release:$PATH"
 command -v cargo >/dev/null || { echo 'cargo is required' >&2; exit 1; }
 command -v Xephyr >/dev/null || { echo 'Xephyr is required (Ubuntu/Debian: xserver-xephyr)' >&2; exit 1; }
 command -v xdpyinfo >/dev/null || { echo 'xdpyinfo is required (x11-utils)' >&2; exit 1; }
@@ -28,11 +44,10 @@ if [[ -z "${RWR_FONT_FILES:-}" ]]; then
   files="$(./scripts/prepare-ibm-plex || true)"
   [[ -n "$files" ]] && export RWR_FONT_FILES="$files"
 fi
-VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
-VERSION="${VERSION:-0.0.7}"
+VERSION="$(tr -d '[:space:]' < "$ROOT/FLAMEWM_VERSION")"
 
-echo "[1/5] Building FlameWM WM + desktop + shell"
-cargo build --quiet --release -p flamewm-wm -p flamewm-desktop -p flamewm-shell
+echo "[1/5] Building FlameWM WM + desktop + shell + settings"
+cargo build --quiet --release -p flamewm-wm -p flamewm-desktop -p flamewm-shell -p flamewm-settings
 mkdir -p .target/flamewm
 WM_BIN=./.target/release/flamewm
 DESKTOP_BIN=./.target/release/flamewm-desktop
@@ -60,12 +75,55 @@ desktop_log=.target/flamewm/desktop.log
 shell_log=.target/flamewm/shell.log
 : >"$xephyr_log"; : >"$wm_log"; : >"$desktop_log"; : >"$shell_log"
 
+# C03 debug logs: never delete history here; each run gets its own
+# `.debug/$RUN_ID` dir (see below); retention prunes old runs only.
+# Xephyr dev default: debug logging on; direct product start stays off
+# unless the caller exports FLAMEWM_DEBUG=1 (flamewm-debug default).
+: "${FLAMEWM_DEBUG:=1}"
+export FLAMEWM_DEBUG
+
+# Xephyr dev default: profiling on with tight cadence; direct product start
+# stays off unless the caller exports FLAMEWM_PROFILE=1 (profiler default).
+: "${FLAMEWM_PROFILE:=1}"
+: "${FLAMEWM_PROFILE_INTERVAL:=10}"
+: "${FLAMEWM_PROFILE_TOP:=8}"
+export FLAMEWM_PROFILE FLAMEWM_PROFILE_INTERVAL FLAMEWM_PROFILE_TOP
+
 # J11 .performance evidence run directory pipeline.
 # Profiler owns formatting/append; this harness owns lifecycle only.
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_DIR="$ROOT/.performance/$RUN_ID"
 mkdir -p "$RUN_DIR"
 export FLAMEWM_PROFILE_DIR="$RUN_DIR"
+# F20 debug run dir: per-run debug logs under .debug/$RUN_ID; never rm -rf.
+DEBUG_RUN_DIR="$ROOT/.debug/$RUN_ID"
+mkdir -p "$DEBUG_RUN_DIR"
+export FLAMEWM_DEBUG_DIR="$DEBUG_RUN_DIR"
+ln -sfn "$DEBUG_RUN_DIR" "$ROOT/.debug/latest" 2>/dev/null || true
+# Bounded debug retention: keep latest + previous 9, never current run.
+run_debug_retention(){
+  if [[ -x tools/debug_retention.py || -f tools/debug_retention.py ]]; then
+    FLAMEWM_CURRENT_RUN="${RUN_ID:-}" python3 tools/debug_retention.py "$ROOT/.debug" 2>/dev/null || true
+  else
+    # Fallback: same policy inline (keep 10 newest, protect latest+current).
+    python3 - "$ROOT/.debug" "${RUN_ID:-}" <<'EOF' 2>/dev/null || true
+import os, re, shutil, sys
+base, current = sys.argv[1], sys.argv[2]
+pat = re.compile(r"^\d{8}T\d{6}Z-\d+$")
+try:
+    latest = os.readlink(os.path.join(base, "latest"))
+    latest = os.path.basename(os.path.normpath(latest))
+except OSError:
+    latest = ""
+runs = sorted((d for d in os.listdir(base)
+               if pat.match(d) and os.path.isdir(os.path.join(base, d))
+               and d != current and d != latest))
+for stale in runs[:max(0, len(runs) - 9)]:
+    shutil.rmtree(os.path.join(base, stale), ignore_errors=True)
+EOF
+  fi
+}
+run_debug_retention
 # Manifest: run identity + environment (best-effort fields never fail the run).
 {
   echo "run_id=$RUN_ID"
@@ -75,17 +133,58 @@ export FLAMEWM_PROFILE_DIR="$RUN_DIR"
   echo "version=$VERSION"
   echo "display=${FLAMEWM_XEPHYR_DISPLAY:-auto}"
   echo "geometry=$SCREEN"
-  echo "profile=$([ "${FLAMEWM_PROFILE:-0}" = 1 ] && echo 1 || echo 0)"
-  echo "profile_interval=${FLAMEWM_PROFILE_INTERVAL:-60}"
+  echo "profile=$([ "${FLAMEWM_PROFILE:-1}" = 1 ] && echo 1 || echo 0)"
+  echo "profile_interval=${FLAMEWM_PROFILE_INTERVAL:-10}"
   echo "profile_top=${FLAMEWM_PROFILE_TOP:-8}"
   echo "xcursor_theme=${FLAMEWM_CURSOR_THEME:-FlameWM-Breeze-Dark}"
   echo "xcursor_size=${FLAMEWM_CURSOR_SIZE:-24}"
   echo "xcursor_path=${FLAMEWM_CURSOR_PATH:-$ROOT/.target/stage-icons}"
   echo "command=$0 $*"
+  echo "dbus_mode=$([ "${FLAMEWM_XEPHYR_PRIVATE_DBUS:-1}" = "0" ] && echo optout || echo private)"
+  echo "dbus_inner=${FLAMEWM_XEPHYR_PRIVATE_DBUS_INNER:-0}"
+  echo "dbus_session_present=$([ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && echo 1 || echo 0)"
+  echo "dbus_session_hash=$(printf '%s' "${DBUS_SESSION_BUS_ADDRESS:-none}" | sha256sum | cut -d' ' -f1)"
   echo "rustc=$(rustc --version 2>/dev/null || echo unknown)"
   echo "cargo=$(cargo --version 2>/dev/null || echo unknown)"
 } >"$RUN_DIR/manifest.txt" 2>/dev/null || true
 ln -sfn "$RUN_DIR" "$ROOT/.performance/latest" 2>/dev/null || true
+# Crash-debug environment record (never fails the run).
+{
+  echo "ulimit_c=$(ulimit -c 2>/dev/null || echo unknown)"
+  echo "core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown)"
+  if command -v coredumpctl >/dev/null 2>&1; then echo "coredumpctl=yes"; else echo "coredumpctl=no"; fi
+  if command -v gdb >/dev/null 2>&1; then echo "gdb=yes $(gdb --version 2>/dev/null | head -n 1 || true)"; else echo "gdb=no"; fi
+  echo "gdb_child=${FLAMEWM_XEPHYR_GDB_CHILD:-none}"
+} >"$RUN_DIR/crash-env.txt" 2>/dev/null || true
+# Bounded retention: on by default (FLAMEWM_PERFORMANCE_CLEANUP=1).
+# Never fails run.
+run_retention(){
+  if [[ -x tools/performance_retention.py || -f tools/performance_retention.py ]]; then
+    FLAMEWM_CURRENT_RUN="${RUN_ID:-}" python3 tools/performance_retention.py "$ROOT/.performance" 2>/dev/null || true
+  fi
+}
+run_retention
+# Optional gdb wrapper: FLAMEWM_XEPHYR_GDB_CHILD=wm|desktop|shell runs that
+# child under gdb, capturing a real backtrace to $RUN_DIR/<child>.gdb.log.
+GDB_CHILD="${FLAMEWM_XEPHYR_GDB_CHILD:-}"
+gdb_has_return_child_result(){
+  gdb --help 2>/dev/null | grep -q 'return-child-result'
+}
+launch_child(){
+  local name="$1" bin="$2" log="$3"
+  if [[ "${GDB_CHILD:-}" == "$name" ]] && command -v gdb >/dev/null 2>&1; then
+    local gdb_log="$RUN_DIR/$name.gdb.log"
+    echo "[gdb] wrapping $name under gdb -> $gdb_log" >&2
+    echo "[gdb] wrapped; full output in $name.gdb.log" >>"$log" 2>/dev/null || true
+    if gdb_has_return_child_result; then
+      nested_env gdb -batch -return-child-result -ex run -ex bt --args "$bin" >"$gdb_log" 2>&1
+    else
+      nested_env gdb -batch -ex run -ex bt --args "$bin" >"$gdb_log" 2>&1
+    fi
+  else
+    nested_env "$bin" >"$log" 2>&1
+  fi
+}
 # Evidence collection: copy logs, best-effort PSS, canary screenshot,
 # profile summary. Never hides exit codes; never deletes old runs.
 collect_evidence(){
@@ -94,6 +193,12 @@ collect_evidence(){
   for f in "$xephyr_log" "$wm_log" "$desktop_log" "$shell_log"; do
     cp "$f" "$RUN_DIR/$(basename "$f")" 2>/dev/null || true
   done
+  # F20: collect per-run debug logs + manifest link into evidence.
+  if [[ -d "${FLAMEWM_DEBUG_DIR:-}" ]]; then
+    mkdir -p "$RUN_DIR/debug" 2>/dev/null || true
+    cp "${FLAMEWM_DEBUG_DIR:-}"/*.log "$RUN_DIR/debug/" 2>/dev/null || true
+  fi
+  echo "debug_dir=.debug/$RUN_ID" >>"$RUN_DIR/manifest.txt" 2>/dev/null || true
   for rec in "wm:${wm_pid:-}" "desktop:${desktop_pid:-}" "shell:${shell_pid:-}"; do
     name="${rec%%:*}"; pid="${rec##*:}"
     [[ -n "$pid" && -r "/proc/$pid/smaps_rollup" ]] || continue
@@ -101,8 +206,7 @@ collect_evidence(){
       "/proc/$pid/smaps_rollup" >>"$RUN_DIR/pss.txt" 2>/dev/null || true
   done
   [[ -s .target/flamewm/canary-root.png ]] && cp .target/flamewm/canary-root.png "$RUN_DIR/root.png" 2>/dev/null || true
-  if [[ -x tools/profile_summary.py ]]; then
-    shopt -s nullglob
+  if [[ -x tools/profile_summary.py ]]; then    shopt -s nullglob
     prof_logs=("$RUN_DIR"/*.profile.log)
     shopt -u nullglob
     if [[ "${#prof_logs[@]}" -gt 0 ]]; then
@@ -111,6 +215,7 @@ collect_evidence(){
       python3 tools/profile_summary.py "$wm_log" "$desktop_log" "$shell_log" >"$RUN_DIR/summary.txt" 2>/dev/null || true
     fi
   fi
+  run_retention
 }
 
 xephyr_pid=''
@@ -142,20 +247,28 @@ fail(){
   exit 1
 }
 
-# Non-blocking core-collection hint. Only prints command paths when the tooling
-# exists; never waits on the user and never changes the supervised run outcome.
-crash_collection_hint(){
+# Real crash capture: gdb-wrapped child already wrote $RUN_DIR/<name>.gdb.log;
+# otherwise report any core via coredumpctl, or a clear NO-CORE verdict.
+crash_capture(){
   local pid="$1" name="$2"
-  if command -v gdb >/dev/null 2>&1; then
-    echo "crash-collect: gdb available; attach for backtrace (non-interactive guidance):" >&2
-    echo "  gdb -p $pid -batch -ex bt" >&2
+  local gdb_log="${RUN_DIR:-}/$name.gdb.log"
+  if [[ -n "${RUN_DIR:-}" && -s "$gdb_log" ]]; then
+    echo "crash-capture: gdb backtrace for $name in evidence ($name.gdb.log):" >&2
+    tail -n 30 "$gdb_log" >&2 || true
+    return 0
   fi
   if command -v coredumpctl >/dev/null 2>&1; then
-    echo "crash-collect: coredumpctl available; collect core with:" >&2
-    echo "  coredumpctl gdb $name" >&2
-  fi
-  if ! command -v gdb >/dev/null 2>&1 && ! command -v coredumpctl >/dev/null 2>&1; then
-    echo "crash-collect: no gdb/coredumpctl found; set FLAMEWM_XEPHYR_DEBUG_CRASH=1 and rerun for RUST_BACKTRACE" >&2
+    if coredumpctl info "$pid" >/dev/null 2>&1; then
+      echo "crash-capture: core recorded for pid=$pid ($name); collect with:" >&2
+      echo "  coredumpctl gdb $pid" >&2
+      coredumpctl info "$pid" 2>/dev/null | head -n 20 >&2 || true
+    else
+      echo "crash-capture: NO-CORE for pid=$pid ($name) (coredumpctl has no dump; core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown))" >&2
+    fi
+  elif command -v gdb >/dev/null 2>&1; then
+    echo "crash-capture: NO-CORE for pid=$pid ($name) (no gdb-wrapped log, no coredumpctl; rerun with FLAMEWM_XEPHYR_GDB_CHILD=$name)" >&2
+  else
+    echo "crash-capture: NO-CORE for pid=$pid ($name) (no gdb/coredumpctl; set FLAMEWM_XEPHYR_DEBUG_CRASH=1 and rerun for RUST_BACKTRACE)" >&2
   fi
 }
 
@@ -183,7 +296,7 @@ first_dead_child(){
         echo "NOTE: Xephyr itself exited; remaining clients will report the display connection broken during cleanup (secondary, expected)." >&2
       else
         echo "NOTE: primary child ($name) died; any 'X connection to :.. broken' that follows during cleanup is secondary/expected teardown, not the root cause." >&2
-        crash_collection_hint "$pid" "$name"
+        crash_capture "$pid" "$name"
       fi
       return 0
     fi
@@ -201,8 +314,7 @@ require_alive(){
 # J11 production appearance/session consumer: same env the flamewm launcher
 # applies — FlameWM identity (never KDE), XCURSOR_* cursor theme (bundled
 # FlameWM-Breeze-Dark authority), and the guarded Breeze toolkit theme
-# (GTK only if Breeze-Dark installed, Qt only if a Breeze style plugin
-# exists). Explicit user values always win.
+# (explicit user values pass through; harness never selects toolkit styles).
 session_appearance_env(){
   : "${FLAMEWM_CURSOR_THEME:=FlameWM-Breeze-Dark}"
   : "${FLAMEWM_CURSOR_SIZE:=24}"
@@ -229,14 +341,6 @@ session_appearance_env(){
     export XDG_CURRENT_DESKTOP=FlameWM
   fi
   export FLAMEWM_DESKTOP=FlameWM
-  if [[ "$FLAMEWM_APPEARANCE" != [Ss][Yy][Ss][Tt][Ee][Mm] ]]; then
-    if [[ -z "${GTK_THEME:-}" && -d /usr/share/themes/Breeze-Dark/gtk-3.0 ]]; then
-      export GTK_THEME=Breeze-Dark
-    fi
-    if [[ -z "${QT_STYLE_OVERRIDE:-}" ]] && ls /usr/lib/x86_64-linux-gnu/qt*/plugins/styles/breeze*.so >/dev/null 2>&1; then
-      export QT_STYLE_OVERRIDE=Breeze
-    fi
-  fi
 }
 nested_env(){
   session_appearance_env
@@ -265,7 +369,7 @@ done
 DISPLAY="$nested" xdpyinfo >/dev/null 2>&1 || fail "Xephyr readiness failed"
 
 echo '[3/5] Starting FlameWM window manager (EWMH gate)'
-nested_env "$WM_BIN" >"$wm_log" 2>&1 &
+launch_child wm "$WM_BIN" "$wm_log" &
 wm_pid=$!
 wm_ready=0
 for _ in $(seq 1 100); do
@@ -284,14 +388,14 @@ else
 fi
 
 echo '[4/5] Starting FlameWM desktop'
-nested_env "$DESKTOP_BIN" >"$desktop_log" 2>&1 &
+launch_child desktop "$DESKTOP_BIN" "$desktop_log" &
 desktop_pid=$!
 sleep 1
 require_alive desktop "$desktop_pid" "$desktop_log"
 require_alive wm "$wm_pid" "$wm_log"
 
 echo '[5/5] Starting FlameWM shell'
-nested_env "$SHELL_BIN" >"$shell_log" 2>&1 &
+launch_child shell "$SHELL_BIN" "$shell_log" &
 shell_pid=$!
 sleep 1
 require_alive shell "$shell_pid" "$shell_log"

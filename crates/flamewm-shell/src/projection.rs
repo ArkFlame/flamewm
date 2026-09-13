@@ -2,7 +2,7 @@ use chrono::{DateTime, Datelike, Local};
 use flamewm_api::applications::DesktopApplication;
 use flamewm_api::session::SessionCapabilities;
 use flamewm_integrations_linux::icons::{IconResolver, IconSize, Rgb8Raster};
-use flamewm_ui_x11::{Overflow, RuntimeImage, UiColor, UiDocumentAccess};
+use flamewm_ui_x11::{RuntimeImage, UiColor, UiDocumentAccess};
 
 use crate::start::{StartCategory, PRESENTATION_CATEGORIES};
 use crate::taskbar::workspaces::{
@@ -715,7 +715,18 @@ mod calendar_tests {
         ) -> Result<(), String> {
             Ok(())
         }
-        fn overflow(&mut self, _id: &str, _x: Overflow, _y: Overflow) -> Result<(), String> {
+        fn overflow(
+            &mut self,
+            _id: &str,
+            _x: flamewm_ui_x11::Overflow,
+            _y: flamewm_ui_x11::Overflow,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn font_size(&mut self, _: &str, _: f32) -> Result<(), String> {
+            Ok(())
+        }
+        fn font_weight(&mut self, _: &str, _: u16) -> Result<(), String> {
             Ok(())
         }
     }

@@ -2,15 +2,22 @@ use flamewm_api::Point;
 use flamewm_api::settings::SettingValue;
 use flamewm_desktop_core::model::DesktopItemKind;
 use flamewm_desktop_core::presentation::desktop_label_lines;
-use flamewm_integrations_linux::icons::{IconLookupPurpose, IconResolver, IconSize, Rgb8Raster};
+use flamewm_integrations_linux::icon_service::{IconJob, IconPriority, IconService};
+use flamewm_integrations_linux::icons::{
+    IconKey, IconLookupPurpose, IconRequest, IconResolver, IconSize, Rgba8Raster,
+};
 use flamewm_ui_core::style::UiLayer;
 use flamewm_ui_x11::{RuntimeImage, UiColor, UiDocumentAccess};
+
+use std::path::PathBuf;
 
 const ICON_KINDS: [&str; 5] = ["directory", "desktop-launcher", "file", "symlink", "trash"];
 const LABEL_WIDTH_PX: f32 = 76.0;
 const LABEL_FONT_SIZE_PX: f32 = 13.0;
 pub const DESKTOP_TILE_WIDTH: f32 = 82.0;
 pub const DESKTOP_TILE_HEIGHT: f32 = 82.0;
+pub const STICKY_SLOT_COUNT: usize = 16;
+const ICON_TILE_PX: u32 = 44;
 
 pub fn project_background(
     document: &mut impl UiDocumentAccess,
@@ -41,7 +48,9 @@ pub fn assign_document_layers(document: &mut impl UiDocumentAccess) -> Result<()
         document.layer(&format!("desktop-item-{index}"), UiLayer::Content)?;
     }
     document.layer("desktop-selection", UiLayer::Selection)?;
-    document.layer("sticky-note", UiLayer::Floating)?;
+    for slot in 0..STICKY_SLOT_COUNT {
+        document.layer(&format!("sticky-{}", slot + 1), UiLayer::Floating)?;
+    }
     document.layer("desktop-menu", UiLayer::Popover)?;
     document.layer("desktop-entry-menu", UiLayer::Popover)?;
     document.layer("sticky-menu", UiLayer::Popover)?;
@@ -53,7 +62,7 @@ const SLOT_COUNT: usize = 128;
 
 pub const TRANSIENT_HIDDEN_IDS: [&str; 6] = [
     "desktop-selection",
-    "sticky-note",
+    "sticky-1",
     "desktop-menu",
     "desktop-entry-menu",
     "sticky-menu",
@@ -82,21 +91,162 @@ pub fn icon_purpose(kind: DesktopItemKind, has_override: bool) -> IconLookupPurp
     }
 }
 
+/// Reusable parallel icon service: rows project immediately from the warm
+/// cache (fallback = no stale glyph), visible misses submit async HIGH, and
+/// completions apply only on exact [`IconKey`] identity match per slot.
+pub struct ParallelIconService {
+    service: IconService,
+}
+
+impl ParallelIconService {
+    #[must_use]
+    pub fn spawn(packaged_root: PathBuf) -> Self {
+        let service = IconService::new(2, 128, move || {
+            IconResolver::from_environment(packaged_root.clone(), 0)
+        });
+        Self { service }
+    }
+
+    #[must_use]
+    pub fn icon_key(kind: DesktopItemKind, icon_override: Option<&str>) -> IconKey {
+        let override_name = icon_override.map(str::trim).filter(|icon| !icon.is_empty());
+        IconKey::new(
+            icon_purpose(kind, override_name.is_some()),
+            IconRequest::name(launcher_icon_name(kind, icon_override)),
+            IconSize::new(ICON_TILE_PX, ICON_TILE_PX),
+            0,
+            0,
+        )
+    }
+
+    /// Raw FD readable whenever a worker result completes. Register with
+    /// the Desktop Reactor; the callback only calls `wake_drain` and the
+    /// next reactor tick repaints through the normal flush path.
+    #[must_use]
+    pub fn wake_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.service.wake_fd()
+    }
+
+    /// Non-blocking drain of pending wake bytes (call after `wake_fd` readable).
+    pub fn wake_drain(&mut self) {
+        self.service.wake_drain();
+    }
+
+    /// Projects row chrome + label immediately; the glyph comes from the warm
+    /// cache when present, otherwise the Flame fallback paints synchronously
+    /// (never a stale glyph, never blank) and a HIGH request is queued.
+    /// Returns the key for slot identity tracking.
+    pub fn project_row(
+        &mut self,
+        document: &mut impl UiDocumentAccess,
+        index: usize,
+        kind: DesktopItemKind,
+        label: &str,
+        point: Point,
+        icon_override: Option<&str>,
+    ) -> Result<IconKey, String> {
+        let item_id = format!("desktop-item-{index}");
+        document.visible(&item_id, true)?;
+        document.position(&item_id, point.x as f32, point.y as f32)?;
+        document.size(&item_id, DESKTOP_TILE_WIDTH, DESKTOP_TILE_HEIGHT)?;
+        let key = Self::icon_key(kind, icon_override);
+        if let Some(Ok(raster)) = self.service.cached(&key) {
+            apply_raster(document, index, kind, raster)?;
+        } else {
+            // Miss: Flame fallback paints synchronously so the tile never
+            // shows blank/stale; the worker result replaces it on drain.
+            apply_raster(document, index, kind, flame_fallback_raster())?;
+            let _ = self.service.submit(IconJob {
+                key: key.clone(),
+                priority: IconPriority::High,
+            });
+        }
+        project_item_label(document, index, label)?;
+        Ok(key)
+    }
+
+    /// Applies one completed raster only when the slot still expects its key.
+    /// Returns false without insert/apply on any identity mismatch.
+    pub fn apply_if_current(
+        &mut self,
+        document: &mut impl UiDocumentAccess,
+        index: usize,
+        kind: DesktopItemKind,
+        expected: &IconKey,
+        actual: &IconKey,
+        raster: Rgba8Raster,
+    ) -> Result<bool, String> {
+        if expected != actual {
+            return Ok(false);
+        }
+        apply_raster(document, index, kind, raster)?;
+        Ok(true)
+    }
+
+    /// Drains completed HIGH jobs; [`IconService`] retains successful rasters
+    /// in its bounded shared cache. Callers reproject only slots whose tracked
+    /// identity still equals the result key.
+    pub fn drain_ready(&mut self) -> Vec<(IconKey, Option<Rgba8Raster>)> {
+        self.service
+            .drain_ready()
+            .into_iter()
+            .map(|result| {
+                let raster = result.result.ok();
+                (result.key, raster)
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn cached(&self, key: &IconKey) -> Option<Rgba8Raster> {
+        self.service.cached(key).and_then(Result::ok)
+    }
+
+    pub fn request_high(&mut self, key: IconKey) {
+        let _ = self.service.submit(IconJob {
+            key,
+            priority: IconPriority::High,
+        });
+    }
+
+    #[must_use]
+    pub fn memory_estimate_bytes(&self) -> usize {
+        // IconService owns cache memory; this facade retains no rasters.
+        0
+    }
+}
+
+fn apply_raster(
+    document: &mut impl UiDocumentAccess,
+    index: usize,
+    kind: DesktopItemKind,
+    raster: Rgba8Raster,
+) -> Result<(), String> {
+    let selected = icon_semantic(kind);
+    replace_image(
+        document,
+        &format!("desktop-glyph-{index}-{selected}"),
+        runtime_image(raster),
+    )?;
+    for icon_kind in ICON_KINDS {
+        document.visible(
+            &format!("desktop-glyph-{index}-{icon_kind}"),
+            icon_kind == selected,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn project_item(
     document: &mut impl UiDocumentAccess,
-    icon_resolver: &mut IconResolver,
+    icons: &mut ParallelIconService,
     index: usize,
     kind: DesktopItemKind,
     label: &str,
     point: Point,
     icon_override: Option<&str>,
-) -> Result<(), String> {
-    let item_id = format!("desktop-item-{index}");
-    document.visible(&item_id, true)?;
-    document.position(&item_id, point.x as f32, point.y as f32)?;
-    document.size(&item_id, DESKTOP_TILE_WIDTH, DESKTOP_TILE_HEIGHT)?;
-    project_item_icon(document, icon_resolver, index, kind, icon_override)?;
-    project_item_label(document, index, label)
+) -> Result<IconKey, String> {
+    icons.project_row(document, index, kind, label, point, icon_override)
 }
 
 pub fn clear_item(document: &mut impl UiDocumentAccess, index: usize) -> Result<(), String> {
@@ -110,46 +260,50 @@ pub fn clear_item(document: &mut impl UiDocumentAccess, index: usize) -> Result<
 
 pub fn project_drag_ghost_icon(
     document: &mut impl UiDocumentAccess,
-    icon_resolver: &mut IconResolver,
+    icons: &mut ParallelIconService,
     kind: DesktopItemKind,
     icon_override: Option<&str>,
 ) -> Result<(), String> {
-    let selected = icon_semantic(kind);
-    let override_name = icon_override.map(str::trim).filter(|icon| !icon.is_empty());
-    let candidates = icon_candidates(kind, icon_override);
-    let purpose = icon_purpose(kind, override_name.is_some());
-    let icon = resolve_first(icon_resolver, &candidates, purpose, IconSize::new(44, 44))?;
-    replace_image(document, "desktop-drag-ghost-icon", icon)?;
+    let key = ParallelIconService::icon_key(kind, icon_override);
+    if let Some(raster) = icons.cached(&key) {
+        replace_image(document, "desktop-drag-ghost-icon", runtime_image(raster))?;
+        document.visible("desktop-drag-ghost-icon", true)?;
+        return Ok(());
+    }
+    // Miss: Flame fallback now, HIGH request queued, drain replaces it.
+    replace_image(
+        document,
+        "desktop-drag-ghost-icon",
+        runtime_image(flame_fallback_raster()),
+    )?;
     document.visible("desktop-drag-ghost-icon", true)?;
-    let _ = selected;
+    icons.request_high(key);
     Ok(())
 }
 
-pub fn project_item_icon(
-    document: &mut impl UiDocumentAccess,
-    icon_resolver: &mut IconResolver,
-    index: usize,
-    kind: DesktopItemKind,
-    icon_override: Option<&str>,
-) -> Result<(), String> {
-    let selected = icon_semantic(kind);
-    let override_name = icon_override.map(str::trim).filter(|icon| !icon.is_empty());
-    let candidates = icon_candidates(kind, icon_override);
-    let purpose = icon_purpose(kind, override_name.is_some());
-    let icon = resolve_first(icon_resolver, &candidates, purpose, IconSize::new(44, 44))?;
-    let icon_id = format!("desktop-glyph-{index}-{selected}");
-    replace_image(document, &icon_id, icon)?;
-    for icon_kind in ICON_KINDS {
-        document.visible(
-            &format!("desktop-glyph-{index}-{icon_kind}"),
-            icon_kind == selected,
-        )?;
+/// Flame-red fallback raster (brand 239,64,72) painted synchronously on a
+/// cache miss; the worker result overwrites it. Not a placeholder shape: a
+/// real RGBA8 raster in the tile's selected semantic slot.
+fn flame_fallback_raster() -> Rgba8Raster {
+    use flamewm_integrations_linux::icons::IconOrigin;
+    let pixels = ICON_TILE_PX as usize * ICON_TILE_PX as usize;
+    let mut bytes = Vec::with_capacity(pixels * 4);
+    for _ in 0..pixels {
+        bytes.extend_from_slice(&[239, 64, 72, 255]);
     }
-    Ok(())
+    Rgba8Raster {
+        source: "flamewm-fallback".to_owned(),
+        width: ICON_TILE_PX,
+        height: ICON_TILE_PX,
+        pixels: bytes,
+        origin: IconOrigin::PackagedFallback,
+        fallback_reason: None,
+    }
 }
 
 /// Launcher metadata selection: an explicit Icon= value wins, otherwise the
 /// per-kind default name. Pure so unit tests can pin the ordering.
+#[cfg(test)]
 #[must_use]
 pub fn icon_candidates(kind: DesktopItemKind, icon_override: Option<&str>) -> Vec<String> {
     let selected = launcher_icon_name(kind, icon_override);
@@ -172,6 +326,18 @@ pub fn launcher_icon_name(kind: DesktopItemKind, icon_override: Option<&str>) ->
         .filter(|icon| !icon.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| icon_name(kind).to_owned())
+}
+
+/// Projection-only caret: appends the caret glyph to the edit buffer for
+/// display/sync output while a sticky edit is active. Never persisted to
+/// the model; callers pass the raw buffer and render the return value.
+#[must_use]
+pub fn caret_text(buffer: &str, editing: bool) -> String {
+    if editing {
+        format!("{buffer}▏")
+    } else {
+        buffer.to_owned()
+    }
 }
 
 pub fn project_item_label(
@@ -212,48 +378,7 @@ fn icon_name(kind: DesktopItemKind) -> &'static str {
     }
 }
 
-fn resolve_first(
-    resolver: &mut IconResolver,
-    candidates: &[String],
-    purpose: IconLookupPurpose,
-    size: IconSize,
-) -> Result<RuntimeImage, String> {
-    let mut last_error = String::new();
-    for candidate in candidates {
-        match resolve_icon(resolver, candidate, purpose, size) {
-            Ok(image) => return Ok(image),
-            Err(error) => last_error = error,
-        }
-    }
-    if last_error.is_empty() {
-        last_error = "no icon candidates".to_owned();
-    }
-    Err(last_error)
-}
-
-fn resolve_icon(
-    resolver: &mut IconResolver,
-    icon_name: &str,
-    purpose: IconLookupPurpose,
-    size: IconSize,
-) -> Result<RuntimeImage, String> {
-    let resolve = |resolver: &mut IconResolver, name: &str| match purpose {
-        IconLookupPurpose::Application => resolver.prepare_application(name, size),
-        IconLookupPurpose::Semantic => resolver.prepare_semantic(name, size),
-    };
-    let raster = resolve(resolver, icon_name).or_else(|error| {
-        let fallback_result = match purpose {
-            IconLookupPurpose::Application => resolver.prepare_application("", size),
-            IconLookupPurpose::Semantic => resolver.prepare_semantic("", size),
-        };
-        fallback_result.map_err(|fallback| {
-            format!("icon '{icon_name}' failed: {error}; generic fallback failed: {fallback}")
-        })
-    })?;
-    Ok(runtime_image(raster))
-}
-
-fn runtime_image(raster: Rgb8Raster) -> RuntimeImage {
+fn runtime_image(raster: Rgba8Raster) -> RuntimeImage {
     RuntimeImage {
         source: raster.source,
         width: raster.width,
@@ -267,12 +392,19 @@ fn replace_image(
     id: &str,
     image: RuntimeImage,
 ) -> Result<(), String> {
-    document.image_rgb8(id, image)
+    document.image_rgba8(id, image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_caret_is_display_only_and_model_stays_raw() {
+        assert_eq!(caret_text("abc", true), "abc▏");
+        assert_eq!(caret_text("abc", false), "abc");
+        assert_eq!(caret_text("", true), "▏");
+    }
 
     #[test]
     fn arbitrary_directory_keeps_generic_folder_semantic() {
@@ -358,6 +490,12 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
+        fn font_size(&mut self, _: &str, _: f32) -> Result<(), String> {
+            Ok(())
+        }
+        fn font_weight(&mut self, _: &str, _: u16) -> Result<(), String> {
+            Ok(())
+        }
         fn layer(&mut self, id: &str, layer: UiLayer) -> Result<(), String> {
             self.layers.push((id.to_owned(), layer.z_index()));
             Ok(())
@@ -382,7 +520,7 @@ mod tests {
         let watermark = layer_of(&probe, "desktop-watermark");
         let item = layer_of(&probe, "desktop-item-0");
         let selection = layer_of(&probe, "desktop-selection");
-        let sticky = layer_of(&probe, "sticky-note");
+        let sticky = layer_of(&probe, "sticky-1");
         let menu = layer_of(&probe, "desktop-menu");
         let entry_menu = layer_of(&probe, "desktop-entry-menu");
         let sticky_menu = layer_of(&probe, "sticky-menu");
@@ -458,6 +596,12 @@ mod tests {
             _: flamewm_ui_x11::Overflow,
             _: flamewm_ui_x11::Overflow,
         ) -> Result<(), String> {
+            Ok(())
+        }
+        fn font_size(&mut self, _: &str, _: f32) -> Result<(), String> {
+            Ok(())
+        }
+        fn font_weight(&mut self, _: &str, _: u16) -> Result<(), String> {
             Ok(())
         }
         fn layer(&mut self, _: &str, _: UiLayer) -> Result<(), String> {

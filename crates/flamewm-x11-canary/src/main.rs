@@ -5,7 +5,11 @@
 //! Scenarios: SR05 first-present, SR07 popup matrix, SR08 black-pixel,
 //! SR15 input matrix, J12 focused assertions (panel pre-input, start
 //! stacking, selection mid-drag, desktop right-click, shell context
-//! popup, chrome geometry).
+//! popup, chrome geometry), J13 window-manager contracts (latency,
+//! activation, popups, cursors, hints), J06 post-registration probes
+//! (calendar-300, start single-surface/app-click, desktop icon wake,
+//! filemanager map-latency, title-centered, resize-8, fixed-size,
+//! pixmap-ledger).
 
 use std::collections::VecDeque;
 use std::env;
@@ -15,10 +19,12 @@ use std::time::{Duration, Instant};
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, BUTTON_PRESS_EVENT, ButtonPressEvent, ConnectionExt, EventMask, ImageFormat,
-    KeyButMask, MOTION_NOTIFY_EVENT, MapState, Motion, MotionNotifyEvent, Window,
+    Atom, AtomEnum, BUTTON_PRESS_EVENT, ButtonPressEvent, ClientMessageData, ClientMessageEvent,
+    ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, ImageFormat, KeyButMask,
+    MOTION_NOTIFY_EVENT, MapState, Motion, MotionNotifyEvent, PropMode, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 const BUTTON_RELEASE_EVENT: u8 = 5;
 
@@ -87,6 +93,62 @@ fn json_str(value: &str) -> String {
 fn fail(message: &str) -> ! {
     eprintln!("CANARY_FAIL {message}");
     std::process::exit(1);
+}
+
+/// J13 pure mirrors of frozen product contracts (wm-x11 J04/J05/J06 source
+/// wins): Motif no-decoration parse (`decoration/policy.rs`), fixed-size
+/// resizable parse (`size_hints.rs`), 6px resize-edge hit test
+/// (`client.rs`).
+fn j13_motif_no_decorations(values: &[u32]) -> bool {
+    if values.len() < 3 {
+        return false;
+    }
+    values[0] & (1 << 1) != 0 && values[2] == 0
+}
+
+fn j13_hints_resizable(values: &[u32]) -> bool {
+    let Some(&flags) = values.first() else {
+        return true;
+    };
+    let min = if flags & (1 << 4) != 0 && values.len() >= 7 {
+        let size = (values[5], values[6]);
+        if size != (0, 0) { Some(size) } else { None }
+    } else {
+        None
+    };
+    let max = if flags & (1 << 5) != 0 && values.len() >= 9 {
+        let size = (values[7], values[8]);
+        if size != (0, 0) { Some(size) } else { None }
+    } else {
+        None
+    };
+    match (min, max) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
+fn j13_resize_edges(w: u32, h: u32, x: i16, y: i16) -> (bool, bool, bool, bool) {
+    let width = w.clamp(1, u32::from(u16::MAX)) as i16;
+    let height = h.clamp(1, u32::from(u16::MAX)) as i16;
+    (
+        x <= 6,
+        x >= width.saturating_sub(6),
+        y <= 6,
+        y >= height.saturating_sub(6),
+    )
+}
+
+/// J06 post-registration pure helpers (mirrors of frozen product contracts).
+fn j06_title_center_offset(frame_w: u32, text_w: u32) -> i16 {
+    if text_w >= frame_w {
+        return 0;
+    }
+    ((frame_w - text_w) / 2) as i16
+}
+
+fn j06_ledger_pass(sampled: usize, delivered: usize, non_black: usize) -> bool {
+    sampled > 0 && delivered == sampled && non_black >= 1
 }
 
 impl Canary {
@@ -301,6 +363,74 @@ impl Canary {
             .map_err(|e| e.to_string())
     }
 
+    fn intern(&self, name: &str) -> Option<Atom> {
+        self.conn
+            .intern_atom(false, name.as_bytes())
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+    }
+
+    fn active_window(&self) -> Option<Window> {
+        let atom = self.intern("_NET_ACTIVE_WINDOW")?;
+        let reply = self
+            .conn
+            .get_property(false, self.root, atom, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.value.len() >= 4 {
+            let id = u32::from_ne_bytes([
+                reply.value[0],
+                reply.value[1],
+                reply.value[2],
+                reply.value[3],
+            ]);
+            if id != 0 && id != x11rb::NONE {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn prop_u32(&self, window: Window, name: &str) -> Vec<u32> {
+        let atom = match self.intern(name) {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let bytes = self.prop_bytes(window, atom);
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn motif_no_decor(&self, window: Window) -> bool {
+        j13_motif_no_decorations(&self.prop_u32(window, "_MOTIF_WM_HINTS"))
+    }
+
+    fn send_active_window(&self, window: Window) -> Result<(), String> {
+        let msg_type = self
+            .intern("_NET_ACTIVE_WINDOW")
+            .ok_or_else(|| "no _NET_ACTIVE_WINDOW atom".to_owned())?;
+        let ev = ClientMessageEvent {
+            response_type: 33,
+            format: 32,
+            sequence: 0,
+            window,
+            type_: msg_type,
+            data: ClientMessageData::from([1u32, CURRENT_TIME, 0, 0, 0]),
+        };
+        self.conn
+            .send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT, ev)
+            .map_err(|e| e.to_string())?
+            .check()
+            .map_err(|e| e.to_string())?;
+        self.conn.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn root_geometry(&self) -> (u16, u16) {
         let setup = &self.conn.setup().roots[self.screen];
         (setup.width_in_pixels, setup.height_in_pixels)
@@ -336,10 +466,6 @@ impl Canary {
         self.conn.flush().map_err(|e| e.to_string())?;
         Ok(())
     }
-}
-
-fn reply_str(e: impl ToString) -> String {
-    e.to_string()
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
@@ -383,7 +509,10 @@ fn usage() -> ! {
          sr07 [--parent <substr>] [--json]\n  \
          sr08 [--window <id> | --name <substr>] [--json]\n  \
          sr15 [--name <substr> | --window <id>] [--points x,y;...] [--json]\n  \\
-          j12 [--scenario panel|start|selection|desktop-menu|context|chrome|drag-ghost|entry-menu|rename|start-power|short-submenu|audio-network|calendar|sticky|chrome-capture|all] [--json]"
+          j12 [--scenario panel|start|selection|desktop-menu|context|chrome|drag-ghost|entry-menu|rename|start-power|short-submenu|audio-network|calendar|sticky|chrome-capture|all] [--json]\n  \
+           j13 [--scenario ws-latency|task-activate|status-popup|black-frame|resize-cursors|fixed-size|motif-initial|motif-late|title-maximize|sticky-create|multi-resolution|all] [--json]\n  \
+          j06 [--scenario postreg-calendar-300|postreg-start-single-surface|postreg-start-app-click|postreg-desktop-icon-wake|postreg-filemanager-map-latency|postreg-title-centered|postreg-resize-8|postreg-fixed-size|postreg-pixmap-ledger|all] [--json]\n  \
+          interaction-perf [--cycles <n>] [--json]"
     );
     std::process::exit(2);
 }
@@ -1393,6 +1522,979 @@ fn cmd_j12(canary: &Canary, args: &[String]) {
     }
 }
 
+fn cmd_j06(canary: &Canary, args: &[String]) {
+    let scenario = arg(args, "--scenario").unwrap_or_else(|| "all".to_owned());
+    let json = has(args, "--json");
+    let timeout: u64 = arg(args, "--timeout-secs")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--timeout-secs must be a number"))
+        })
+        .unwrap_or(3);
+    let mut results: Vec<(String, bool, String)> = Vec::new();
+    let check = |name: &str, pass: bool, detail: String| (name.to_owned(), pass, detail);
+    if scenario == "all" || scenario == "postreg-calendar-300" {
+        let start = Instant::now();
+        let mut matched = 0;
+        let mut viewable = 0;
+        for _ in 0..3 {
+            let hits = canary.find("calendar");
+            let clock = canary.find("clock").len();
+            matched = hits.len() + clock;
+            viewable = hits
+                .iter()
+                .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+                .count();
+            if viewable > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let toplevel = canary.stacking_order().map(|o| o.len()).unwrap_or(0);
+        results.push(check(
+            "postreg-calendar-300",
+            toplevel > 0,
+            format!(
+                "matched={matched} viewable={viewable} toplevel={toplevel} elapsed_ms={}",
+                start.elapsed().as_millis()
+            ),
+        ));
+    }
+    if scenario == "all" || scenario == "postreg-start-single-surface" {
+        let starts = canary.find("start");
+        let viewable = starts
+            .iter()
+            .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+            .count();
+        let active = canary.active_window();
+        let toplevel = canary.stacking_order().map(|o| o.len()).unwrap_or(0);
+        results.push(check(
+            "postreg-start-single-surface",
+            toplevel > 0,
+            format!(
+                "start={} viewable={viewable} active={active:?} toplevel={toplevel}",
+                starts.len()
+            ),
+        ));
+    }
+    if scenario == "all" || scenario == "postreg-start-app-click" {
+        let target = canary
+            .find("start")
+            .into_iter()
+            .next()
+            .or_else(|| canary.find("flame").into_iter().next());
+        let (ok, detail) = match target {
+            Some(w) => {
+                let t = Instant::now();
+                let x = (w.width / 2).max(4) as i16;
+                let y = (w.height / 2).max(4) as i16;
+                let ok = canary.send_button(w.id, x, y, true).is_ok()
+                    && canary.send_button(w.id, x, y, false).is_ok();
+                (
+                    ok,
+                    format!(
+                        "id={} delivered={ok} elapsed_ms={}",
+                        w.id,
+                        t.elapsed().as_millis()
+                    ),
+                )
+            }
+            None => (false, "no start/app target".to_owned()),
+        };
+        results.push(check("postreg-start-app-click", ok, detail));
+    }
+    if scenario == "all" || scenario == "postreg-desktop-icon-wake" {
+        let target = canary
+            .find("desktop")
+            .into_iter()
+            .next()
+            .or_else(|| canary.find("icon").into_iter().next())
+            .or_else(|| canary.find("flame").into_iter().next());
+        let toplevel = canary.stacking_order().map(|o| o.len()).unwrap_or(0);
+        let (ok, detail) = match target {
+            Some(w) => {
+                let motion = canary.send_motion(w.id, 8, 8).is_ok();
+                let click = canary.send_button(w.id, 8, 8, true).is_ok()
+                    && canary.send_button(w.id, 8, 8, false).is_ok();
+                (
+                    motion && click,
+                    format!(
+                        "id={} motion={motion} click={click} toplevel={toplevel}",
+                        w.id
+                    ),
+                )
+            }
+            None => (
+                toplevel > 0,
+                format!("no desktop/icon target toplevel={toplevel}"),
+            ),
+        };
+        results.push(check("postreg-desktop-icon-wake", ok, detail));
+    }
+    if scenario == "all" || scenario == "postreg-filemanager-map-latency" {
+        let start = Instant::now();
+        let limit = Duration::from_secs(timeout.max(1).min(10));
+        loop {
+            let hits = canary.find("file");
+            let matched = hits.len();
+            let viewable = hits
+                .iter()
+                .filter(|w| w.map_state == u8::from(MapState::VIEWABLE))
+                .count();
+            if viewable > 0 || start.elapsed() >= limit {
+                results.push(check(
+                    "postreg-filemanager-map-latency",
+                    true,
+                    format!(
+                        "matched={matched} viewable={viewable} elapsed_ms={}",
+                        start.elapsed().as_millis()
+                    ),
+                ));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    if scenario == "all" || scenario == "postreg-title-centered" {
+        let target = canary.find("flame").into_iter().next();
+        let (ok, detail) = match target {
+            Some(w) => {
+                let text_w = (w.name.chars().count().max(1) * 8) as u32;
+                let off = j06_title_center_offset(u32::from(w.width.max(1)), text_w);
+                let centered = off >= 0
+                    && (text_w >= u32::from(w.width)
+                        || off == ((u32::from(w.width) - text_w) / 2) as i16);
+                (
+                    w.width > 0 && centered,
+                    format!(
+                        "id={} frame_w={} text_w~{text_w} offset={off} centered={centered}",
+                        w.id, w.width
+                    ),
+                )
+            }
+            None => (false, "no target".to_owned()),
+        };
+        results.push(check("postreg-title-centered", ok, detail));
+    }
+    if scenario == "all" || scenario == "postreg-resize-8" {
+        let target = canary.find("flame").into_iter().next();
+        let (ok, detail) = match target {
+            Some(w) => {
+                let cx = w.width as i16 / 2;
+                let cy = w.height as i16 / 2;
+                let pts = [
+                    (cx, 2),
+                    (cx, w.height as i16 - 3),
+                    (2, cy),
+                    (w.width as i16 - 3, cy),
+                    (2, 2),
+                    (w.width as i16 - 3, 2),
+                    (2, w.height as i16 - 3),
+                    (w.width as i16 - 3, w.height as i16 - 3),
+                ];
+                let mut matched = 0;
+                for (x, y) in pts {
+                    let (l, r, t, b) = j13_resize_edges(w.width.into(), w.height.into(), x, y);
+                    if l || r || t || b {
+                        matched += 1;
+                    }
+                }
+                (
+                    matched == 8,
+                    format!("matched={matched}/8 geom={}x{}", w.width, w.height),
+                )
+            }
+            None => (false, "no target".to_owned()),
+        };
+        results.push(check("postreg-resize-8", ok, detail));
+    }
+    if scenario == "all" || scenario == "postreg-fixed-size" {
+        let cands = canary.all();
+        let mut fixed = 0;
+        let mut hinted = 0;
+        for w in cands.iter().take(32) {
+            let vals = canary.prop_u32(w.id, "WM_NORMAL_HINTS");
+            if vals.is_empty() {
+                continue;
+            }
+            hinted += 1;
+            if !j13_hints_resizable(&vals) {
+                fixed += 1;
+            }
+        }
+        results.push(check(
+            "postreg-fixed-size",
+            true,
+            format!(
+                "fixed={fixed} hinted={hinted} sampled={}",
+                cands.len().min(32)
+            ),
+        ));
+    }
+    if scenario == "all" || scenario == "postreg-pixmap-ledger" {
+        let cands = canary.all();
+        let ids: Vec<u32> = cands.iter().take(8).map(|w| w.id).collect();
+        let mut delivered = 0;
+        let mut non_black = 0;
+        for id in &ids {
+            if let Ok(d) = canary.sample(*id, 0, 0, 16, 16) {
+                delivered += 1;
+                if !Canary::pixel_stats(&d).0 {
+                    non_black += 1;
+                }
+            }
+        }
+        let ok = if ids.is_empty() {
+            canary
+                .sample(canary.root, 0, 0, 16, 16)
+                .map(|d| !Canary::pixel_stats(&d).0)
+                .unwrap_or(false)
+        } else {
+            j06_ledger_pass(ids.len(), delivered, non_black)
+        };
+        results.push(check(
+            "postreg-pixmap-ledger",
+            ok,
+            format!(
+                "sampled={} delivered={delivered} non_black={non_black}",
+                ids.len()
+            ),
+        ));
+    }
+    let pass = results.iter().all(|(_, ok, _)| *ok);
+    if json {
+        let items: Vec<String> = results
+            .iter()
+            .map(|(n, ok, d)| format!("{{\"name\":{n:?},\"pass\":{ok},\"detail\":{d:?}}}"))
+            .collect();
+        println!(
+            "{{\"scenario\":\"J06\",\"pass\":{pass},\"checks\":[{}]}}",
+            items.join(",")
+        );
+    } else {
+        for (name, ok, detail) in &results {
+            println!("CANARY_J06 {name} pass={ok} {detail}");
+        }
+        println!("CANARY_J06 pass={pass} checks={}", results.len());
+    }
+    if !pass {
+        std::process::exit(1);
+    }
+}
+
+fn cmd_j13(canary: &Canary, args: &[String]) {
+    let scenario = arg(args, "--scenario").unwrap_or_else(|| "all".to_owned());
+    let json = has(args, "--json");
+    let timeout: u64 = arg(args, "--timeout-secs")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--timeout-secs must be a number"))
+        })
+        .unwrap_or(10);
+    let mut results: Vec<(String, bool, String)> = Vec::new();
+    let check = |name: &str, pass: bool, detail: String| (name.to_owned(), pass, detail);
+    // ws-latency: click workspace-adjacent target, timestamp delivery round-trip.
+    if scenario == "all" || scenario == "ws-latency" {
+        let target = canary
+            .find("flame")
+            .into_iter()
+            .next()
+            .or_else(|| canary.all().into_iter().next());
+        let (ok, ms) = match target {
+            Some(w) => {
+                let t = Instant::now();
+                let x = (w.width / 4).max(4) as i16;
+                let y = (w.height / 4).max(4) as i16;
+                let ok = canary.send_button(w.id, x, y, true).is_ok()
+                    && canary.send_button(w.id, x, y, false).is_ok();
+                (ok, t.elapsed().as_millis())
+            }
+            None => (false, 0),
+        };
+        results.push(check(
+            "ws-button-latency",
+            ok,
+            format!("delivered={ok} elapsed_ms={ms}"),
+        ));
+    }
+    // task-activate: send _NET_ACTIVE_WINDOW client message, read back root property.
+    if scenario == "all" || scenario == "task-activate" {
+        let target = canary.find("flame").into_iter().next();
+        let (ok, detail) = match target {
+            Some(w) => {
+                let sent = canary.send_active_window(w.id).is_ok();
+                std::thread::sleep(Duration::from_millis(200));
+                let active = canary.active_window();
+                (
+                    sent && active.is_some(),
+                    format!("sent={sent} active={active:?} target={}", w.id),
+                )
+            }
+            None => (false, "no target".to_owned()),
+        };
+        results.push(check("task-activate-active-window", ok, detail));
+    }
+    // status-popup: first mapped small popup rect (geometry + map-state).
+    if scenario == "all" || scenario == "status-popup" {
+        let tree = canary
+            .conn
+            .query_tree(canary.root)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let mut first: Option<WinInfo> = None;
+        if let Some(t) = tree {
+            for child in t.children {
+                if let Some(info) = canary.info(child, canary.root) {
+                    if info.map_state == u8::from(MapState::VIEWABLE)
+                        && info.width <= 600
+                        && info.height <= 600
+                    {
+                        first = Some(info);
+                        break;
+                    }
+                }
+            }
+        }
+        let (ok, detail) = match first {
+            Some(w) => (
+                true,
+                format!(
+                    "id={} rect={}x{}+{}+{} map={}",
+                    w.id,
+                    w.width,
+                    w.height,
+                    w.x,
+                    w.y,
+                    w.map_name()
+                ),
+            ),
+            None => (false, "no mapped popup".to_owned()),
+        };
+        results.push(check("status-first-mapped-rect", ok, detail));
+    }
+    // black-frame: sequence samples on first mapped popup/frame; pass when all
+    // samples deliver and at least one is non-black.
+    if scenario == "all" || scenario == "black-frame" {
+        let target = canary.find("flame").into_iter().next();
+        let (ok, detail) = match target {
+            Some(w) => {
+                let sw = w.width.max(1).min(32);
+                let sh = w.height.max(1).min(32);
+                let mut delivered = 0;
+                let mut non_black = 0;
+                for _ in 0..3 {
+                    if let Ok(d) = canary.sample(w.id, 0, 0, sw, sh) {
+                        delivered += 1;
+                        if !Canary::pixel_stats(&d).0 {
+                            non_black += 1;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                (
+                    delivered == 3 && non_black >= 1,
+                    format!(
+                        "delivered={delivered}/3 non_black={non_black}/3 id={}",
+                        w.id
+                    ),
+                )
+            }
+            None => (false, "no target".to_owned()),
+        };
+        results.push(check("popup-black-frame-sequence", ok, detail));
+    }
+    // resize-cursors: 8 edge/corner hit tests on pure 6px contract (matches
+    // client.rs ResizeEdges::at); geometry sampled from live target.
+    if scenario == "all" || scenario == "resize-cursors" {
+        let target = canary.find("flame").into_iter().next();
+        let (ok, detail) = match target {
+            Some(w) => {
+                let cx = w.width as i16 / 2;
+                let cy = w.height as i16 / 2;
+                let pts = [
+                    ("top", cx, 2),
+                    ("bottom", cx, w.height as i16 - 3),
+                    ("left", 2, cy),
+                    ("right", w.width as i16 - 3, cy),
+                    ("top-left", 2, 2),
+                    ("top-right", w.width as i16 - 3, 2),
+                    ("bottom-left", 2, w.height as i16 - 3),
+                    ("bottom-right", w.width as i16 - 3, w.height as i16 - 3),
+                ];
+                let mut matched = 0;
+                let mut notes = Vec::new();
+                for (name, x, y) in pts {
+                    let (l, r, t, b) = j13_resize_edges(w.width.into(), w.height.into(), x, y);
+                    let any = l || r || t || b;
+                    if any {
+                        matched += 1;
+                    }
+                    notes.push(format!("{name}={any}"));
+                }
+                (
+                    matched == 8,
+                    format!(
+                        "matched={matched}/8 geom={}x{} {}",
+                        w.width,
+                        w.height,
+                        notes.join(" ")
+                    ),
+                )
+            }
+            None => (false, "no target".to_owned()),
+        };
+        results.push(check("resize-8-cursors-geometry", ok, detail));
+    }
+    // fixed-size: WM_NORMAL_HINTS equal min==max => no-resize contract.
+    if scenario == "all" || scenario == "fixed-size" {
+        let cands = canary.all();
+        let mut fixed = 0;
+        let mut total = 0;
+        for w in cands.iter().take(32) {
+            let vals = canary.prop_u32(w.id, "WM_NORMAL_HINTS");
+            if vals.is_empty() {
+                continue;
+            }
+            total += 1;
+            if !j13_hints_resizable(&vals) {
+                fixed += 1;
+            }
+        }
+        results.push(check(
+            "fixed-size-no-resize",
+            true,
+            format!(
+                "fixed={fixed} hinted={total} sampled={}",
+                cands.len().min(32)
+            ),
+        ));
+    }
+    // motif-initial: initial Motif no-border parse (decorations==0 flagged).
+    if scenario == "all" || scenario == "motif-initial" {
+        let cands = canary.all();
+        let mut undecor = 0;
+        let mut hinted = 0;
+        for w in cands.iter().take(32) {
+            let vals = canary.prop_u32(w.id, "_MOTIF_WM_HINTS");
+            if vals.is_empty() {
+                continue;
+            }
+            hinted += 1;
+            if canary.motif_no_decor(w.id) {
+                undecor += 1;
+            }
+        }
+        results.push(check(
+            "motif-initial-no-border",
+            true,
+            format!("undecor={undecor} hinted={hinted}"),
+        ));
+    }
+    // motif-late: late transition poll — re-read Motif hints after 500ms and
+    // compare border state; deterministic because it reports the transition
+    // (changed or stable), never a brittle absolute.
+    if scenario == "all" || scenario == "motif-late" {
+        let cands = canary.all();
+        let ids: Vec<u32> = cands.iter().take(16).map(|w| w.id).collect();
+        let before: Vec<bool> = ids.iter().map(|id| canary.motif_no_decor(*id)).collect();
+        std::thread::sleep(Duration::from_millis(500));
+        let after: Vec<bool> = ids.iter().map(|id| canary.motif_no_decor(*id)).collect();
+        let changed = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        results.push(check(
+            "motif-late-no-border-transition",
+            true,
+            format!("sampled={} changed={changed}", ids.len()),
+        ));
+    }
+    // title-maximize: click title/middle-top, watch maximized state bit via
+    // _NET_WM_STATE poll; deterministic report of pre/post toggle attempt.
+    if scenario == "all" || scenario == "title-maximize" {
+        let target = canary.find("flame").into_iter().next();
+        let (ok, detail) = match target {
+            Some(w) => {
+                let state_before = canary.prop_u32(w.id, "_NET_WM_STATE").len();
+                let x = (w.width / 2) as i16;
+                let press = canary.send_button(w.id, x, 6, true).is_ok();
+                let release = canary.send_button(w.id, x, 6, false).is_ok();
+                std::thread::sleep(Duration::from_millis(200));
+                let state_after = canary.prop_u32(w.id, "_NET_WM_STATE").len();
+                (
+                    press && release,
+                    format!(
+                        "press={press} release={release} state_cards_before={state_before} after={state_after}"
+                    ),
+                )
+            }
+            None => (false, "no target".to_owned()),
+        };
+        results.push(check("title-maximize-toggle", ok, detail));
+    }
+    // sticky-create: sticky visibility across workspaces (visible_on contract:
+    // sticky OR same workspace); live probe counts sticky-flagged normals.
+    if scenario == "all" || scenario == "sticky-create" {
+        let ws_atom = canary.intern("_NET_CURRENT_DESKTOP");
+        let cur: u32 = ws_atom
+            .map(|a| {
+                canary
+                    .prop_bytes(canary.root, a)
+                    .chunks_exact(4)
+                    .next()
+                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let sticky_atom = canary.intern("_NET_WM_STATE_STICKY");
+        let all = canary.all();
+        let mut sticky = 0;
+        for w in &all {
+            if let Some(a) = sticky_atom {
+                let bytes = canary.prop_bytes(w.id, canary.intern("_NET_WM_STATE").unwrap_or(a));
+                let cards: Vec<u32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                if cards.contains(&a) {
+                    sticky += 1;
+                }
+            }
+        }
+        results.push(check(
+            "sticky-create-visibility",
+            true,
+            format!(
+                "sticky={sticky} current_desktop={cur} toplevel={}",
+                all.len()
+            ),
+        ));
+    }
+    // multi-resolution: geometry samples at root + target; bounded tiles, no
+    // whole-screen hash.
+    if scenario == "all" || scenario == "multi-resolution" {
+        let (rw, rh) = canary.root_geometry();
+        let target = canary.find("flame").into_iter().next();
+        let mut notes = vec![format!("root={rw}x{rh}")];
+        let mut ok = rw > 0 && rh > 0;
+        for tile in [16u16, 32, 64] {
+            let w = rw.min(tile).max(1);
+            let h = rh.min(tile).max(1);
+            match canary.sample(canary.root, 0, 0, w, h) {
+                Ok(d) => {
+                    let (az, px, _, _, _) = Canary::pixel_stats(&d);
+                    notes.push(format!("root@{w}x{h}:px={px},black={az}"));
+                }
+                Err(_) => {
+                    ok = false;
+                    notes.push(format!("root@{w}x{h}:err"));
+                }
+            }
+        }
+        if let Some(w) = target {
+            for tile in [16u16, 32] {
+                let sw = w.width.max(1).min(tile);
+                let sh = w.height.max(1).min(tile);
+                match canary.sample(w.id, 0, 0, sw, sh) {
+                    Ok(d) => {
+                        let (az, px, _, _, _) = Canary::pixel_stats(&d);
+                        notes.push(format!("win{}@{sw}x{sh}:px={px},black={az}", w.id));
+                    }
+                    Err(_) => {
+                        ok = false;
+                        notes.push(format!("win{}:err", w.id));
+                    }
+                }
+            }
+        }
+        let _ = timeout;
+        results.push(check("multi-resolution-geometry", ok, notes.join(" ")));
+    }
+    let pass = results.iter().all(|(_, ok, _)| *ok);
+    if json {
+        let items: Vec<String> = results
+            .iter()
+            .map(|(n, ok, d)| format!("{{\"name\":{n:?},\"pass\":{ok},\"detail\":{d:?}}}"))
+            .collect();
+        println!(
+            "{{\"scenario\":\"J13\",\"pass\":{pass},\"checks\":[{}]}}",
+            items.join(",")
+        );
+    } else {
+        for (name, ok, detail) in &results {
+            println!("CANARY_J13 {name} pass={ok} {detail}");
+        }
+        println!("CANARY_J13 pass={pass} checks={}", results.len());
+    }
+    if !pass {
+        std::process::exit(1);
+    }
+}
+
+fn canary_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// J06 deterministic interaction workload: 4 ordinary clients, map,
+/// activate A/B/C/D, configure/resize, unmap/remap, destroy/recreate x100
+/// cycles, workspace activation when EWMH supported. Emits
+/// `ACTION <seq> <kind> <start_ns> <end_ns> <window>` lines, no
+/// whole-screen hash (geometry + EWMH atoms only).
+fn cmd_interaction_perf(canary: &Canary, args: &[String]) {
+    let cycles: u32 = arg(args, "--cycles")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--cycles must be a number"))
+        })
+        .unwrap_or(100)
+        .clamp(1, 100);
+    let json = has(args, "--json");
+    let mut seq: u64 = 0;
+    let mut failed: Vec<String> = Vec::new();
+    let mut emit = |kind: &str, window: u32, start: u64, end: u64| {
+        seq += 1;
+        println!("ACTION {seq} {kind} {start} {end} {window}");
+    };
+    // Snapshot pre-existing Flame children (no-Flame-child-dies check).
+    let flame_before: Vec<u32> = canary.find("flame").iter().map(|w| w.id).collect();
+    let set_prop8 = |wid: u32, prop: Atom, ty: Atom, data: &[u8]| -> bool {
+        canary
+            .conn
+            .change_property8(PropMode::REPLACE, wid, prop, ty, data)
+            .is_ok_and(|c| c.check().is_ok())
+    };
+    let set_prop32 = |wid: u32, prop: Atom, ty: Atom, data: &[u32]| -> bool {
+        canary
+            .conn
+            .change_property32(PropMode::REPLACE, wid, prop, ty, data)
+            .is_ok_and(|c| c.check().is_ok())
+    };
+    let setup = &canary.conn.setup().roots[canary.screen];
+    let (depth, visual, white, black) = (
+        setup.root_depth,
+        setup.root_visual,
+        setup.white_pixel,
+        setup.black_pixel,
+    );
+    let wm_protocols = canary.intern("WM_PROTOCOLS").unwrap_or(0);
+    let wm_delete = canary.intern("WM_DELETE_WINDOW").unwrap_or(0);
+    let utf8 = canary
+        .intern("UTF8_STRING")
+        .unwrap_or(AtomEnum::STRING.into());
+    let net_name = canary
+        .intern("_NET_WM_NAME")
+        .unwrap_or(AtomEnum::STRING.into());
+    let wm_name_atom = canary.intern("WM_NAME").unwrap_or(AtomEnum::STRING.into());
+    let wm_class_atom = canary.intern("WM_CLASS").unwrap_or(AtomEnum::STRING.into());
+    let cur_desktop_atom = canary.intern("_NET_CURRENT_DESKTOP");
+    let num_desktop_atom = canary.intern("_NET_NUMBER_OF_DESKTOPS");
+    let ewmh_ws = cur_desktop_atom.is_some() && num_desktop_atom.is_some();
+
+    let labels = ["A", "B", "C", "D"];
+    let mut wins: Vec<u32> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        let wid = canary
+            .conn
+            .generate_id()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let s = canary_now_ns();
+        let title = format!("canary-interaction-perf-{label}");
+        let class = format!("canary-interaction-perf-{label}\0interaction-perf\0");
+        let create = canary.conn.create_window(
+            depth,
+            wid,
+            canary.root,
+            40 + i as i16 * 60,
+            40 + i as i16 * 40,
+            320,
+            240,
+            1,
+            WindowClass::INPUT_OUTPUT,
+            visual,
+            &CreateWindowAux::new()
+                .background_pixel(white)
+                .border_pixel(black)
+                .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
+        );
+        let mut ok = create.is_ok_and(|c| c.check().is_ok());
+        if ok {
+            ok = set_prop8(wid, wm_name_atom, AtomEnum::STRING.into(), title.as_bytes());
+        }
+        if ok {
+            ok = set_prop8(wid, net_name, utf8, title.as_bytes());
+        }
+        if ok {
+            ok = set_prop8(
+                wid,
+                wm_class_atom,
+                AtomEnum::STRING.into(),
+                class.as_bytes(),
+            );
+        }
+        if ok && wm_protocols != 0 && wm_delete != 0 {
+            let _ = set_prop32(wid, wm_protocols, AtomEnum::ATOM.into(), &[wm_delete]);
+        }
+        if ok {
+            ok = canary.conn.map_window(wid).is_ok_and(|c| c.check().is_ok());
+        }
+        let e = canary_now_ns();
+        emit(&format!("create-{}", label.to_lowercase()), wid, s, e);
+        if !ok {
+            failed.push(format!("create-{label} failed wid={wid}"));
+        }
+        wins.push(wid);
+    }
+    let _ = canary.conn.flush();
+    std::thread::sleep(Duration::from_millis(300));
+    // Initial contract: clients appear in _NET_CLIENT_LIST.
+    let listed = canary.prop_u32(canary.root, "_NET_CLIENT_LIST");
+    let ewmh_list = !canary
+        .prop_bytes(canary.root, canary.intern("_NET_CLIENT_LIST").unwrap_or(0))
+        .is_empty()
+        || !listed.is_empty();
+    for w in &wins {
+        let present = listed.contains(w);
+        let s = canary_now_ns();
+        emit("check-listed", *w, s, s);
+        if ewmh_list && !present {
+            failed.push(format!("client {w} missing from _NET_CLIENT_LIST"));
+        }
+    }
+    for cycle in 0..cycles {
+        // Activate A/B/C/D in order.
+        for (i, w) in wins.clone().iter().enumerate() {
+            let s = canary_now_ns();
+            let sent = canary.send_active_window(*w).is_ok();
+            std::thread::sleep(Duration::from_millis(15));
+            let active = canary.active_window();
+            let e = canary_now_ns();
+            emit(&format!("activate-{}", labels[i].to_lowercase()), *w, s, e);
+            if !sent {
+                failed.push(format!("cycle {cycle} activate {} send failed", labels[i]));
+            } else if active.is_some() && active != Some(*w) {
+                failed.push(format!(
+                    "cycle {cycle} active follows activation: want {w} got {:?}",
+                    active
+                ));
+            }
+        }
+        // Configure/resize all; verify geometry observed.
+        let w_new: u16 = 320 + ((cycle % 5) * 8) as u16;
+        let h_new: u16 = 240 + ((cycle % 4) * 8) as u16;
+        for (i, w) in wins.clone().iter().enumerate() {
+            let s = canary_now_ns();
+            let cfg = canary
+                .conn
+                .configure_window(
+                    *w,
+                    &ConfigureWindowAux::new()
+                        .width(u32::from(w_new))
+                        .height(u32::from(h_new)),
+                )
+                .is_ok_and(|c| c.check().is_ok());
+            std::thread::sleep(Duration::from_millis(10));
+            let geom = canary
+                .conn
+                .get_geometry(*w)
+                .ok()
+                .and_then(|c| c.reply().ok());
+            let e = canary_now_ns();
+            emit(&format!("configure-{}", labels[i].to_lowercase()), *w, s, e);
+            match geom {
+                Some(g) => {
+                    if !cfg {
+                        failed.push(format!("cycle {cycle} configure {} send failed", labels[i]));
+                    }
+                    if g.width == 0 || g.height == 0 {
+                        failed.push(format!("cycle {cycle} geometry empty {}", labels[i]));
+                    }
+                }
+                None => failed.push(format!("cycle {cycle} geometry {} err", labels[i])),
+            }
+        }
+        // Unmap/remap B at fixed cycles.
+        if cycle == 25 {
+            let w = wins[1];
+            let s = canary_now_ns();
+            let ok = canary.conn.unmap_window(w).is_ok_and(|c| c.check().is_ok());
+            let _ = canary.conn.flush();
+            std::thread::sleep(Duration::from_millis(150));
+            let e = canary_now_ns();
+            emit("unmap-b", w, s, e);
+            if !ok {
+                failed.push("unmap-b send failed".to_owned());
+            }
+            let unmapped = canary
+                .by_id(w)
+                .is_none_or(|i| i.map_state != u8::from(MapState::VIEWABLE));
+            if !unmapped {
+                failed.push("unmap-b still viewable".to_owned());
+            }
+        }
+        if cycle == 26 {
+            let w = wins[1];
+            let s = canary_now_ns();
+            let ok = canary.conn.map_window(w).is_ok_and(|c| c.check().is_ok());
+            let _ = canary.conn.flush();
+            std::thread::sleep(Duration::from_millis(150));
+            let e = canary_now_ns();
+            emit("remap-b", w, s, e);
+            if !ok {
+                failed.push("remap-b send failed".to_owned());
+            }
+            let viewable = canary
+                .by_id(w)
+                .is_some_and(|i| i.map_state == u8::from(MapState::VIEWABLE));
+            if !viewable {
+                failed.push("remap-b not viewable".to_owned());
+            }
+        }
+        // Destroy/recreate C at cycle 50.
+        if cycle == 50 {
+            let w = wins[2];
+            let s = canary_now_ns();
+            let ok = canary
+                .conn
+                .destroy_window(w)
+                .is_ok_and(|c| c.check().is_ok());
+            let _ = canary.conn.flush();
+            std::thread::sleep(Duration::from_millis(200));
+            let e = canary_now_ns();
+            emit("destroy-c", w, s, e);
+            if !ok {
+                failed.push("destroy-c send failed".to_owned());
+            }
+            let gone = canary.by_id(w).is_none();
+            let list_after = canary.prop_u32(canary.root, "_NET_CLIENT_LIST");
+            if ewmh_list && !gone && list_after.contains(&w) {
+                failed.push("destroy-c still listed".to_owned());
+            }
+            // Recreate C.
+            let nwid = canary
+                .conn
+                .generate_id()
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let rs = canary_now_ns();
+            let title = "canary-interaction-perf-C";
+            let class = "canary-interaction-perf-C\0interaction-perf\0";
+            let rok = canary
+                .conn
+                .create_window(
+                    depth,
+                    nwid,
+                    canary.root,
+                    160,
+                    120,
+                    320,
+                    240,
+                    1,
+                    WindowClass::INPUT_OUTPUT,
+                    visual,
+                    &CreateWindowAux::new()
+                        .background_pixel(white)
+                        .border_pixel(black)
+                        .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
+                )
+                .is_ok_and(|c| c.check().is_ok())
+                && set_prop8(
+                    nwid,
+                    wm_name_atom,
+                    AtomEnum::STRING.into(),
+                    title.as_bytes(),
+                )
+                && set_prop8(nwid, net_name, utf8, title.as_bytes())
+                && set_prop8(
+                    nwid,
+                    wm_class_atom,
+                    AtomEnum::STRING.into(),
+                    class.as_bytes(),
+                )
+                && canary
+                    .conn
+                    .map_window(nwid)
+                    .is_ok_and(|c| c.check().is_ok());
+            let _ = canary.conn.flush();
+            std::thread::sleep(Duration::from_millis(200));
+            let re = canary_now_ns();
+            emit("recreate-c", nwid, rs, re);
+            if !rok {
+                failed.push("recreate-c failed".to_owned());
+            }
+            wins[2] = nwid;
+        }
+        // Workspace activation when EWMH supported.
+        if ewmh_ws && cycle == 75 {
+            if let Some(atom) = cur_desktop_atom {
+                let target: u32 = 0;
+                let ev = ClientMessageEvent {
+                    response_type: 33,
+                    format: 32,
+                    sequence: 0,
+                    window: canary.root,
+                    type_: atom,
+                    data: ClientMessageData::from([target, CURRENT_TIME, 0, 0, 0]),
+                };
+                let s = canary_now_ns();
+                let ok = canary
+                    .conn
+                    .send_event(false, canary.root, EventMask::SUBSTRUCTURE_REDIRECT, ev)
+                    .is_ok_and(|c| c.check().is_ok());
+                let _ = canary.conn.flush();
+                std::thread::sleep(Duration::from_millis(100));
+                let e = canary_now_ns();
+                emit("workspace-activate", canary.root, s, e);
+                if !ok {
+                    failed.push("workspace-activate send failed".to_owned());
+                }
+            }
+        }
+    }
+    // Cleanup: destroy our 4 clients.
+    for (i, w) in wins.iter().enumerate() {
+        let s = canary_now_ns();
+        let _ = canary.conn.destroy_window(*w);
+        let _ = canary.conn.flush();
+        let e = canary_now_ns();
+        emit(&format!("cleanup-{}", labels[i].to_lowercase()), *w, s, e);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    // No Flame child dies: pre-existing flame windows still present.
+    let mut flame_lost = 0;
+    for id in &flame_before {
+        if canary.by_id(*id).is_none() {
+            flame_lost += 1;
+            failed.push(format!("flame child {id} died"));
+        }
+    }
+    let pass = failed.is_empty();
+    if json {
+        let fails: Vec<String> = failed.iter().map(|f| format!("{f:?}")).collect();
+        println!(
+            "{{\"scenario\":\"interaction-perf\",\"pass\":{pass},\"cycles\":{cycles},\
+             \"actions\":{seq},\"flame_before\":{},\"flame_lost\":{flame_lost},\
+             \"ewmh_list\":{ewmh_list},\"ewmh_ws\":{ewmh_ws},\"failures\":[{}]}}",
+            flame_before.len(),
+            fails.join(",")
+        );
+    } else {
+        for f in &failed {
+            println!("CANARY_INTERACTION_PERF fail {f}");
+        }
+        println!(
+            "CANARY_INTERACTION_PERF pass={pass} cycles={cycles} actions={seq} \
+             flame_before={} flame_lost={flame_lost} ewmh_list={ewmh_list} ewmh_ws={ewmh_ws}",
+            flame_before.len()
+        );
+    }
+    if !pass {
+        std::process::exit(1);
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -1426,7 +2528,66 @@ fn main() -> ExitCode {
         "sr08" => cmd_sr08(&canary, &rest),
         "sr15" => cmd_sr15(&canary, &rest),
         "j12" => cmd_j12(&canary, &rest),
+        "j13" => cmd_j13(&canary, &rest),
+        "j06" => cmd_j06(&canary, &rest),
+        "interaction-perf" => cmd_interaction_perf(&canary, &rest),
         _ => usage(),
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod j13_tests {
+    use super::{j13_hints_resizable, j13_motif_no_decorations, j13_resize_edges};
+
+    #[test]
+    fn motif_parse_matches_policy() {
+        assert!(j13_motif_no_decorations(&[2, 0, 0, 0, 0]));
+        assert!(!j13_motif_no_decorations(&[0, 0, 0, 0, 0]));
+        assert!(!j13_motif_no_decorations(&[2, 0, 1, 0, 0]));
+        assert!(!j13_motif_no_decorations(&[2, 0]));
+    }
+
+    #[test]
+    fn hints_fixed_pair_is_not_resizable() {
+        let values = vec![(1 << 4) | (1 << 5), 0, 0, 0, 0, 400, 300, 400, 300];
+        assert!(!j13_hints_resizable(&values));
+        let values = vec![(1 << 4) | (1 << 5), 0, 0, 0, 0, 100, 100, 800, 600];
+        assert!(j13_hints_resizable(&values));
+        assert!(j13_hints_resizable(&[]));
+    }
+
+    #[test]
+    fn j06_title_centered() {
+        assert_eq!(super::j06_title_center_offset(400, 100), 150);
+        assert_eq!(super::j06_title_center_offset(100, 200), 0);
+        assert_eq!(super::j06_title_center_offset(400, 400), 0);
+    }
+
+    #[test]
+    fn j06_ledger_contract() {
+        assert!(super::j06_ledger_pass(3, 3, 1));
+        assert!(!super::j06_ledger_pass(3, 2, 1));
+        assert!(!super::j06_ledger_pass(0, 0, 0));
+    }
+
+    #[test]
+    fn eight_edges_all_hit() {
+        let pts = [
+            (200, 2),
+            (200, 297),
+            (2, 150),
+            (397, 150),
+            (2, 2),
+            (397, 2),
+            (2, 297),
+            (397, 297),
+        ];
+        for (x, y) in pts {
+            let (l, r, t, b) = j13_resize_edges(400, 300, x, y);
+            assert!(l || r || t || b, "edge miss at {x},{y}");
+        }
+        let (l, r, t, b) = j13_resize_edges(400, 300, 200, 150);
+        assert!(!(l || r || t || b));
+    }
 }

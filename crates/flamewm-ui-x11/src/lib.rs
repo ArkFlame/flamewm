@@ -10,6 +10,7 @@ mod template;
 pub use event_source::{
     pump_events, run_surface_runtime_with_reactor, run_surface_runtime_with_reactor_access,
 };
+pub use flamewm_render_x11::GeometryTrace;
 pub use input::{
     SurfaceEvent, UiInputEvent, WHEEL_SCROLL_STEP, action_scroll_delta, pointer_button_from_raw,
     surface_event_to_ui_event, wheel_scroll_delta,

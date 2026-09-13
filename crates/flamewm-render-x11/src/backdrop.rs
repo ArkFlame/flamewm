@@ -1,0 +1,361 @@
+//! Snap-preview backdrop: root readback under the preview rect.
+//! No compositor, no XSHM. Pure conversion + one X11-backed capture helper.
+//! Flow (caller-gated on target/rect change): capture under rect via
+//! XGetImage on the root, convert pixels with live server masks/byte order
+//! (never hardcoded RGB order), retain as preview background, then draw the
+//! desktop-selection material over it. Failure -> border-only preview.
+//! No capture runs unless the caller reports a geometry change.
+
+use std::ptr;
+
+use crate::xlib::*;
+
+/// Accent from the shared `flamewm-skin` selection contract (0xef4048).
+pub const BACKDROP_ACCENT_RGB: (u8, u8, u8) = (0xef, 0x40, 0x48);
+
+/// Fill alpha family for the snap preview (20% default). Shared with
+/// `flamewm-desktop-core` selection material semantics: accent blended in
+/// `fill_color` below, border at full-accent strength.
+pub const BACKDROP_FILL_ALPHA_DEFAULT: u8 = 51;
+/// Border alpha family: strong accent edge over the captured backdrop.
+pub const BACKDROP_BORDER_ALPHA: u8 = 0xdd;
+/// Border width family in device px: matches the compiled snap-preview CSS.
+pub const BACKDROP_BORDER_WIDTH_PX: u32 = 2;
+
+/// Straight RGBA8 capture plus the server format it was decoded from.
+#[derive(Debug, Clone)]
+pub struct BackdropCapture {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Bit position of the lowest set bit in a channel mask. Zero mask -> 0.
+fn mask_shift(mask: u64) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
+    mask.trailing_zeros()
+}
+
+/// Bit width of the contiguous set field in a channel mask, from its lowest
+/// set bit. Zero mask -> 0.
+fn mask_width(mask: u64) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
+    let shifted = mask >> mask_shift(mask);
+    64 - shifted.leading_zeros() - shifted.trailing_zeros().min(64)
+}
+
+/// Scale one extracted channel field to 8 bits using the live mask geometry.
+fn scale_channel(value: u64, mask: u64) -> u8 {
+    let width = mask_width(mask);
+    if width == 0 {
+        return 0;
+    }
+    let field = (value & mask) >> mask_shift(mask);
+    if width >= 8 {
+        (field >> (width - 8)) as u8
+    } else {
+        ((field * 255) / ((1u64 << width) - 1)) as u8
+    }
+}
+
+/// Decode one server pixel word into (r, g, b) using live visual masks.
+/// No hardcoded channel order: shifts/widths come from the server.
+#[must_use]
+pub fn decode_pixel(pixel: u64, red_mask: u64, green_mask: u64, blue_mask: u64) -> (u8, u8, u8) {
+    (
+        scale_channel(pixel, red_mask),
+        scale_channel(pixel, green_mask),
+        scale_channel(pixel, blue_mask),
+    )
+}
+
+/// Translucent accent fill over a captured backdrop. Pure and testable:
+/// 20% default maps to alpha 51 to match the existing preview contract.
+#[must_use]
+pub fn fill_color(opacity_percent: u8) -> (u8, u8, u8, u8) {
+    let opacity = u32::from(opacity_percent.min(100));
+    let alpha = ((opacity * 255 + 50) / 100) as u8;
+    (
+        BACKDROP_ACCENT_RGB.0,
+        BACKDROP_ACCENT_RGB.1,
+        BACKDROP_ACCENT_RGB.2,
+        alpha,
+    )
+}
+
+/// Shared desktop-selection material for one material, two consumers
+/// (desktop selection renderer and snap-preview backdrop): translucent
+/// accent fill plus strong accent border ring. Pure and headless-testable.
+#[must_use]
+pub fn selection_material(opacity_percent: u8) -> ((u8, u8, u8, u8), (u8, u8, u8, u8)) {
+    (
+        fill_color(opacity_percent),
+        (
+            BACKDROP_ACCENT_RGB.0,
+            BACKDROP_ACCENT_RGB.1,
+            BACKDROP_ACCENT_RGB.2,
+            BACKDROP_BORDER_ALPHA,
+        ),
+    )
+}
+
+/// Alpha-over blend of a translucent source over an opaque backdrop pixel.
+/// Integer math, rounded.
+fn blend_over(src: (u8, u8, u8, u8), dst: (u8, u8, u8)) -> (u8, u8, u8) {
+    let a = u32::from(src.3);
+    let inv = 255 - a;
+    let mix = |s: u8, d: u8| ((u32::from(s) * a + u32::from(d) * inv + 127) / 255) as u8;
+    (mix(src.0, dst.0), mix(src.1, dst.1), mix(src.2, dst.2))
+}
+
+/// Composite the desktop-selection material over a captured backdrop:
+/// translucent accent fill everywhere, strong accent border ring at
+/// `BACKDROP_BORDER_WIDTH_PX`. Pure; caller uploads the result as the
+/// retained preview background. Border-only failure path is expressed by
+/// passing `fill=None`.
+#[must_use]
+pub fn composite_selection_material(
+    backdrop: &BackdropCapture,
+    fill: Option<(u8, u8, u8, u8)>,
+    border: (u8, u8, u8, u8),
+) -> Vec<u8> {
+    let mut out = backdrop.pixels.clone();
+    let (w, h) = (backdrop.width as usize, backdrop.height as usize);
+    if w == 0 || h == 0 || out.len() != w * h * 4 {
+        return out;
+    }
+    if let Some(fill) = fill {
+        for pixel in out.chunks_exact_mut(4) {
+            let (r, g, b) = blend_over(fill, (pixel[0], pixel[1], pixel[2]));
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = b;
+            pixel[3] = 255;
+        }
+    }
+    let bw = BACKDROP_BORDER_WIDTH_PX as usize;
+    let ba = border.3;
+    for y in 0..h {
+        for x in 0..w {
+            let on_border = x < bw || y < bw || x + bw >= w || y + bw >= h;
+            if !on_border {
+                continue;
+            }
+            let off = (y * w + x) * 4;
+            let (r, g, b) = blend_over(
+                (border.0, border.1, border.2, ba),
+                (out[off], out[off + 1], out[off + 2]),
+            );
+            out[off] = r;
+            out[off + 1] = g;
+            out[off + 2] = b;
+            out[off + 3] = 255;
+        }
+    }
+    out
+}
+
+/// Capture root content under `rect` via XGetImage (ZPixmap, all planes).
+/// Converts with the live `XImage` masks/byte order; rejects depths other
+/// than 24/32 and empty geometry. `Err` means caller falls back to the
+/// border-only preview with no opaque fill.
+pub fn capture_root_rect(
+    display: *mut Display,
+    root: u64,
+    rect: (i32, i32, u32, u32),
+) -> Result<BackdropCapture, String> {
+    use std::os::raw::{c_int, c_ulong};
+    let _guard = flamewm_profiler::start("render.overlay.capture");
+    let (x, y, width, height) = rect;
+    if width == 0 || height == 0 {
+        return Err("backdrop capture: empty rect".to_string());
+    }
+    if display.is_null() || root == 0 {
+        return Err("backdrop capture: no display/root".to_string());
+    }
+    let image = unsafe {
+        XGetImage(
+            display,
+            root as c_ulong,
+            x as c_int,
+            y as c_int,
+            width,
+            height,
+            c_ulong::MAX,
+            ZPIXMAP,
+        )
+    };
+    if image.is_null() {
+        eprintln!("debug render.overlay.capture reason=xgetimage-null");
+        return Err("backdrop capture unsupported (XGetImage returned NULL)".to_string());
+    }
+    let head = unsafe { &*(image as *const XImageHead) };
+    if head.depth != 24 && head.depth != 32 {
+        unsafe { XDestroyImage(image) };
+        eprintln!(
+            "debug render.overlay.capture reason=unsupported-depth depth={}",
+            head.depth
+        );
+        return Err(format!("backdrop capture unsupported depth {}", head.depth));
+    }
+    if head.width <= 0 || head.height <= 0 || head.data.is_null() {
+        unsafe { XDestroyImage(image) };
+        eprintln!("debug render.overlay.capture reason=invalid-image");
+        return Err("backdrop capture produced an invalid XImage".to_string());
+    }
+    let width_px = head.width as u32;
+    let height_px = head.height as u32;
+    let red_mask = head.red_mask as u64;
+    let green_mask = head.green_mask as u64;
+    let blue_mask = head.blue_mask as u64;
+    let byte_order = head.byte_order as u32;
+    let bits_per_pixel = head.bits_per_pixel as u32;
+    let bytes_per_line = head.bytes_per_line as usize;
+    // XImage data is owned by the XImage; copy out row by row honoring
+    // bytes_per_line, bits_per_pixel, and server byte order.
+    let data = unsafe {
+        std::slice::from_raw_parts(
+            head.data as *const u8,
+            bytes_per_line.saturating_mul(height_px as usize),
+        )
+    };
+    let bytes_per_pixel = match bits_per_pixel {
+        32 => 4usize,
+        24 => 4usize,
+        16 => 2usize,
+        _ => {
+            unsafe { XDestroyImage(image) };
+            eprintln!("debug render.overlay.capture reason=unsupported-bpp bpp={bits_per_pixel}");
+            return Err(format!("backdrop capture unsupported bpp {bits_per_pixel}"));
+        }
+    };
+    let mut pixels = Vec::with_capacity((width_px as usize) * (height_px as usize) * 4);
+    for row in 0..height_px as usize {
+        let row_base = row.saturating_mul(bytes_per_line);
+        for col in 0..width_px as usize {
+            let off = row_base.saturating_add(col.saturating_mul(bytes_per_pixel));
+            if off + bytes_per_pixel > data.len() {
+                unsafe { XDestroyImage(image) };
+                eprintln!("debug render.overlay.capture reason=short-row");
+                return Err("backdrop capture row overrun".to_string());
+            }
+            let word: u64 = match bytes_per_pixel {
+                4 => {
+                    let raw = [data[off], data[off + 1], data[off + 2], data[off + 3]];
+                    // Server byte order decides word assembly; LSBFirst
+                    // (0) vs MSBFirst (1) per XImage.byte_order.
+                    if byte_order == 1 {
+                        u32::from_be_bytes(raw) as u64
+                    } else {
+                        u32::from_le_bytes(raw) as u64
+                    }
+                }
+                2 => {
+                    let raw = [data[off], data[off + 1]];
+                    if byte_order == 1 {
+                        u16::from_be_bytes(raw) as u64
+                    } else {
+                        u16::from_le_bytes(raw) as u64
+                    }
+                }
+                _ => 0,
+            };
+            let (r, g, b) = decode_pixel(word, red_mask, green_mask, blue_mask);
+            pixels.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    unsafe { XDestroyImage(image) };
+    let _ = ptr::null::<u8>();
+    Ok(BackdropCapture {
+        width: width_px,
+        height: height_px,
+        pixels,
+    })
+}
+
+/// Capture on a short-lived connection opened here, so overlay owners
+/// without a borrowed display (e.g. the snap-preview surface) can read
+/// back root content only when their target/rect changes. Opens with
+/// `XOpenDisplay`, captures via [`capture_root_rect`], closes. `Err`
+/// means the caller falls back to the border-only preview.
+pub fn capture_root_rect_auto(rect: (i32, i32, u32, u32)) -> Result<BackdropCapture, String> {
+    let display = unsafe { XOpenDisplay(ptr::null()) };
+    if display.is_null() {
+        eprintln!("debug render.overlay.capture reason=no-display");
+        return Err("backdrop capture: XOpenDisplay failed".to_string());
+    }
+    install_x_io_error_handler();
+    let screen = unsafe { XDefaultScreen(display) };
+    let root = unsafe { XRootWindow(display, screen) };
+    let result = capture_root_rect(display, root as u64, rect);
+    unsafe { XCloseDisplay(display) };
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_uses_masks_not_hardcoded_order() {
+        // BGR-ordered server: red in low byte, blue in high byte.
+        assert_eq!(
+            decode_pixel(0x00_11_22_33, 0x0000ff, 0x00ff00, 0xff0000),
+            (0x33, 0x22, 0x11)
+        );
+        // Standard RGB order.
+        assert_eq!(
+            decode_pixel(0x00_11_22_33, 0xff0000, 0x00ff00, 0x0000ff),
+            (0x11, 0x22, 0x33)
+        );
+        // 16-bit 565.
+        assert_eq!(decode_pixel(0xf800, 0xf800, 0x07e0, 0x001f).0, 255);
+        assert_eq!(decode_pixel(0x001f, 0xf800, 0x07e0, 0x001f).2, 255);
+    }
+
+    #[test]
+    fn fill_default_matches_twenty_percent_contract() {
+        assert_eq!(fill_color(20), (0xef, 0x40, 0x48, 51));
+        assert_eq!(BACKDROP_BORDER_ALPHA, 0xdd);
+        assert_eq!(BACKDROP_BORDER_WIDTH_PX, 2);
+        assert_eq!(
+            selection_material(20),
+            ((0xef, 0x40, 0x48, 51), (0xef, 0x40, 0x48, 0xdd))
+        );
+    }
+
+    #[test]
+    fn composite_paints_fill_and_border_ring() {
+        let backdrop = BackdropCapture {
+            width: 6,
+            height: 6,
+            pixels: vec![0, 0, 0, 255].repeat(36),
+        };
+        let out = composite_selection_material(
+            &backdrop,
+            Some((0xef, 0x40, 0x48, 51)),
+            (0xef, 0x40, 0x48, 0xdd),
+        );
+        assert_eq!(out.len(), 36 * 4);
+        // Border pixel (0,0) is strong accent; interior (3,3) is 20% fill.
+        let border = &out[0..4];
+        assert!(border[0] > 200, "border red {border:?}");
+        let inner = &out[(3 * 6 + 3) * 4..][..4];
+        assert_eq!((inner[0], inner[1], inner[2]), (48, 13, 14));
+        // Border-only failure path keeps content, still rings the border.
+        let ring_only = composite_selection_material(&backdrop, None, (0xef, 0x40, 0x48, 0xdd));
+        let inner2 = &ring_only[(3 * 6 + 3) * 4..][..4];
+        assert_eq!((inner2[0], inner2[1], inner2[2]), (0, 0, 0));
+        assert!(ring_only[0] > 200);
+    }
+
+    #[test]
+    fn capture_rejects_empty_rect_without_x() {
+        assert!(capture_root_rect(ptr::null_mut(), 0, (0, 0, 0, 10)).is_err());
+        assert!(capture_root_rect(ptr::null_mut(), 0, (0, 0, 10, 10)).is_err());
+    }
+}

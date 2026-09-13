@@ -12,6 +12,9 @@ Packets are UTF-8 JSON files validated by `SCHEMA.json`.
 - Outbox packets are completion reports sent to the parent or coordinator.
 - Packet filenames are stable, descriptive, and use `.json`.
 - A packet identifies one job, its owner, scope, requested outcome, and verification evidence.
+- A handoff declares `REQUIRED_SKILLS`; the receiving agent explicitly loads each skill before work and records them in route evidence.
+- Route evidence identifies job ID, role, source handoff, loaded skills, changed paths, commands and results, blockers, and the hypothesis ledger reference when hypotheses are used.
+- Hypotheses, assumptions, and their outcomes are recorded in the task-scoped hypothesis ledger at `runtime/hypotheses/<job-id>.md`; it is ignored evidence, not a source of shared contract truth.
 - Missing, ambiguous, or conflicting requirements are reported as `BLOCKED`; agents do not silently invent contract changes.
 
 ## Claims and Locks
@@ -31,3 +34,10 @@ Every completion packet uses exactly one state:
 - `BLOCKED`: work could not be completed; include the exact blocker and smallest next action.
 
 Reports list changed paths, verification commands and results, remaining risks, and blockers. Never report success from inspection alone.
+
+## Role Gates
+
+- Coordinator routes the handoff, required skills, evidence destination, and Builder/Verifier roles. Coordinator reports route evidence and may not convert a mutating result into `PASS`.
+- Builder's first terminal status is exactly `PATCH_APPLIED_NEEDS_VERIFY`, `BLOCKED`, or `FAILED`. A Builder never reports `PASS` for mutating work.
+- Verifier independently records verification evidence and reports exactly `PASS`, `BLOCKED`, or `FAILED`. `PASS` is valid only for verification, never mutation.
+- A Coordinator may report `DONE` only after Verifier `PASS`; it reports `UNVERIFIED` only when verification was explicitly excluded or could not run, with evidence.

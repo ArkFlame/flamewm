@@ -13,6 +13,7 @@
 | Shell/UI projection | `crates/flamewm-shell`, `crates/flamewm-shell-core` | typed state and commands |
 | UI renderer bridge | `crates/flamewm-ui-x11` | typed UI/backend contract |
 | WM X11 bridge | `crates/flamewm-wm-x11` | typed WM/native contract |
+| Flame X11 frame engine (window geometry, pointer hit, chrome scene) | `crates/flamewm-wm-x11/src/frame/**` + `decoration/interaction.rs` + `decoration/manager.rs` + `client.rs` | pure planners/intents/effects; live X applies |
 | Render compilation | `crates/flamewm-render-compiler` | compiled render document |
 | Layout, paint, hit testing | `crates/flamewm-render-core` | render commands |
 | Native render output | `crates/flamewm-render-x11` | renderer-native boundary |

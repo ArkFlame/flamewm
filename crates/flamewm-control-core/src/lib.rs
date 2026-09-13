@@ -13,6 +13,7 @@ use flamewm_api::panels::PanelsSnapshot;
 use flamewm_api::ports::EnginePorts;
 use flamewm_api::session::{SessionAction, SessionCapabilities};
 use flamewm_api::settings::{SettingsSnapshot, SettingsTransaction};
+use flamewm_api::shell_bootstrap::ShellBootstrapSnapshot;
 use flamewm_api::shortcuts::{KeyBinding, ShortcutSnapshot};
 use flamewm_api::system::{SystemAction, SystemSnapshot};
 use flamewm_api::window::WindowSnapshot;
@@ -21,6 +22,10 @@ use flamewm_api::{
     DesktopAppId, ErrorCode, FlameError, ModeId, OutputId, PanelEdge, TransactionId, WindowRef,
 };
 use flamewm_platform::host::PlatformHost;
+
+pub mod mutations;
+
+pub use mutations::{ControlMutation, ControlMutationQueue, ControlMutationResult, MutationLane};
 
 pub const BUS_NAME: &str = "com.arkflame.FlameWM1";
 pub const OBJECT_PATH: &str = "/com/arkflame/FlameWM1";
@@ -81,6 +86,7 @@ pub enum ControlRequest {
     Ping,
     GetVersion,
     GetCapabilities,
+    GetShellBootstrap,
     GetWindows,
     GetApplications,
     LaunchApplication {
@@ -180,6 +186,7 @@ pub enum ControlResponse {
     Pong,
     Version(Version),
     Capabilities(Vec<String>),
+    ShellBootstrap(ShellBootstrapSnapshot),
     Windows(Vec<WindowSnapshot>),
     Applications(Vec<DesktopApplication>),
     Settings(SettingsSnapshot),
@@ -247,6 +254,25 @@ impl Dispatcher {
             ControlRequest::GetVersion => ControlResponse::Version(current_version()),
             ControlRequest::GetCapabilities => {
                 ControlResponse::Capabilities(host.capabilities().items().to_vec())
+            }
+            ControlRequest::GetShellBootstrap => {
+                host.refresh_windows()?;
+                let windows = host.engine().snapshot()?;
+                let windows_revision = windows
+                    .iter()
+                    .map(|window| window.state_generation)
+                    .max()
+                    .unwrap_or(0);
+                ControlResponse::ShellBootstrap(ShellBootstrapSnapshot {
+                    windows_revision,
+                    windows,
+                    workspaces: host.workspace_snapshot()?,
+                    panels: host.panels_snapshot(),
+                    applications: host.search_applications(""),
+                    session: host.session_capabilities(),
+                    displays: host.display_snapshot()?,
+                    system: host.system_snapshot().clone(),
+                })
             }
             ControlRequest::GetWindows => {
                 host.refresh_windows()?;

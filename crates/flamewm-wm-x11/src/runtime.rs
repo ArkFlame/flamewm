@@ -22,7 +22,7 @@ use flamewm_platform::host::PlatformHost;
 use flamewm_reactor::{FdAction, Reactor};
 
 use crate::atoms::AnyError;
-use crate::wm::{WmConfig, run_with_hook};
+use crate::wm::{WmChangeSet, WmConfig, run_with_hook};
 
 struct WmBuilderFields {
     discover_counter: &'static flamewm_profiler::CounterPoint,
@@ -49,6 +49,7 @@ fn discover_catalog_once() -> Result<std::sync::Arc<ApplicationCatalog>, AnyErro
 
 pub fn run(config: WmConfig) -> Result<(), AnyError> {
     flamewm_profiler::init_process("flamewm-wm");
+    flamewm_debug::init_process("wm");
     let settings_path = settings_path();
     let mut host = None;
     let control = ControlServer::connect_session()?;
@@ -172,7 +173,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
     let audio_updates_for_hook = Rc::clone(&audio_updates);
     let reactor_for_hook = Rc::clone(&reactor);
 
-    let result = run_with_hook(config, &catalog, &reactor, move |conn, screen| {
+    let result = run_with_hook(config, &catalog, &reactor, move |conn, screen, changes| {
         // Scoped per-turn span: the whole-process `wm.loop` guard above has
         // been removed so loop-turn CPU is attributed per turn, not once
         // across the full process lifetime.
@@ -263,12 +264,80 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
             &provider_error_for_hook,
         )?;
         let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        flush_wm_changes(host, &control, changes)?;
         control.on_ready(host, now_ms)?;
         Ok(())
     });
     drop(pulse);
     integrations.borrow_mut().stop();
     result
+}
+
+/// Drain one `WmChangeSet` once per reactor turn: refresh only required
+/// snapshots, emit one snapshot signal per changed domain plus legacy
+/// revision-only compat. MANAGE/MINIMIZE/RESTORE/CLOSE -> Windows+Panels,
+/// WORKSPACE SWITCH -> Workspaces+Panels. `work_area`-only turns emit nothing.
+fn flush_wm_changes<E>(
+    host: &mut PlatformHost<E>,
+    control: &ControlServer,
+    changes: WmChangeSet,
+) -> Result<(), AnyError>
+where
+    E: flamewm_api::ports::EnginePorts,
+{
+    for signal in collect_wm_signals(host, changes).map_err(any_from_flame)? {
+        control.emit_signal(&signal).map_err(any_from_flame)?;
+    }
+    Ok(())
+}
+
+fn collect_wm_signals<E>(
+    host: &mut PlatformHost<E>,
+    changes: WmChangeSet,
+) -> flamewm_api::FlameResult<Vec<ControlSignal>>
+where
+    E: flamewm_api::ports::EnginePorts,
+{
+    let mut signals = Vec::new();
+    if changes.windows {
+        let panels_before = host.panels_snapshot();
+        if host.refresh_windows()? {
+            let windows = host.engine().snapshot()?;
+            let revision = windows
+                .iter()
+                .map(|window| window.state_generation)
+                .max()
+                .unwrap_or(0);
+            signals.push(ControlSignal::WindowsSnapshotChanged { revision, windows });
+            signals.push(ControlSignal::WindowsChanged { revision });
+        }
+        let panels = host.panels_snapshot();
+        if panels != panels_before {
+            signals.push(ControlSignal::PanelsSnapshotChanged { snapshot: panels });
+        }
+    }
+    if changes.workspaces {
+        let snapshot = host.workspace_snapshot()?;
+        let revision = snapshot.revision;
+        signals.push(ControlSignal::WorkspacesSnapshotChanged { snapshot });
+        signals.push(ControlSignal::WorkspacesChanged { revision });
+        signals.push(ControlSignal::PanelsSnapshotChanged {
+            snapshot: host.panels_snapshot(),
+        });
+    }
+    if changes.panels && !changes.windows && !changes.workspaces {
+        signals.push(ControlSignal::PanelsSnapshotChanged {
+            snapshot: host.panels_snapshot(),
+        });
+    }
+    Ok(signals)
+}
+
+fn any_from_flame(error: flamewm_api::FlameError) -> AnyError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
 }
 
 struct ProviderRegistration {
@@ -347,4 +416,311 @@ fn settings_path() -> PathBuf {
             env::var_os("FLAMEWM_CONFIG_DIR").map(|path| PathBuf::from(path).join("settings.toml"))
         })
         .unwrap_or_else(|| PathBuf::from("settings.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use flamewm_api::applications::ApplicationLaunchOptions;
+    use flamewm_api::display::{DisplaySnapshot, OutputSnapshot};
+    use flamewm_api::input::PointerPosition;
+    use flamewm_api::ports::{
+        ApplicationPort, DisplayPort, InputPort, SessionPort, ShortcutPort, WindowPort,
+        WorkspacePort,
+    };
+    use flamewm_api::session::{SessionAction, SessionCapabilities};
+    use flamewm_api::shortcuts::KeyBinding;
+    use flamewm_api::window::WindowSnapshot;
+    use flamewm_api::workspace::{WorkspacePlan, WorkspaceSnapshot};
+    use flamewm_api::{
+        DesktopAppId, FlameResult, ModeId, OutputId, Rect, TransactionId, WindowRef,
+    };
+
+    use super::collect_wm_signals;
+    use crate::wm::WmChangeSet;
+
+    struct FakeEngine {
+        windows: Vec<WindowSnapshot>,
+        workspaces: WorkspaceSnapshot,
+    }
+
+    fn fake_window(id: u64, generation: u64) -> WindowSnapshot {
+        WindowSnapshot {
+            reference: WindowRef::new(id, 0),
+            title: format!("w{id}"),
+            app_id: DesktopAppId::new("org.example.Fake"),
+            outer_geometry: Rect::new(0, 0, 100, 100),
+            restore_geometry: Rect::new(0, 0, 100, 100),
+            state: flamewm_api::window::WindowState::Normal,
+            sticky: false,
+            focused: false,
+            workspace: flamewm_api::WorkspaceRef::new(0, 0),
+            output: OutputId::new("eDP-1"),
+            state_generation: generation,
+        }
+    }
+
+    impl FakeEngine {
+        fn new() -> Self {
+            Self {
+                windows: vec![fake_window(1, 1)],
+                workspaces: WorkspaceSnapshot {
+                    revision: 2,
+                    count: 2,
+                    active_index: 0,
+                    last_index: None,
+                    names: Vec::new(),
+                },
+            }
+        }
+
+        fn host(self) -> PlatformHost<Self> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("flamewm-j13-{}-{id}", std::process::id()));
+            let mut host = PlatformHost::new(self, path);
+            host.start().expect("host starts");
+            host
+        }
+    }
+
+    use flamewm_platform::host::PlatformHost;
+
+    impl WindowPort for FakeEngine {
+        fn get(&self, window: WindowRef) -> FlameResult<WindowSnapshot> {
+            self.windows
+                .iter()
+                .find(|item| item.reference.id == window.id)
+                .cloned()
+                .ok_or_else(|| flamewm_api::FlameError::not_found("missing"))
+        }
+        fn snapshot(&self) -> FlameResult<Vec<WindowSnapshot>> {
+            Ok(self.windows.clone())
+        }
+        fn activate(&mut self, _window: WindowRef) -> FlameResult<()> {
+            Ok(())
+        }
+        fn minimize(&mut self, _window: WindowRef) -> FlameResult<()> {
+            Ok(())
+        }
+        fn maximize(&mut self, _window: WindowRef) -> FlameResult<()> {
+            Ok(())
+        }
+        fn restore(&mut self, _window: WindowRef) -> FlameResult<()> {
+            Ok(())
+        }
+        fn close(&mut self, window: WindowRef) -> FlameResult<()> {
+            self.windows.retain(|item| item.reference.id != window.id);
+            Ok(())
+        }
+        fn set_outer_geometry(&mut self, _window: WindowRef, _geometry: Rect) -> FlameResult<()> {
+            Ok(())
+        }
+        fn work_area(&self, _window: WindowRef) -> FlameResult<Rect> {
+            Ok(Rect::new(0, 0, 1920, 1036))
+        }
+        fn output(&self, _window: WindowRef) -> FlameResult<OutputId> {
+            Ok(OutputId::new("eDP-1"))
+        }
+    }
+
+    impl WorkspacePort for FakeEngine {
+        fn workspace_snapshot(&self) -> FlameResult<WorkspaceSnapshot> {
+            Ok(self.workspaces.clone())
+        }
+        fn activate_workspace(&mut self, index: usize, _revision: u64) -> FlameResult<()> {
+            self.workspaces.active_index = index;
+            self.workspaces.revision += 1;
+            Ok(())
+        }
+        fn move_window_to_workspace(
+            &mut self,
+            _window: WindowRef,
+            _target: usize,
+        ) -> FlameResult<()> {
+            Ok(())
+        }
+        fn switch_workspace_with_window(
+            &mut self,
+            _window: WindowRef,
+            target: usize,
+            revision: u64,
+        ) -> FlameResult<()> {
+            self.activate_workspace(target, revision)
+        }
+        fn apply_workspace_plan(&mut self, _plan: &WorkspacePlan) -> FlameResult<()> {
+            Ok(())
+        }
+    }
+
+    impl DisplayPort for FakeEngine {
+        fn display_snapshot(&self) -> FlameResult<DisplaySnapshot> {
+            Ok(DisplaySnapshot {
+                generation: 1,
+                outputs: vec![OutputSnapshot {
+                    id: OutputId::new("eDP-1"),
+                    connector: "eDP-1".to_owned(),
+                    edid_identity: "panel".to_owned(),
+                    connected: true,
+                    primary: true,
+                    geometry: Rect::new(0, 0, 1920, 1080),
+                    current_mode: ModeId(1),
+                    modes: Vec::new(),
+                    shell_scale_percent: 100,
+                }],
+                pending: None,
+            })
+        }
+        fn apply_mode(&mut self, _output: &OutputId, _mode: ModeId) -> FlameResult<TransactionId> {
+            Ok(TransactionId(1))
+        }
+        fn keep_mode(&mut self, _transaction: TransactionId) -> FlameResult<()> {
+            Ok(())
+        }
+        fn revert_mode(&mut self, _transaction: TransactionId) -> FlameResult<()> {
+            Ok(())
+        }
+    }
+
+    impl ShortcutPort for FakeEngine {
+        fn prepare_shortcuts(
+            &mut self,
+            _desired: &BTreeMap<String, KeyBinding>,
+        ) -> FlameResult<()> {
+            Ok(())
+        }
+        fn commit_shortcuts(&mut self) -> FlameResult<()> {
+            Ok(())
+        }
+        fn rollback_shortcuts(&mut self) {}
+    }
+
+    impl InputPort for FakeEngine {
+        fn root_pointer(&self) -> FlameResult<PointerPosition> {
+            Ok(PointerPosition {
+                root: flamewm_api::Point::new(0, 0),
+                output: None,
+            })
+        }
+    }
+
+    impl ApplicationPort for FakeEngine {
+        fn launch(
+            &mut self,
+            _app: &DesktopAppId,
+            _options: &ApplicationLaunchOptions,
+        ) -> FlameResult<()> {
+            Ok(())
+        }
+        fn launch_uri(&mut self, _uri: &str) -> FlameResult<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionPort for FakeEngine {
+        fn session_capabilities(&self) -> SessionCapabilities {
+            SessionCapabilities {
+                lock: false,
+                logout: false,
+                suspend: false,
+                reboot: false,
+                shutdown: false,
+            }
+        }
+        fn perform_session_action(&mut self, _action: SessionAction) -> FlameResult<()> {
+            Ok(())
+        }
+    }
+
+    fn change(windows: bool, workspaces: bool, panels: bool) -> WmChangeSet {
+        WmChangeSet {
+            windows,
+            workspaces,
+            panels,
+            work_area: false,
+        }
+    }
+
+    fn members(signals: &[flamewm_control_wire::ControlSignal]) -> Vec<&'static str> {
+        signals
+            .iter()
+            .map(|signal| match signal {
+                flamewm_control_wire::ControlSignal::WindowsSnapshotChanged { .. } => {
+                    "WindowsSnapshotChanged"
+                }
+                flamewm_control_wire::ControlSignal::WindowsChanged { .. } => "WindowsChanged",
+                flamewm_control_wire::ControlSignal::WorkspacesSnapshotChanged { .. } => {
+                    "WorkspacesSnapshotChanged"
+                }
+                flamewm_control_wire::ControlSignal::WorkspacesChanged { .. } => {
+                    "WorkspacesChanged"
+                }
+                flamewm_control_wire::ControlSignal::PanelsSnapshotChanged { .. } => {
+                    "PanelsSnapshotChanged"
+                }
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_changeset_emits_no_signals() {
+        let mut host = FakeEngine::new().host();
+        let signals = collect_wm_signals(&mut host, change(false, false, false)).expect("collect");
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn manage_window_emits_windows_plus_panels_once() {
+        let mut host = FakeEngine::new().host();
+        let _ = collect_wm_signals(&mut host, change(true, false, false)).expect("seed");
+        host.engine_mut().windows.push(fake_window(2, 2));
+        let signals = collect_wm_signals(&mut host, change(true, false, false)).expect("collect");
+        assert_eq!(
+            members(&signals),
+            vec![
+                "WindowsSnapshotChanged",
+                "WindowsChanged",
+                "PanelsSnapshotChanged"
+            ]
+        );
+    }
+
+    #[test]
+    fn unchanged_windows_emit_no_window_signals() {
+        let mut host = FakeEngine::new().host();
+        let _ = collect_wm_signals(&mut host, change(true, false, false)).expect("seed");
+        let signals = collect_wm_signals(&mut host, change(true, false, false)).expect("collect");
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn workspace_switch_emits_workspaces_plus_panels() {
+        let mut host = FakeEngine::new().host();
+        let signals = collect_wm_signals(&mut host, change(false, true, false)).expect("collect");
+        assert_eq!(
+            members(&signals),
+            vec![
+                "WorkspacesSnapshotChanged",
+                "WorkspacesChanged",
+                "PanelsSnapshotChanged"
+            ]
+        );
+    }
+
+    #[test]
+    fn work_area_only_emits_nothing() {
+        let mut host = FakeEngine::new().host();
+        let only_area = WmChangeSet {
+            windows: false,
+            workspaces: false,
+            panels: false,
+            work_area: true,
+        };
+        let signals = collect_wm_signals(&mut host, only_area).expect("collect");
+        assert!(signals.is_empty());
+    }
 }

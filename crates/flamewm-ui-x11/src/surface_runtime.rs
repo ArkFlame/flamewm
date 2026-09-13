@@ -3,7 +3,9 @@ use std::os::fd::RawFd;
 use std::collections::HashMap;
 
 use flamewm_render_core::RuntimeDocument;
-use flamewm_render_x11::{SurfaceConfig as RenderSurfaceConfig, SurfaceController, SurfaceId};
+use flamewm_render_x11::{
+    GeometryTrace, SurfaceConfig as RenderSurfaceConfig, SurfaceController, SurfaceId,
+};
 
 use crate::{UiDocumentView, UiTemplate};
 
@@ -101,6 +103,7 @@ impl SurfaceHandle {
 pub enum UiBackendError {
     Renderer(String),
     Document(String),
+    PointerGrabRefused(String),
 }
 
 impl From<String> for UiBackendError {
@@ -156,16 +159,81 @@ impl SurfaceRuntime {
     }
 
     pub fn move_resize(
-        &self,
+        &mut self,
         surface: SurfaceHandle,
         x: i32,
         y: i32,
         width: u32,
         height: u32,
     ) -> Result<(), UiBackendError> {
+        self.move_resize_traced(surface, x, y, width, height, None)
+    }
+
+    /// Traced SurfaceRuntime request: records the ui-request stage under the
+    /// caller's txn, then forwards the same txn to the controller. No X
+    /// roundtrip; observed/retained stages stay in the native owner.
+    pub fn move_resize_traced(
+        &mut self,
+        surface: SurfaceHandle,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        trace: Option<GeometryTrace>,
+    ) -> Result<(), UiBackendError> {
+        let role_label = self
+            .controller
+            .surface_role(surface.0)
+            .map(flamewm_render_x11::surface_role_label)
+            .unwrap_or("unknown");
+        let span = match trace {
+            Some(t) => GeometryTrace {
+                txn: t.txn,
+                surface: surface.0.get(),
+                role: role_label,
+            },
+            None => GeometryTrace::begin(role_label).for_surface(surface.0.get()),
+        };
+        span.ui_request((x, y, width.max(1) as i32, height.max(1) as i32));
         self.controller
-            .move_resize(surface.0, x, y, width, height)
+            .move_resize_traced(surface.0, x, y, width, height, Some(span))
             .map_err(Into::into)
+    }
+
+    /// Debug-only observed-rect probe (retained read, no X sync). Off the
+    /// production hot path; shell debug tooling only.
+    pub fn debug_observed_rect(
+        &self,
+        surface: SurfaceHandle,
+        trace: GeometryTrace,
+    ) -> Result<(i32, i32, i32, i32), UiBackendError> {
+        self.controller
+            .debug_observed_rect(surface.0, trace.for_surface(surface.0.get()))
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// DEBUG-ONLY actual root-rect probe after present (X native owner).
+    /// Normal mode: refuses with zero extra X sync. Debug/test mode: one
+    /// retained root-rect read (no X roundtrip), recorded as the trace
+    /// `observed` stage. Call once per popup show.
+    pub fn debug_probe_root_rect(
+        &self,
+        surface: SurfaceHandle,
+        trace: GeometryTrace,
+    ) -> Result<(i32, i32, i32, i32), UiBackendError> {
+        self.controller
+            .debug_probe_root_rect(surface.0, trace.for_surface(surface.0.get()))
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// DEBUG/TEST-ONLY stacking canary: bottom-to-top creation order must
+    /// satisfy desktop < normal < dock < popup. Zero X sync in all modes.
+    /// `Ok(true)` = passes (leave stacking alone); `Ok(false)` = inverted
+    /// (caller repairs via the existing map/raise owner and reports).
+    pub fn debug_stack_canary(&self) -> Result<bool, UiBackendError> {
+        self.controller
+            .debug_stack_canary()
+            .map_err(UiBackendError::Renderer)
     }
 
     pub fn destroy(&mut self, surface: SurfaceHandle) -> Result<(), UiBackendError> {
@@ -216,13 +284,15 @@ impl SurfaceRuntime {
         // Pass-through surfaces never grab: refuse up front, same as render.
         if let Ok(mode) = self.controller.surface_input_mode(surface.0) {
             if mode == flamewm_render_x11::SurfaceInputMode::PassThrough {
-                return Err(UiBackendError::Renderer(format!(
-                    "surface {} is pass-through; pointer grab refused",
+                return Err(UiBackendError::PointerGrabRefused(format!(
+                    "surface {} is pass-through",
                     surface.0.get()
                 )));
             }
         }
-        self.controller.grab_pointer(surface.0).map_err(Into::into)
+        self.controller
+            .grab_pointer(surface.0)
+            .map_err(UiBackendError::PointerGrabRefused)
     }
 
     pub fn ungrab_pointer(&mut self, surface: SurfaceHandle) -> Result<(), UiBackendError> {
@@ -430,6 +500,99 @@ impl SurfaceRuntime {
         self.node_global_rect(surface, node).ok()
     }
 
+    /// Retained-live surface extent in root space (native origin + size).
+    /// Delegates to the render-owned retained query; no layout recompute.
+    pub fn surface_device_rect(
+        &self,
+        surface: SurfaceHandle,
+    ) -> Result<flamewm_render_core::Rect, UiBackendError> {
+        self.controller
+            .surface_device_rect(surface.0)
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// Retained-live node rect in root space (native origin + scaled box).
+    /// Delegates to the render-owned retained query; no layout recompute.
+    pub fn node_device_rect(
+        &self,
+        surface: SurfaceHandle,
+        node: u32,
+    ) -> Result<flamewm_render_core::Rect, UiBackendError> {
+        self.controller
+            .node_device_rect(surface.0, node)
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// Node rect by string id from retained layout (root-space device rect).
+    pub fn node_device_rect_by_id(
+        &self,
+        surface: SurfaceHandle,
+        id: &str,
+    ) -> Option<flamewm_render_core::Rect> {
+        self.controller.node_device_rect_by_id(surface.0, id).ok()
+    }
+
+    /// Retained intrinsic content size of the document root in device
+    /// pixels. Delegates to the render-owned retained query; the 1350x641
+    /// fallback below stays headless/test-only and is never used by
+    /// mapped-surface queries.
+    pub fn document_intrinsic_device_size(
+        &self,
+        surface: SurfaceHandle,
+    ) -> Result<(f32, f32), UiBackendError> {
+        self.controller
+            .document_intrinsic_device_size(surface.0)
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// Close one surface in the same turn: ungrab-once + unmap +
+    /// Expose-present. Delegates to the render-owned single-turn close.
+    pub fn close_surface(&mut self, surface: SurfaceHandle) -> Result<(), UiBackendError> {
+        self.controller
+            .close_surface(surface.0)
+            .map_err(UiBackendError::Renderer)
+    }
+
+    /// Intrinsic outer size in device pixels under finite device constraints.
+    /// Pure measure path: doc + ui_scale -> logical -> `measure_root` ->
+    /// device. No X11 roundtrip, no hardcoded fallback extent.
+    pub fn measure_outer_intrinsic_device_size(
+        &mut self,
+        surface: SurfaceHandle,
+        max_device_w: f32,
+        max_device_h: f32,
+    ) -> Result<(f32, f32), UiBackendError> {
+        let (max_logical_w, max_logical_h) = device_constraint_to_logical(
+            max_device_w,
+            max_device_h,
+            self.controller
+                .document_mut(surface.0)
+                .map(|document| document.ui_scale())
+                .unwrap_or(1.0),
+        )
+        .map_err(UiBackendError::Document)?;
+        let document = self
+            .controller
+            .document_mut(surface.0)
+            .map_err(UiBackendError::Document)?;
+        let scale = document.ui_scale();
+        let measured = flamewm_render_core::LayoutEngine::measure_root(
+            document,
+            max_logical_w,
+            max_logical_h,
+            flamewm_render_core::InteractionState::default(),
+        )
+        .map_err(|error| UiBackendError::Document(error.to_string()))?;
+        logical_intrinsic_to_device(
+            measured.width,
+            measured.height,
+            scale,
+            max_device_w,
+            max_device_h,
+        )
+        .map_err(UiBackendError::Document)
+    }
+
     /// Intrinsic document size: content extent of the root node.
     pub fn document_intrinsic_size(
         &mut self,
@@ -451,6 +614,56 @@ impl SurfaceRuntime {
     }
 }
 
+/// Device->logical constraint conversion: finite/positive input, finite
+/// positive scale; logical result re-validated by `measure_root`.
+fn device_constraint_to_logical(
+    max_device_w: f32,
+    max_device_h: f32,
+    scale: f32,
+) -> Result<(f32, f32), String> {
+    if !max_device_w.is_finite() || !max_device_h.is_finite() {
+        return Err("intrinsic device constraint must be finite".to_string());
+    }
+    if max_device_w <= 0.0 || max_device_h <= 0.0 {
+        return Err("intrinsic device constraint must be positive".to_string());
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("ui scale must be finite and positive".to_string());
+    }
+    let logical_w = max_device_w / scale;
+    let logical_h = max_device_h / scale;
+    if !logical_w.is_finite() || !logical_h.is_finite() {
+        return Err("intrinsic logical constraint must be finite".to_string());
+    }
+    if logical_w <= 0.0 || logical_h <= 0.0 {
+        return Err("intrinsic logical constraint must be positive".to_string());
+    }
+    Ok((logical_w, logical_h))
+}
+
+/// Logical->device rescale with second validation pass (no rounding drift
+/// past the device constraint).
+fn logical_intrinsic_to_device(
+    logical_w: f32,
+    logical_h: f32,
+    scale: f32,
+    max_device_w: f32,
+    max_device_h: f32,
+) -> Result<(f32, f32), String> {
+    let device_w = logical_w * scale;
+    let device_h = logical_h * scale;
+    if !device_w.is_finite() || !device_h.is_finite() {
+        return Err("intrinsic device size must be finite".to_string());
+    }
+    if device_w <= 0.0 || device_h <= 0.0 {
+        return Err("intrinsic device size must be positive".to_string());
+    }
+    if device_w > max_device_w || device_h > max_device_h {
+        return Err("intrinsic size exceeds constraint".to_string());
+    }
+    Ok((device_w, device_h))
+}
+
 fn document_space_extent(document: &RuntimeDocument) -> (f32, f32) {
     // Last-known surface size is render-owned; fall back to root style size,
     // then to a conservative default so queries stay total without display.
@@ -467,4 +680,46 @@ fn document_space_extent(document: &RuntimeDocument) -> (f32, f32) {
         _ => 641.0,
     };
     (width.max(1.0), height.max(1.0))
+}
+
+#[cfg(test)]
+mod intrinsic_tests {
+    use super::*;
+
+    #[test]
+    fn device_constraint_scales_exact() {
+        let (lw, lh) = device_constraint_to_logical(400.0, 300.0, 2.0).expect("scales");
+        assert_eq!((lw, lh), (200.0, 150.0));
+        let (dw, dh) =
+            logical_intrinsic_to_device(200.0, 100.0, 2.0, 400.0, 300.0).expect("rescales");
+        assert_eq!((dw, dh), (400.0, 200.0));
+        // Exact scale-1.5 roundtrip.
+        let (lw, lh) = device_constraint_to_logical(300.0, 150.0, 1.5).expect("scales");
+        assert!((lw - 200.0).abs() < 0.001 && (lh - 100.0).abs() < 0.001);
+        let (dw, dh) = logical_intrinsic_to_device(lw, lh, 1.5, 300.0, 150.0).expect("rescales");
+        assert!((dw - 300.0).abs() < 0.01 && (dh - 150.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn device_constraint_refuses_bad_input() {
+        for (w, h, s) in [
+            (f32::NAN, 100.0, 1.0),
+            (100.0, f32::INFINITY, 1.0),
+            (0.0, 100.0, 1.0),
+            (100.0, -5.0, 1.0),
+            (100.0, 100.0, 0.0),
+            (100.0, 100.0, f32::NAN),
+        ] {
+            assert!(
+                device_constraint_to_logical(w, h, s).is_err(),
+                "must refuse ({w},{h},scale {s})"
+            );
+        }
+    }
+
+    #[test]
+    fn device_result_over_constraint_refused() {
+        assert!(logical_intrinsic_to_device(200.0, 100.0, 2.0, 300.0, 300.0).is_err());
+        assert!(logical_intrinsic_to_device(100.0, 200.0, 1.0, 100.0, 100.0).is_err());
+    }
 }

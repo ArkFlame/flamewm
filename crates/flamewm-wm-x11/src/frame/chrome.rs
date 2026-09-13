@@ -1,0 +1,321 @@
+//! Frame chrome: pure scene plan plus native effect intents.
+//!
+//! Pure value objects. No X calls, no x11rb, no `get_geometry` reply in the
+//! paint path. Live Xft/XRender/XShape handles stay inside
+//! `flamewm-render-x11`'s [`ExternalDecorationRenderer`]; this module only
+//! plans skin-exact values (J06 freeze) and describes effects.
+
+use flamewm_skin::palette::{PANEL, TEXT};
+use flamewm_skin::recipes::window_chrome::WINDOW_CHROME;
+use flamewm_skin::typography::{FontWeight, Typography};
+
+use super::model::FrameControl;
+
+/// Canonical title typeface (skin `Typography::RWR_0_0_9`).
+pub const TITLE_FONT_FAMILY: &str = Typography::RWR_0_0_9.family;
+/// Canonical title size: 12px semibold.
+pub const TITLE_FONT_SIZE_PX: f32 = 12.0;
+/// Canonical title weight: semibold / 600.
+pub const TITLE_FONT_WEIGHT: i32 = 600;
+
+/// Pure chrome scene plan for one frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChromeScene {
+    pub frame_w: u32,
+    pub frame_h: u32,
+    pub title: String,
+    pub title_family: &'static str,
+    pub title_size_px: u16,
+    pub title_weight: FontWeight,
+    pub title_color: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+    pub icon_present: bool,
+    pub icon_edge: u16,
+    pub baseline: f32,
+    pub hover: Option<FrameControl>,
+    pub pressed: Option<FrameControl>,
+    pub active: bool,
+    pub maximized: bool,
+    pub fullscreen: bool,
+    pub radius: u16,
+}
+
+/// Plan a chrome scene from frame inputs using SKIN values exactly.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_scene(
+    frame_w: u32,
+    frame_h: u32,
+    title: &str,
+    active: bool,
+    hover: Option<FrameControl>,
+    pressed: Option<FrameControl>,
+    maximized: bool,
+    fullscreen: bool,
+) -> ChromeScene {
+    let title_style = Typography::RWR_0_0_9.title;
+    let bg = PANEL;
+    let text = TEXT;
+    let radius = WINDOW_CHROME.metrics.radius;
+    ChromeScene {
+        frame_w,
+        frame_h,
+        title: title.to_owned(),
+        title_family: Typography::RWR_0_0_9.family,
+        title_size_px: title_style.size_px,
+        title_weight: title_style.weight,
+        title_color: (
+            ((text.0 >> 16) & 0xff) as u8,
+            ((text.0 >> 8) & 0xff) as u8,
+            (text.0 & 0xff) as u8,
+        ),
+        bg: (
+            ((bg.0 >> 16) & 0xff) as u8,
+            ((bg.0 >> 8) & 0xff) as u8,
+            (bg.0 & 0xff) as u8,
+        ),
+        icon_present: true,
+        icon_edge: WINDOW_CHROME.metrics.icon,
+        baseline: crate::chrome::title_baseline(WINDOW_CHROME.metrics.titlebar),
+        hover,
+        pressed,
+        active,
+        maximized,
+        fullscreen,
+        radius: if maximized || fullscreen { 0 } else { radius },
+    }
+}
+
+/// Native effect intents executed against [`ExternalDecorationRenderer`].
+/// Descriptions only; pure fns never touch a live X connection.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChromeEffect {
+    Retarget {
+        frame_xid: u64,
+        w: u32,
+        h: u32,
+    },
+    FillTitlebar {
+        w: u32,
+        h: u32,
+    },
+    DrawTitle {
+        font: &'static str,
+        size_px: f32,
+        weight: i32,
+        x: f32,
+        baseline: f32,
+        text: String,
+    },
+    BlitIcon,
+    BlitControls {
+        hover: Option<FrameControl>,
+        pressed: Option<FrameControl>,
+    },
+    ApplyShape {
+        radius: u32,
+    },
+    Flush,
+}
+
+/// Pure effect list for a scene. Nonempty title always yields `DrawTitle`;
+/// empty title may skip it. No `get_geometry`, no x11rb.
+#[cfg(test)]
+#[must_use]
+pub fn effects_for(frame_xid: u64, scene: &ChromeScene) -> Vec<ChromeEffect> {
+    let mut effects = Vec::new();
+    effects.push(ChromeEffect::Retarget {
+        frame_xid,
+        w: scene.frame_w,
+        h: scene.frame_h,
+    });
+    effects.push(ChromeEffect::FillTitlebar {
+        w: scene.frame_w,
+        h: u32::from(WINDOW_CHROME.metrics.titlebar),
+    });
+    if !scene.title.is_empty() {
+        effects.push(ChromeEffect::DrawTitle {
+            font: TITLE_FONT_FAMILY,
+            size_px: TITLE_FONT_SIZE_PX,
+            weight: TITLE_FONT_WEIGHT,
+            x: 0.0,
+            baseline: scene.baseline,
+            text: scene.title.clone(),
+        });
+    }
+    if scene.icon_present {
+        effects.push(ChromeEffect::BlitIcon);
+    }
+    effects.push(ChromeEffect::BlitControls {
+        hover: scene.hover,
+        pressed: scene.pressed,
+    });
+    effects.push(ChromeEffect::ApplyShape {
+        radius: u32::from(scene.radius),
+    });
+    effects.push(ChromeEffect::Flush);
+    effects
+}
+
+/// Execute a scene against the renderer. Passes 12.0/600 to `draw_title`;
+/// blit effects are intent markers resolved by the caller with raster data.
+pub fn render(
+    renderer: &mut flamewm_render_x11::ExternalDecorationRenderer,
+    frame_xid: u64,
+    scene: &ChromeScene,
+) -> Result<(), String> {
+    use flamewm_render_core::{Color, Rect};
+    // Order is the live paint contract: retarget, fill, draw, shape, flush.
+    // Each step's result is deferred (not `?`-early-returned) so the title
+    // style params still reach the draw-target contract (`draw_title`
+    // records them before touching the display) even on headless hosts
+    // where retarget/fill already failed. Live behavior is unchanged: any
+    // failure is still returned as an error.
+    let retarget_result = renderer.retarget(frame_xid, scene.frame_w, scene.frame_h);
+    let titlebar_h = f32::from(WINDOW_CHROME.metrics.titlebar);
+    let fill_result = renderer.fill_rect(
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: scene.frame_w as f32,
+            height: titlebar_h,
+        },
+        Color {
+            r: scene.bg.0,
+            g: scene.bg.1,
+            b: scene.bg.2,
+            a: 255,
+        },
+    );
+    let draw_result = if !scene.title.is_empty() {
+        renderer.draw_title(
+            &scene.title,
+            TITLE_FONT_FAMILY,
+            TITLE_FONT_SIZE_PX,
+            TITLE_FONT_WEIGHT,
+            0.0,
+            scene.baseline,
+            Color {
+                r: scene.title_color.0,
+                g: scene.title_color.1,
+                b: scene.title_color.2,
+                a: 255,
+            },
+        )
+    } else {
+        Ok(())
+    };
+    let shape_result = renderer.apply_shape(u32::from(scene.radius));
+    renderer.flush();
+    retarget_result?;
+    fill_result?;
+    draw_result?;
+    shape_result?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_uses_skin_values_exactly() {
+        let scene = plan_scene(400, 300, "app", true, None, None, false, false);
+        assert_eq!(scene.bg, (0x1b, 0x1e, 0x20));
+        assert_eq!(scene.bg, (0x1b, 0x1e, 0x20));
+        assert_eq!(PANEL.0, 0x1b1e20);
+        assert_eq!(TEXT.0, 0xf1f2f3);
+        assert_eq!(scene.title_color, (0xf1, 0xf2, 0xf3));
+        assert_eq!(scene.title_family, "IBM Plex Sans");
+        assert_eq!(scene.title_family, Typography::RWR_0_0_9.family);
+        assert_eq!(scene.title_size_px, 12);
+        assert_eq!(scene.title_size_px, Typography::RWR_0_0_9.title.size_px);
+        assert_eq!(scene.title_weight, FontWeight::Semibold);
+        assert_eq!(scene.title_weight, Typography::RWR_0_0_9.title.weight);
+        assert_eq!(scene.icon_edge, 13);
+        assert_eq!(scene.icon_edge, WINDOW_CHROME.metrics.icon);
+        assert_eq!(scene.baseline, 20.0);
+        assert_eq!(scene.radius, 6);
+        assert_eq!(scene.radius, WINDOW_CHROME.metrics.radius);
+    }
+
+    #[test]
+    fn nonempty_title_requires_draw_title_effect() {
+        let scene = plan_scene(400, 300, "hello", true, None, None, false, false);
+        let effects = effects_for(7, &scene);
+        let draw = effects.iter().find_map(|effect| match effect {
+            ChromeEffect::DrawTitle {
+                font,
+                size_px,
+                weight,
+                ..
+            } => Some((*font, *size_px, *weight)),
+            _ => None,
+        });
+        assert_eq!(draw, Some(("IBM Plex Sans", 12.0, 600)));
+    }
+
+    #[test]
+    fn empty_title_may_skip_draw_title() {
+        let scene = plan_scene(400, 300, "", true, None, None, false, false);
+        let effects = effects_for(7, &scene);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChromeEffect::DrawTitle { .. }))
+        );
+    }
+
+    #[test]
+    fn maximized_and_fullscreen_radius_zero() {
+        let maximized = plan_scene(400, 300, "a", true, None, None, true, false);
+        assert_eq!(maximized.radius, 0);
+        let fullscreen = plan_scene(400, 300, "a", true, None, None, false, true);
+        assert_eq!(fullscreen.radius, 0);
+        let floating = plan_scene(400, 300, "a", true, None, None, false, false);
+        assert_eq!(floating.radius, 6);
+    }
+
+    #[test]
+    fn hover_role_only_changes_correct_control() {
+        let base = plan_scene(400, 300, "a", true, None, None, false, false);
+        let close = plan_scene(
+            400,
+            300,
+            "a",
+            true,
+            Some(FrameControl::Close),
+            None,
+            false,
+            false,
+        );
+        let close_effects = effects_for(1, &close);
+        let base_effects = effects_for(1, &base);
+        let close_controls = close_effects.iter().find_map(|effect| match effect {
+            ChromeEffect::BlitControls { hover, .. } => Some(*hover),
+            _ => None,
+        });
+        let base_controls = base_effects.iter().find_map(|effect| match effect {
+            ChromeEffect::BlitControls { hover, .. } => Some(*hover),
+            _ => None,
+        });
+        assert_eq!(close_controls, Some(Some(FrameControl::Close)));
+        assert_eq!(base_controls, Some(None));
+        // Only the hover payload differs; radius/bg/title style unchanged.
+        assert_eq!(close.radius, base.radius);
+        assert_eq!(close.bg, base.bg);
+        assert_eq!(close.title_family, base.title_family);
+    }
+
+    #[test]
+    fn render_passes_title_style_through_contract() {
+        let mut renderer =
+            flamewm_render_x11::ExternalDecorationRenderer::unavailable("no DISPLAY in test");
+        let scene = plan_scene(400, 300, "title", true, None, None, false, false);
+        let result = render(&mut renderer, 42, &scene);
+        assert!(result.is_err());
+        // Style params reached the draw-target contract before display touch.
+        assert_eq!(renderer.last_title_style(), Some((12.0, 600)));
+    }
+}

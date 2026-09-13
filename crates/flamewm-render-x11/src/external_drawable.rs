@@ -3,12 +3,13 @@
 //! backends; targets retarget those backends per drawable. No silent
 //! fallback: text/alpha paths error when their backend is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::ptr;
 
 use flamewm_render_core::{Color, Rect, RuntimeDocument};
 
+use super::native::xresource::{X11ResourceAllocator, refresh_image_gauge};
 use super::xft::{XftBackend, xft_measure_estimate};
 use super::xlib::*;
 use super::xrender::XRenderBackend;
@@ -31,6 +32,23 @@ struct ExternalImageKey {
 struct ExternalCachedImage {
     pixmap: Pixmap,
     bytes: usize,
+}
+
+/// Max cached native pixmaps / total native bytes for the image LRU.
+pub const EXTERNAL_IMAGE_CACHE_MAX_ENTRIES: usize = 128;
+pub const EXTERNAL_IMAGE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// MRU touch for the image LRU queue: hit moves `key` to the back
+/// (newest); miss appends. Pure and unit-testable without X.
+fn image_lru_touch(lru: &mut VecDeque<ExternalImageKey>, key: ExternalImageKey) {
+    if let Some(pos) = lru.iter().position(|entry| *entry == key) {
+        lru.remove(pos);
+    }
+    lru.push_back(key);
+    // Hard bound: the queue mirrors at most the entry cap.
+    while lru.len() > EXTERNAL_IMAGE_CACHE_MAX_ENTRIES {
+        lru.pop_front();
+    }
 }
 
 fn external_content_hash(rgba8: &[u8]) -> u64 {
@@ -159,19 +177,30 @@ pub struct ExternalDrawableTarget {
     xft_bound: Drawable,
     xrender_bound: Drawable,
     image_cache: HashMap<ExternalImageKey, ExternalCachedImage>,
+    image_lru: VecDeque<ExternalImageKey>,
+    allocator: X11ResourceAllocator,
 }
 
 impl Drop for ExternalDrawableTarget {
     fn drop(&mut self) {
         if self.session.is_null() || self.image_cache.is_empty() {
+            // Keep the image gauge truthful even when there is nothing to free.
+            if self.image_cache.is_empty() {
+                refresh_image_gauge(0);
+            }
             return;
         }
         let display = unsafe { (*self.session).display };
         for (_, cached) in self.image_cache.drain() {
             if cached.pixmap != 0 {
-                unsafe { XFreePixmap(display, cached.pixmap) };
+                unsafe {
+                    self.allocator
+                        .free_pixmap(display, cached.pixmap, cached.bytes)
+                };
             }
         }
+        self.image_lru.clear();
+        refresh_image_gauge(0);
     }
 }
 
@@ -231,6 +260,8 @@ impl ExternalDrawableTarget {
             xft_bound: drawable,
             xrender_bound: drawable,
             image_cache: HashMap::new(),
+            image_lru: VecDeque::new(),
+            allocator: X11ResourceAllocator::new(),
         })
     }
 
@@ -334,14 +365,48 @@ impl ExternalDrawableTarget {
     pub fn invalidate_image_cache(&mut self) {
         if self.session.is_null() {
             self.image_cache.clear();
+            self.image_lru.clear();
+            refresh_image_gauge(0);
             return;
         }
         let display = unsafe { (*self.session).display };
         for (_, cached) in self.image_cache.drain() {
             if cached.pixmap != 0 {
-                unsafe { XFreePixmap(display, cached.pixmap) };
+                unsafe {
+                    self.allocator
+                        .free_pixmap(display, cached.pixmap, cached.bytes)
+                };
             }
         }
+        self.image_lru.clear();
+        refresh_image_gauge(self.image_cache_bytes() as u64);
+    }
+
+    /// MRU touch for the image LRU: hit moves `key` to the back (newest).
+    /// Pure and unit-testable without X.
+    fn image_lru_touch(&mut self, key: ExternalImageKey) {
+        image_lru_touch(&mut self.image_lru, key);
+    }
+
+    /// Evict oldest entries via the allocator until within both caps.
+    /// Pure accounting + checked frees; updates the image gauge.
+    fn enforce_image_limits(&mut self, display: *mut Display) {
+        while self.image_cache.len() > EXTERNAL_IMAGE_CACHE_MAX_ENTRIES
+            || self.image_cache_bytes() > EXTERNAL_IMAGE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.image_lru.pop_front() else {
+                break;
+            };
+            if let Some(cached) = self.image_cache.remove(&oldest) {
+                if cached.pixmap != 0 && !display.is_null() {
+                    unsafe {
+                        self.allocator
+                            .free_pixmap(display, cached.pixmap, cached.bytes)
+                    };
+                }
+            }
+        }
+        refresh_image_gauge(self.image_cache_bytes() as u64);
     }
 
     pub fn draw_text(
@@ -449,7 +514,9 @@ impl ExternalDrawableTarget {
 
     /// Shared cached-ARGB32 composite. `require_xrender` keeps the semantic
     /// path's explicit error; the straight path keeps its opaque fallback.
-    /// On cache hit the pixmap upload is skipped (zero reupload).
+    /// On cache hit the pixmap upload is skipped (zero reupload) and the
+    /// key is touched MRU; on miss the pixmap goes through the checked
+    /// allocator and the oldest entries are evicted within both caps.
     fn blit_cached_argb32(
         &mut self,
         key: ExternalImageKey,
@@ -459,31 +526,36 @@ impl ExternalDrawableTarget {
         dest: Rect,
         require_xrender: bool,
     ) -> Result<(), String> {
-        let view = self.session_view()?;
-        let (view_display, view_gc, view_screen) = (view.display, view.gc, view.screen);
+        // Borrow the session view once; all pointer fields are Copy.
+        let (view_display, view_gc, view_screen) = {
+            let view = self.session_view()?;
+            (view.display, view.gc, view.screen)
+        };
+        let drawable = self.drawable;
         let pixmap = match self.image_cache.get(&key).copied() {
-            Some(cached) => cached.pixmap,
+            Some(cached) => {
+                self.image_lru_touch(key);
+                cached.pixmap
+            }
             None => {
-                let fresh = unsafe { XCreatePixmap(view_display, self.drawable, w, h, 32) };
-                if fresh == 0 {
-                    return Err("XCreatePixmap failed for external image cache".to_string());
+                let root_w = unsafe { XDisplayWidth(view_display, view_screen) }.max(1) as u32;
+                let root_h = unsafe { XDisplayHeight(view_display, view_screen) }.max(1) as u32;
+                let (fresh, bytes) = unsafe {
+                    self.allocator
+                        .create_pixmap(view_display, drawable, w, h, 32, root_w, root_h)
                 }
+                .map_err(|error| format!("external image cache: {error}"))?;
                 let visual = match match_argb32_visual(view_display, view_screen) {
                     Some(visual) => visual,
                     None => {
-                        unsafe { XFreePixmap(view_display, fresh) };
+                        unsafe { self.allocator.free_pixmap(view_display, fresh, bytes) };
                         return Err("no 32-bit TrueColor visual for external blit".to_string());
                     }
                 };
                 if let Err(error) = upload_argb32(view_display, view_gc, fresh, visual, argb, w, h)
                 {
-                    unsafe { XFreePixmap(view_display, fresh) };
+                    unsafe { self.allocator.free_pixmap(view_display, fresh, bytes) };
                     return Err(error);
-                }
-                let bytes = external_pixmap_byte_estimate(w, h);
-                if bytes == usize::MAX {
-                    unsafe { XFreePixmap(view_display, fresh) };
-                    return Err("external image cache size overflow".to_string());
                 }
                 self.image_cache.insert(
                     key,
@@ -492,7 +564,19 @@ impl ExternalDrawableTarget {
                         bytes,
                     },
                 );
-                fresh
+                self.image_lru_touch(key);
+                self.enforce_image_limits(view_display);
+                // The fresh pixmap may itself have been evicted under memory
+                // pressure if the single entry exceeds the byte cap; in that
+                // case re-resolve what (if anything) survived.
+                match self.image_cache.get(&key).copied() {
+                    Some(cached) => cached.pixmap,
+                    None => {
+                        return Err(
+                            "external image cache entry exceeds byte cap; evicted".to_string()
+                        );
+                    }
+                }
             }
         };
         let (dx, dy) = (dest.x.round() as i32, dest.y.round() as i32);
@@ -617,6 +701,8 @@ impl<'a> NativeDrawableRenderer<'a> {
     /// Blit straight RGBA8 pixels at device rect via ARGB32/XRender.
     /// Same semantics as the canonical scene path: transparent clear is
     /// 0x00000000, compositing is PictOpOver per SurfaceAlphaMode.
+    /// Transient pixmap goes through the checked allocator (validated +
+    /// trapped create, accounted free); errors free before returning.
     pub fn rgba_blit(
         &mut self,
         rgba8: &[u8],
@@ -628,13 +714,21 @@ impl<'a> NativeDrawableRenderer<'a> {
         let h = dest.height.round().max(1.0) as u32;
         let argb = crate::native::image::scale_and_premultiply(rgba8, src_w, src_h, w, h);
         let root = unsafe { XRootWindow(self.app.display, self.app.screen) };
-        let pixmap = unsafe { XCreatePixmap(self.app.display, root, w, h, 32) };
-        if pixmap == 0 {
-            return Err("XCreatePixmap failed for rgba_blit".to_string());
+        let root_w = unsafe { XDisplayWidth(self.app.display, self.app.screen) }.max(1) as u32;
+        let root_h = unsafe { XDisplayHeight(self.app.display, self.app.screen) }.max(1) as u32;
+        let (pixmap, bytes) = unsafe {
+            self.app
+                .allocator
+                .create_pixmap(self.app.display, root, w, h, 32, root_w, root_h)
         }
+        .map_err(|error| format!("rgba_blit: {error}"))?;
         let result = unsafe { self.app.upload_argb32_pub(pixmap, &argb, w, h) };
         if let Err(error) = result {
-            unsafe { XFreePixmap(self.app.display, pixmap) };
+            unsafe {
+                self.app
+                    .allocator
+                    .free_pixmap(self.app.display, pixmap, bytes)
+            };
             return Err(error);
         }
         let dx = dest.x.round() as i32;
@@ -658,7 +752,11 @@ impl<'a> NativeDrawableRenderer<'a> {
             };
             Ok(())
         };
-        unsafe { XFreePixmap(self.app.display, pixmap) };
+        unsafe {
+            self.app
+                .allocator
+                .free_pixmap(self.app.display, pixmap, bytes)
+        };
         blit
     }
 
@@ -1081,6 +1179,33 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn lru_touch_moves_hit_to_back() {
+        let mut lru: VecDeque<ExternalImageKey> = VecDeque::new();
+        let key = |h: u64| ExternalImageKey {
+            content_hash: h,
+            src_w: 1,
+            src_h: 1,
+            dst_w: 1,
+            dst_h: 1,
+            palette: [255, 255, 255, 255],
+        };
+        let (a, b, c) = (key(1), key(2), key(3));
+        image_lru_touch(&mut lru, a);
+        image_lru_touch(&mut lru, b);
+        image_lru_touch(&mut lru, c);
+        // Hit on oldest moves it MRU (back); order becomes b, c, a.
+        image_lru_touch(&mut lru, a);
+        let order: Vec<u64> = lru.iter().map(|entry| entry.content_hash).collect();
+        assert_eq!(order, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn cache_caps_are_sane() {
+        assert_eq!(EXTERNAL_IMAGE_CACHE_MAX_ENTRIES, 128);
+        assert_eq!(EXTERNAL_IMAGE_CACHE_MAX_BYTES, 8 * 1024 * 1024);
     }
 
     #[test]

@@ -10,6 +10,7 @@ repository.workspace = true
 dbus = { version = "=0.9.12", default-features = false }
 flamewm-api = { path = "../flamewm-api" }
 flamewm-dbus-reactor = { path = "../flamewm-dbus-reactor" }
+flamewm-debug = { path = "../flamewm-debug" }
 flamewm-image-core = { path = "../flamewm-image-core" }
 flamewm-integrations-core = { path = "../flamewm-integrations-core" }
 flamewm-profiler = { path = "../flamewm-profiler" }

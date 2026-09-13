@@ -79,7 +79,76 @@ impl LayoutResult {
 
 pub struct LayoutEngine;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IntrinsicSize {
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntrinsicMeasureError {
+    NonFinite,
+    NonPositive,
+    ExceedsConstraint,
+}
+
+impl std::fmt::Display for IntrinsicMeasureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite => write!(f, "intrinsic constraint must be finite"),
+            Self::NonPositive => write!(f, "intrinsic constraint must be positive"),
+            Self::ExceedsConstraint => write!(f, "intrinsic size exceeds constraint"),
+        }
+    }
+}
+
+impl std::error::Error for IntrinsicMeasureError {}
+
 impl LayoutEngine {
+    /// Outer intrinsic size of the document root under finite max constraints.
+    /// Uses `Engine::measure_node(root, max)` only; never reads
+    /// `layout.contents[root]` / `content_extent(root)` (scroll metrics owner).
+    pub fn measure_root(
+        document: &RuntimeDocument,
+        max_w: f32,
+        max_h: f32,
+        interaction: InteractionState,
+    ) -> Result<IntrinsicSize, IntrinsicMeasureError> {
+        if !max_w.is_finite() || !max_h.is_finite() {
+            return Err(IntrinsicMeasureError::NonFinite);
+        }
+        if max_w <= 0.0 || max_h <= 0.0 {
+            return Err(IntrinsicMeasureError::NonPositive);
+        }
+        if document.document.nodes.is_empty() {
+            return Err(IntrinsicMeasureError::NonPositive);
+        }
+        let root = document.document.root;
+        if (root as usize) >= document.document.nodes.len() {
+            return Err(IntrinsicMeasureError::NonPositive);
+        }
+        let mut empty: Vec<LayoutBox> = Vec::new();
+        let probe = Engine {
+            document,
+            interaction,
+            boxes: &mut empty,
+        };
+        // Finite popup constraint only; never f32::MAX here.
+        let (w, h) = probe.measure_node(root, max_w, max_h);
+        if !w.is_finite() || !h.is_finite() {
+            return Err(IntrinsicMeasureError::NonFinite);
+        }
+        if w <= 0.0 || h <= 0.0 {
+            return Err(IntrinsicMeasureError::NonPositive);
+        }
+        if w > max_w || h > max_h {
+            return Err(IntrinsicMeasureError::ExceedsConstraint);
+        }
+        Ok(IntrinsicSize {
+            width: w,
+            height: h,
+        })
+    }
     pub fn compute(
         document: &RuntimeDocument,
         viewport_width: f32,
@@ -199,11 +268,16 @@ impl<'a> Engine<'a> {
         }
         if node.kind == NodeKind::Text {
             let text = self.document.text_for(index);
-            let width = text.chars().count() as f32 * style.font_size * 0.58;
-            let height = style.font_size * 1.30;
+            let laid = crate::text_layout::layout_text(
+                text,
+                style.font_size,
+                avail_w,
+                style.text_wrap,
+                style.break_anywhere,
+            );
             return (
-                clamp_length(width, style.min_width, style.max_width, avail_w),
-                clamp_length(height, style.min_height, style.max_height, avail_h),
+                clamp_length(laid.width, style.min_width, style.max_width, avail_w),
+                clamp_length(laid.height, style.min_height, style.max_height, avail_h),
             );
         }
         if node.kind == NodeKind::Image {
@@ -793,5 +867,125 @@ mod tests {
             let m = metrics(vw, cw);
             assert_eq!(m.thumb_x, Rect::default());
         }
+    }
+
+    fn fixed_doc(w: f32, h: f32) -> RuntimeDocument {
+        let mut root_style = Style::default();
+        root_style.width = Length::Px(w);
+        root_style.height = Length::Px(h);
+        RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![CompiledNode {
+                kind: NodeKind::Element,
+                parent: None,
+                first_child: None,
+                next_sibling: None,
+                id: String::new(),
+                action: String::new(),
+                text: String::new(),
+                image: None,
+                style: root_style,
+                hover_style: None,
+                active_style: None,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn overflow_auto_doc() -> RuntimeDocument {
+        let mut root_style = Style::default();
+        root_style.width = Length::Px(200.0);
+        root_style.height = Length::Px(100.0);
+        root_style.overflow_y = Overflow::Auto;
+        let mut child_style = Style::default();
+        child_style.width = Length::Px(180.0);
+        child_style.height = Length::Px(500.0);
+        RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![
+                CompiledNode {
+                    kind: NodeKind::Element,
+                    parent: None,
+                    first_child: Some(1),
+                    next_sibling: None,
+                    id: String::new(),
+                    action: String::new(),
+                    text: String::new(),
+                    image: None,
+                    style: root_style,
+                    hover_style: None,
+                    active_style: None,
+                },
+                CompiledNode {
+                    kind: NodeKind::Element,
+                    parent: Some(0),
+                    first_child: None,
+                    next_sibling: None,
+                    id: String::new(),
+                    action: String::new(),
+                    text: String::new(),
+                    image: None,
+                    style: child_style,
+                    hover_style: None,
+                    active_style: None,
+                },
+            ],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn measure_root_finite_fixed_popup() {
+        let doc = fixed_doc(200.0, 100.0);
+        let size = LayoutEngine::measure_root(&doc, 800.0, 600.0, InteractionState::default())
+            .expect("finite fixed popup measures");
+        assert_eq!((size.width, size.height), (200.0, 100.0));
+    }
+
+    #[test]
+    fn measure_root_overflow_auto_child_not_max() {
+        let doc = overflow_auto_doc();
+        let size = LayoutEngine::measure_root(&doc, 800.0, 600.0, InteractionState::default())
+            .expect("overflow:auto root measures");
+        assert!(size.width.is_finite() && size.height.is_finite());
+        assert!(size.width < f32::MAX / 2.0 && size.height < f32::MAX / 2.0);
+        assert!(size.width <= 800.0 && size.height <= 600.0);
+        assert_eq!((size.width, size.height), (200.0, 100.0));
+    }
+
+    #[test]
+    fn measure_root_refuses_bad_constraints() {
+        let doc = fixed_doc(200.0, 100.0);
+        for (w, h) in [
+            (f32::NAN, 100.0),
+            (100.0, f32::INFINITY),
+            (f32::INFINITY, f32::INFINITY),
+            (0.0, 100.0),
+            (100.0, 0.0),
+            (-10.0, 100.0),
+            (100.0, -5.0),
+        ] {
+            let err = LayoutEngine::measure_root(&doc, w, h, InteractionState::default())
+                .expect_err("bad constraint must fail");
+            assert!(
+                err == IntrinsicMeasureError::NonFinite
+                    || err == IntrinsicMeasureError::NonPositive,
+                "unexpected {err:?} for ({w},{h})"
+            );
+        }
+    }
+
+    #[test]
+    fn measure_root_result_over_constraint_refused() {
+        let doc = fixed_doc(500.0, 400.0);
+        let err = LayoutEngine::measure_root(&doc, 100.0, 100.0, InteractionState::default())
+            .expect_err("oversize result must fail");
+        assert_eq!(err, IntrinsicMeasureError::ExceedsConstraint);
     }
 }

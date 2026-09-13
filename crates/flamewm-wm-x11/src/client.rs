@@ -2,14 +2,23 @@ use x11rb::protocol::xproto::Window;
 
 use crate::chrome::IconImage;
 use crate::classifier::WindowKind;
+use crate::frame::coords::RootRect;
+use crate::frame::model::{FrameControl, PlacementMode, PlacementState};
 use crate::geometry::Rect;
+use crate::size_hints::ClientSizeHints;
 
 #[derive(Debug, Clone)]
 pub struct ManagedClient {
     pub client: Window,
     pub frame: Window,
+    /// Authoritative geometry + mode. Single source of truth for placement.
+    pub placement: PlacementState,
+    /// Parsed `WM_NORMAL_HINTS` for this client (client-pixel domain).
+    pub hints: ClientSizeHints,
+    /// Legacy `Rect` mirror of `placement.current`, projected on every
+    /// placement write. `wm.rs` hot paths read this; `placement` stays
+    /// authoritative.
     pub outer: Rect,
-    pub restore: Rect,
     pub workspace: usize,
     pub title: String,
     pub title_text_width: i32,
@@ -19,60 +28,113 @@ pub struct ManagedClient {
     pub icon_fallback: Option<String>,
     pub transient_for: Option<Window>,
     pub minimized: bool,
-    pub maximized: bool,
-    pub fullscreen: bool,
     pub sticky: bool,
     pub ignore_unmap: u8,
     pub kind: WindowKind,
-    pub close_hover: bool,
+    /// All-control hover target: `Some` when the pointer is inside the
+    /// titlebar over a control button, else `None`. Motion feeds it;
+    /// the frame redraws only on change.
+    pub hover_control: Option<FrameControl>,
+}
+
+/// Convert a legacy frame `Rect` (u32 size) to a placement `RootRect`.
+#[must_use]
+pub fn rect_to_root(rect: Rect) -> RootRect {
+    RootRect::from_legacy(rect)
+}
+
+/// Convert a placement `RootRect` back to a legacy frame `Rect`.
+#[must_use]
+pub fn root_to_rect(root: RootRect) -> Rect {
+    root.to_legacy()
+}
+
+/// Floating placement with current == floating_restore and no resume.
+#[must_use]
+pub fn placement_floating(current: RootRect) -> PlacementState {
+    PlacementState {
+        mode: PlacementMode::Floating,
+        current,
+        floating_restore: current,
+        resume: None,
+    }
 }
 
 impl ManagedClient {
     pub fn visible_on(&self, workspace: usize) -> bool {
         !self.minimized && (self.sticky || self.workspace == workspace)
     }
-}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ResizeEdges {
-    pub left: bool,
-    pub right: bool,
-    pub top: bool,
-    pub bottom: bool,
-}
-
-impl ResizeEdges {
-    pub const fn any(self) -> bool {
-        self.left || self.right || self.top || self.bottom
+    #[must_use]
+    pub fn is_maximized(&self) -> bool {
+        self.placement.mode == PlacementMode::Maximized
     }
 
     #[must_use]
-    pub fn at(outer_width: u32, outer_height: u32, x: i16, y: i16) -> Self {
-        let threshold = 6_i16;
-        let width = outer_width.clamp(1, u32::from(u16::MAX)) as i16;
-        let height = outer_height.clamp(1, u32::from(u16::MAX)) as i16;
-        Self {
-            left: x <= threshold,
-            right: x >= width.saturating_sub(threshold),
-            top: y <= threshold,
-            bottom: y >= height.saturating_sub(threshold),
+    pub fn is_fullscreen(&self) -> bool {
+        self.placement.mode == PlacementMode::Fullscreen
+    }
+
+    /// Set the authoritative frame rect (floating-restore follows when
+    /// floating; resume snapshot is left for explicit transitions).
+    pub fn set_outer(&mut self, outer: Rect) {
+        let root = rect_to_root(outer);
+        self.placement.current = root;
+        if self.placement.mode == PlacementMode::Floating {
+            self.placement.floating_restore = root;
         }
+        self.outer = outer;
+    }
+
+    /// Adopt an externally computed placement (e.g. geometry planner output).
+    pub fn apply_placement(&mut self, placement: PlacementState) {
+        self.placement = placement;
+        self.outer = root_to_rect(self.placement.current);
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Drag {
-    Move {
-        client: Window,
-        offset_x: i32,
-        offset_y: i32,
-        original: Rect,
-    },
-    Resize {
-        client: Window,
-        root_x: i32,
-        root_y: i32,
-        original: Rect,
-        edges: ResizeEdges,
-    },
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_is_authoritative_over_legacy_mirrors() {
+        let outer = Rect::new(100, 100, 400, 300);
+        let root = rect_to_root(outer);
+        assert_eq!(root_to_rect(root), outer);
+        let floating = placement_floating(root);
+        assert_eq!(floating.mode, PlacementMode::Floating);
+        assert_eq!(floating.floating_restore, root);
+        assert_eq!(floating.resume, None);
+    }
+
+    #[test]
+    fn transition_maximize_and_restore_roundtrip() {
+        let start = RootRect::new(100, 100, 400, 300);
+        let max_rect = RootRect::new(0, 0, 1920, 1080);
+        let floating = placement_floating(start);
+        let mut client = ManagedClient {
+            client: 1,
+            frame: 2,
+            placement: floating,
+            hints: ClientSizeHints::default(),
+            outer: root_to_rect(start),
+            workspace: 0,
+            title: String::new(),
+            title_text_width: 0,
+            icon: None,
+            icon_fallback: None,
+            transient_for: None,
+            minimized: false,
+            sticky: false,
+            ignore_unmap: 0,
+            kind: WindowKind::Normal,
+            hover_control: None,
+        };
+        assert!(!client.is_maximized());
+        assert!(!client.is_fullscreen());
+        client.set_outer(root_to_rect(max_rect));
+        assert_eq!(client.placement.current, max_rect);
+        assert_eq!(client.outer, root_to_rect(max_rect));
+    }
 }

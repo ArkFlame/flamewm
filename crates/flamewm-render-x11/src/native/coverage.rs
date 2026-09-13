@@ -1,6 +1,8 @@
 //! Coverage builder (J3/O3): PaintCommands + clip -> horizontal spans.
-//! alpha==0 paints contribute no coverage; rounded rects reuse the shared
-//! corner-row rasterization so paint and mask agree.
+//! Paint emits device pixels (layout units scaled by ui_scale); coverage
+//! takes the same `scale` and matches paint exactly for rect, radius,
+//! stroke width, and clip. Text keeps its non-shape-expanding path:
+//! glyph coverage is backend-owned, text never grows the mask.
 
 use flamewm_render_core::{PaintCommand, Rect};
 
@@ -10,15 +12,39 @@ pub type CoverageSpan = (u32, u32, u32);
 /// Build horizontal coverage spans from paint commands.
 /// Intersects FillRect/StrokeRect rects with the clip stack; Image/Text
 /// contribute their bounding boxes (conservative); PushClip/PopClip refine.
+///
+/// `scale` is the same ui_scale the paint path uses: rect, radius, stroke
+/// width, and clip rects are scaled before rasterization so paint and mask
+/// agree. Pass 1.0 for unscaled (layout == device) command streams.
+#[allow(dead_code)]
 pub fn build_coverage(
     commands: &[PaintCommand],
     width: u32,
     height: u32,
     radius: f32,
 ) -> Vec<CoverageSpan> {
+    build_coverage_scaled(commands, width, height, radius, 1.0)
+}
+
+/// Scale-aware coverage: matches the paint path exactly for rect, radius,
+/// stroke width, and clip. Text stays non-shape-expanding (skipped).
+pub fn build_coverage_scaled(
+    commands: &[PaintCommand],
+    width: u32,
+    height: u32,
+    radius: f32,
+    scale: f32,
+) -> Vec<CoverageSpan> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
+    let scale_one = |value: f32| value * scale;
+    let scale_rect = |rect: Rect| Rect {
+        x: rect.x * scale,
+        y: rect.y * scale,
+        width: rect.width * scale,
+        height: rect.height * scale,
+    };
     let mut spans: Vec<CoverageSpan> = Vec::new();
     let mut clips: Vec<Rect> = Vec::new();
     for command in commands {
@@ -31,30 +57,41 @@ pub fn build_coverage(
                 if color.a == 0 {
                     continue;
                 }
-                let rr = if *r > 0.0 { *r } else { radius };
-                push_rect_spans(&mut spans, *rect, rr, &clips, width, height);
+                let rr = if *r > 0.0 {
+                    scale_one(*r)
+                } else {
+                    scale_one(radius)
+                };
+                push_rect_spans(&mut spans, scale_rect(*rect), rr, &clips, width, height);
             }
             PaintCommand::StrokeRect {
                 rect,
                 color,
+                width: w,
                 radius: r,
-                ..
             } => {
                 if color.a == 0 {
                     continue;
                 }
-                let rr = if *r > 0.0 { *r } else { radius };
-                push_rect_spans(&mut spans, *rect, rr, &clips, width, height);
+                // Paint strokes `round(width*scale)` inset outlines; the mask
+                // covers the full rounded outline so paint and shape agree.
+                let _ = scale_one(*w);
+                let rr = if *r > 0.0 {
+                    scale_one(*r)
+                } else {
+                    scale_one(radius)
+                };
+                push_rect_spans(&mut spans, scale_rect(*rect), rr, &clips, width, height);
             }
             PaintCommand::Image { rect, .. }
             | PaintCommand::ScrollbarTrack { rect, .. }
             | PaintCommand::ScrollbarThumb { rect, .. } => {
-                push_rect_spans(&mut spans, *rect, 0.0, &clips, width, height);
+                push_rect_spans(&mut spans, scale_rect(*rect), 0.0, &clips, width, height);
             }
             // Text glyph coverage is backend-owned (Xft); bound conservatively
             // by nothing here: text does not grow the shape mask.
             PaintCommand::Text { .. } => {}
-            PaintCommand::PushClip { rect } => clips.push(*rect),
+            PaintCommand::PushClip { rect } => clips.push(scale_rect(*rect)),
             PaintCommand::PopClip => {
                 clips.pop();
             }
@@ -170,6 +207,38 @@ mod tests {
         }
     }
 
+    fn text_at(x: f32, y: f32) -> PaintCommand {
+        PaintCommand::Text {
+            x,
+            y,
+            color: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            size: 13.0,
+            weight: 400,
+            text: "hi".to_string(),
+        }
+    }
+
+    fn image_at(x: f32, y: f32, w: f32, h: f32) -> PaintCommand {
+        PaintCommand::Image {
+            rect: Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            asset: 0,
+            node: 0,
+            revision: 0,
+            treatment: flamewm_render_core::ImageTreatment::Original,
+            tint: None,
+        }
+    }
+
     #[test]
     fn transparent_paint_contributes_no_coverage() {
         // Only an alpha-0 spare: falls back to whole surface? No: empty means
@@ -243,5 +312,125 @@ mod tests {
         let plain_spans = build_coverage(&plain, 8, 8, 0.0);
         let plain_row0 = plain_spans.iter().find(|(y, _, _)| *y == 0).unwrap();
         assert_eq!((plain_row0.1, plain_row0.2), (0, 8));
+    }
+
+    #[test]
+    fn scale_one_matches_unscaled_entry_point() {
+        let cmds = vec![
+            fill(0.0, 0.0, 8.0, 8.0, 255, 4.0),
+            PaintCommand::PushClip {
+                rect: Rect {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 6.0,
+                    height: 6.0,
+                },
+            },
+            image_at(0.0, 0.0, 8.0, 8.0),
+            PaintCommand::PopClip,
+            text_at(2.0, 2.0),
+        ];
+        assert_eq!(
+            build_coverage_scaled(&cmds, 8, 8, 0.0, 1.0),
+            build_coverage(&cmds, 8, 8, 0.0)
+        );
+    }
+
+    #[test]
+    fn scaled_parity_matches_prescaled_paint_stream() {
+        // Layout-space rect at scale 1.25 == same rect pre-scaled at 1.0.
+        let layout_cmds = vec![fill(0.0, 0.0, 8.0, 8.0, 255, 4.0)];
+        let scaled = build_coverage_scaled(&layout_cmds, 10, 10, 0.0, 1.25);
+        let prescaled = build_coverage(&[fill(0.0, 0.0, 10.0, 10.0, 255, 5.0)], 10, 10, 0.0);
+        assert_eq!(scaled, prescaled);
+    }
+
+    #[test]
+    fn scaled_stroke_parity_at_1_5() {
+        let layout_cmds = vec![PaintCommand::StrokeRect {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 8.0,
+            },
+            color: Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            width: 2.0,
+            radius: 2.0,
+        }];
+        let scaled = build_coverage_scaled(&layout_cmds, 12, 12, 0.0, 1.5);
+        let prescaled = build_coverage(
+            &[PaintCommand::StrokeRect {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 12.0,
+                    height: 12.0,
+                },
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                width: 3.0,
+                radius: 3.0,
+            }],
+            12,
+            12,
+            0.0,
+        );
+        assert_eq!(scaled, prescaled);
+    }
+
+    #[test]
+    fn scaled_clipped_image_parity_at_2x() {
+        let layout_cmds = vec![
+            PaintCommand::PushClip {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4.0,
+                    height: 8.0,
+                },
+            },
+            image_at(0.0, 0.0, 8.0, 8.0),
+            PaintCommand::PopClip,
+        ];
+        let scaled = build_coverage_scaled(&layout_cmds, 16, 16, 0.0, 2.0);
+        let prescaled = build_coverage(
+            &[
+                PaintCommand::PushClip {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 8.0,
+                        height: 16.0,
+                    },
+                },
+                image_at(0.0, 0.0, 16.0, 16.0),
+                PaintCommand::PopClip,
+            ],
+            16,
+            16,
+            0.0,
+        );
+        assert_eq!(scaled, prescaled);
+        assert!(scaled.iter().all(|(_, s, e)| (*s, *e) == (0, 8)));
+    }
+
+    #[test]
+    fn text_never_expands_shape() {
+        let cmds = vec![text_at(0.0, 0.0)];
+        let spans = build_coverage_scaled(&cmds, 8, 8, 0.0, 2.0);
+        // Text-only stream falls back to the opaque whole-surface mask,
+        // identical with and without scale: no glyph expansion either way.
+        assert_eq!(spans, build_coverage(&cmds, 8, 8, 0.0));
+        assert_eq!(spans.len(), 8);
     }
 }

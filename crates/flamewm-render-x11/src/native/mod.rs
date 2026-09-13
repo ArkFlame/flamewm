@@ -6,5 +6,6 @@ pub mod cursor;
 pub mod image;
 pub mod surface_format;
 pub mod target;
+pub mod xresource;
 
 pub use target::{PresentationState, presenter_error};

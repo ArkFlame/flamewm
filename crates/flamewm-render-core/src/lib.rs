@@ -2,14 +2,16 @@ pub mod codec;
 pub mod layout;
 pub mod model;
 pub mod paint;
+pub mod text_layout;
 
 pub use codec::{decode, encode};
-pub use layout::{LayoutBox, LayoutEngine, LayoutResult};
+pub use layout::{IntrinsicMeasureError, IntrinsicSize, LayoutBox, LayoutEngine, LayoutResult};
 pub use model::*;
 pub use paint::{
     PaintCommand, build_paint_commands, build_paint_commands_with_scroll, emit_scroll_chrome,
     scroll_clip, scrollbar_visible,
 };
+pub use text_layout::{TextLayout, TextLine, layout_text};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionPhase {

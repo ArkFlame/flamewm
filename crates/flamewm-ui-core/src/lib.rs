@@ -1,5 +1,6 @@
 //! Renderer-neutral FlameWM visual design contracts.
 
+pub mod context_menu;
 pub mod controls;
 pub mod icons;
 pub mod image;

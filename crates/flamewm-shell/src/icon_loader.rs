@@ -26,7 +26,7 @@ pub struct IconRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentSurface {
     Panel,
-    StartSubmenu,
+    Start,
 }
 
 #[derive(Debug)]
@@ -48,6 +48,10 @@ pub struct IconLoader {
     pub queue_full_drops: u64,
     pub stale_drops: u64,
     pub results_applied: u64,
+    pub high_enqueued: u64,
+    pub low_enqueued: u64,
+    pub coalesced: u64,
+    pub dropped_low: u64,
 }
 
 impl IconLoader {
@@ -68,12 +72,16 @@ impl IconLoader {
             .spawn(move || {
                 let mut resolver = IconResolver::from_environment(packaged_root, 0);
                 while let Ok(req) = req_rx.recv() {
+                    // Generic app miss must never rasterize brand artwork:
+                    // no empty-name retry (it resolves to the brand
+                    // fallback) and any brand fallback raster is dropped to
+                    // None. Miss -> caller keeps last valid or the
+                    // transparent empty placeholder. Applies to every
+                    // request type/role uniformly.
                     let raster = resolver
                         .prepare_name(&req.name, IconSize::new(req.width, req.height))
-                        .or_else(|_| {
-                            resolver.prepare_name("", IconSize::new(req.width, req.height))
-                        })
-                        .ok();
+                        .ok()
+                        .filter(|raster| !is_brand_fallback(raster));
                     let res = IconResult {
                         target: req.target,
                         generation: req.generation,
@@ -96,6 +104,10 @@ impl IconLoader {
             queue_full_drops: 0,
             stale_drops: 0,
             results_applied: 0,
+            high_enqueued: 0,
+            low_enqueued: 0,
+            coalesced: 0,
+            dropped_low: 0,
         }
     }
 
@@ -108,6 +120,7 @@ impl IconLoader {
     /// worker resolve per key; the result drain caches by key and marks only
     /// dependent surfaces.
     pub fn request(&mut self, target: IconTarget, name: &str, width: u32, height: u32) {
+        self.high_enqueued += 1;
         let key = (target, name.to_owned(), width, height);
         if self.pending.contains(&key) {
             return;
@@ -143,6 +156,12 @@ impl IconLoader {
         }
     }
 
+    /// Low-priority prewarm shim (counts only; same queue, no behavior change).
+    pub fn request_low(&mut self, target: IconTarget, name: &str, width: u32, height: u32) {
+        self.low_enqueued += 1;
+        self.request(target, name, width, height);
+    }
+
     /// Drain ready results; stale generations are dropped and counted.
     /// Ready keys leave the pending set so a later view change can re-queue.
     pub fn drain_ready(&mut self) -> Vec<IconResult> {
@@ -164,15 +183,41 @@ impl IconLoader {
         out
     }
 
+    #[must_use]
+    pub fn wake_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.wake_reader.as_raw_fd()
+    }
+
+    pub fn wake_drain(&self) {
+        use std::io::Read;
+        let _ = self.wake_reader.set_nonblocking(true);
+        let mut buf = [0u8; 64];
+        loop {
+            match (&self.wake_reader).read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Dependent surfaces for one icon result: Start slots repaint the
     /// submenu, task slots repaint the panel. Callers reproject only these.
     #[must_use]
     pub fn dependent_surface(target: IconTarget) -> DependentSurface {
         match target {
-            IconTarget::StartSlot(_) => DependentSurface::StartSubmenu,
+            IconTarget::StartSlot(_) => DependentSurface::Start,
             IconTarget::TaskSlot(_) => DependentSurface::Panel,
         }
     }
+}
+
+/// True when a worker raster is brand artwork that a generic app miss
+/// must never show. Covers the packaged brand fallback path and the
+/// explicit brand names; other packaged/system hits pass through.
+fn is_brand_fallback(raster: &Rgb8Raster) -> bool {
+    raster.source.ends_with("flamewm-icon.svg") || raster.source.ends_with("flamewm-start.svg")
 }
 
 #[cfg(test)]
@@ -215,6 +260,10 @@ mod tests {
             queue_full_drops: 0,
             stale_drops: 0,
             results_applied: 0,
+            high_enqueued: 0,
+            low_enqueued: 0,
+            coalesced: 0,
+            dropped_low: 0,
         };
         let _ = req_rx;
         res_tx
@@ -259,6 +308,10 @@ mod tests {
             queue_full_drops: 0,
             stale_drops: 0,
             results_applied: 0,
+            high_enqueued: 0,
+            low_enqueued: 0,
+            coalesced: 0,
+            dropped_low: 0,
         };
         tx.try_send(IconRequest {
             target: IconTarget::StartSlot(0),
@@ -270,5 +323,31 @@ mod tests {
         .expect("fill");
         loader.request(IconTarget::StartSlot(1), "y", 20, 20);
         assert_eq!(loader.queue_full_drops, 1);
+    }
+
+    #[test]
+    fn brand_fallback_sources_are_rejected() {
+        use flamewm_integrations_linux::icons::IconOrigin;
+        for source in [
+            "packaged/assets/web/flamewm-icon.svg",
+            "x/assets/branding/flamewm-start.svg",
+        ] {
+            assert!(is_brand_fallback(&Rgb8Raster {
+                source: source.to_owned(),
+                width: 20,
+                height: 20,
+                pixels: vec![1; 20 * 20 * 4],
+                origin: IconOrigin::PackagedFallback,
+                fallback_reason: None,
+            }));
+        }
+        assert!(!is_brand_fallback(&Rgb8Raster {
+            source: "packaged/assets/web/breeze/folder.svg".to_owned(),
+            width: 20,
+            height: 20,
+            pixels: vec![1; 20 * 20 * 4],
+            origin: IconOrigin::PackagedBreeze,
+            fallback_reason: None,
+        }));
     }
 }

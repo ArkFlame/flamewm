@@ -241,7 +241,7 @@ impl fmt::Display for IconError {
     }
 }
 
-pub use crate::icon_theme::{IconDir, IconDirType, IconThemeIndex};
+pub use crate::icon_theme::{IconDir, IconDirType, IconLookupIndex, IconThemeIndex};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
@@ -258,6 +258,43 @@ struct Candidate {
     origin: IconOrigin,
 }
 
+/// Service-level key: purpose + request + size + generations.
+/// Identity match drives slot tracking; workers resolve via `prepare_key`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IconKey {
+    pub purpose: IconLookupPurpose,
+    pub request: IconRequest,
+    pub size: IconSize,
+    pub theme_generation: u64,
+    pub palette_generation: u64,
+}
+
+impl IconKey {
+    #[must_use]
+    pub fn new(
+        purpose: IconLookupPurpose,
+        request: IconRequest,
+        size: IconSize,
+        theme_generation: u64,
+        palette_generation: u64,
+    ) -> Self {
+        Self {
+            purpose,
+            request,
+            size,
+            theme_generation,
+            palette_generation,
+        }
+    }
+}
+
+/// Snapshot of resolver cache pressure (request cache + raster LRU).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IconMetricsSnapshot {
+    pub request_entries: usize,
+    pub request_bytes: usize,
+}
+
 pub struct IconResolver {
     packaged_root: PathBuf,
     theme_names: Vec<String>,
@@ -268,6 +305,7 @@ pub struct IconResolver {
     max_entries: usize,
     theme_caches: ThemeLookupCaches,
     raster: RasterCache,
+    shared_index: std::sync::Arc<IconLookupIndex>,
 }
 
 /// Bounded decoded-raster LRU keyed by path + physical size + origin.
@@ -358,6 +396,11 @@ impl IconResolver {
         data_dirs: Vec<PathBuf>,
         theme_generation: u64,
     ) -> Self {
+        let index = std::sync::Arc::new(IconLookupIndex::build(
+            &theme_names,
+            &data_dirs,
+            theme_generation,
+        ));
         Self {
             packaged_root: packaged_root.into(),
             theme_names: unique_strings(theme_names),
@@ -368,6 +411,86 @@ impl IconResolver {
             max_entries: 1024,
             theme_caches: ThemeLookupCaches::default(),
             raster: RasterCache::default(),
+            shared_index: index,
+        }
+    }
+
+    /// Worker fork seam: shares the immutable lookup index + theme config
+    /// with fresh small private caches (128 entries / 512 KiB raster).
+    #[must_use]
+    pub fn from_shared_index(
+        packaged_root: impl Into<PathBuf>,
+        theme_names: Vec<String>,
+        data_dirs: Vec<PathBuf>,
+        theme_generation: u64,
+        shared_index: std::sync::Arc<IconLookupIndex>,
+    ) -> Self {
+        Self {
+            packaged_root: packaged_root.into(),
+            theme_names: unique_strings(theme_names),
+            data_dirs: unique_paths(data_dirs),
+            theme_generation,
+            palette_generation: 0,
+            cache: HashMap::new(),
+            max_entries: 128,
+            theme_caches: ThemeLookupCaches::default(),
+            raster: RasterCache {
+                budget_bytes: 512 * 1024,
+                used_bytes: 0,
+                entries: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+            },
+            shared_index,
+        }
+    }
+
+    /// Forks a worker from this resolver (shared index, fresh caches).
+    #[must_use]
+    pub fn fork_worker(&self) -> Self {
+        Self::from_shared_index(
+            self.packaged_root.clone(),
+            self.theme_names.clone(),
+            self.data_dirs.clone(),
+            self.theme_generation,
+            std::sync::Arc::clone(&self.shared_index),
+        )
+    }
+
+    /// Sets the shared index (service seam).
+    pub fn set_shared_index(&mut self, index: std::sync::Arc<IconLookupIndex>) {
+        self.shared_index = index;
+    }
+
+    /// The shared generation-scoped lookup index.
+    #[must_use]
+    pub fn shared_index(&self) -> &std::sync::Arc<IconLookupIndex> {
+        &self.shared_index
+    }
+
+    /// Service entry point: resolves by key identity.
+    pub fn prepare_key(&mut self, key: &IconKey) -> Result<Rgba8Raster, IconError> {
+        self.theme_generation = key.theme_generation;
+        self.palette_generation = key.palette_generation;
+        match key.request.clone() {
+            IconRequest::Path(path) => self.prepare_path(path, key.size),
+            IconRequest::Name(name) => match key.purpose {
+                IconLookupPurpose::Semantic => self.prepare_semantic(name, key.size),
+                IconLookupPurpose::Application => self.prepare_application(name, key.size),
+            },
+        }
+    }
+
+    /// Cache-pressure snapshot for service bounds checks.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> IconMetricsSnapshot {
+        let bytes: usize = self
+            .cache
+            .iter()
+            .map(|(k, r)| key_memory(k) + result_memory(r) + 96)
+            .sum();
+        IconMetricsSnapshot {
+            request_entries: self.cache.len(),
+            request_bytes: bytes,
         }
     }
 
@@ -528,7 +651,7 @@ impl IconResolver {
                     resolver.resolve_path_candidate(&path, IconOrigin::ExplicitPath, size)
                 });
             }
-            return self.generic_fallback(size, None);
+            return self.application_miss(None);
         }
         let request = IconRequest::Name(name);
         let key = self.key(IconLookupPurpose::Application, request.clone(), size);
@@ -683,7 +806,7 @@ impl IconResolver {
         size: IconSize,
     ) -> Result<Rgba8Raster, IconError> {
         let candidates = self.application_theme_candidates(request, size);
-        self.resolve_candidates(&candidates, size)
+        self.resolve_application_candidates(&candidates, size)
     }
 
     fn resolve_semantic_name(
@@ -715,6 +838,49 @@ impl IconResolver {
             return self.resolve_candidates_with_error(&candidates, size, candidate_error);
         }
         self.resolve_candidates(&[], size)
+    }
+
+    fn resolve_application_candidates(
+        &mut self,
+        candidates: &[Candidate],
+        size: IconSize,
+    ) -> Result<Rgba8Raster, IconError> {
+        // Application misses are transparent slots, never the brand logo.
+        let mut candidate_error: Option<RasterError> = None;
+        for candidate in candidates {
+            if !self.path_exists(&candidate.path) {
+                continue;
+            }
+            match self.cached_rasterize(&candidate.path, size, candidate.origin) {
+                Ok(raster) => return Ok(raster),
+                Err(error) => {
+                    if candidate_error.is_none() {
+                        candidate_error = Some(error);
+                    }
+                }
+            }
+        }
+        self.application_miss(candidate_error)
+    }
+
+    /// Application miss: transparent empty contract. The shell renders a
+    /// transparent slot; brand artwork stays reserved for explicit flame
+    /// brand requests (`prepare_path`).
+    fn application_miss(
+        &mut self,
+        candidate_error: Option<RasterError>,
+    ) -> Result<Rgba8Raster, IconError> {
+        let fallback = self.packaged_root.join("transparent-slot");
+        let fallback_error = RasterError::Io {
+            path: fallback.clone(),
+            message: "application icon miss: transparent slot, brand fallback suppressed"
+                .to_owned(),
+        };
+        Err(IconError::FallbackUnavailable {
+            fallback,
+            fallback_error: Box::new(fallback_error),
+            candidate_error: candidate_error.map(Box::new),
+        })
     }
 
     fn resolve_candidates(
@@ -1804,6 +1970,33 @@ mod tests {
             .prepare_semantic("j2-cached", size)
             .expect("semantic");
         assert!(resolver.cache_len() > after_first + 1 - 1);
+    }
+
+    #[test]
+    fn application_miss_never_returns_brand_logo() {
+        let dir = test_dir("app-miss");
+        let mut resolver = IconResolver::new(workspace_root(), Vec::new(), vec![dir], 0);
+        let size = IconSize::new(16, 16);
+        let error = resolver
+            .prepare_application("definitely-missing-flamewm-app", size)
+            .expect_err("app miss must not resolve");
+        let message = format!("{error}");
+        assert!(
+            !message.contains("flamewm-icon"),
+            "app miss must not reference brand logo: {message}"
+        );
+        if let IconError::FallbackUnavailable { fallback, .. } = &error {
+            assert!(
+                !fallback.to_string_lossy().ends_with("flamewm-icon.svg")
+                    || !message.contains("packaged icon fallback"),
+                "resolved brand fallback must not be returned for app miss"
+            );
+        }
+        // Cached miss path is identical (no brand raster leaks via cache).
+        let cached = resolver
+            .prepare_application("definitely-missing-flamewm-app", size)
+            .expect_err("cached app miss must not resolve");
+        assert_eq!(format!("{cached}"), message);
     }
 
     #[test]

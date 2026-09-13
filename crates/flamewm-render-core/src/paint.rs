@@ -152,14 +152,26 @@ pub fn build_paint_commands_with_scroll(
                 if color.a != 0 {
                     let text = document.text_for(index as u32);
                     if !text.is_empty() {
-                        commands.push(PaintCommand::Text {
-                            x: rect.x,
-                            y: rect.y + style.font_size,
-                            color,
-                            size: style.font_size,
-                            weight: style.font_weight,
-                            text: text.to_string(),
-                        });
+                        let laid = crate::text_layout::layout_text(
+                            text,
+                            style.font_size,
+                            rect.width.max(0.0),
+                            style.text_wrap,
+                            style.break_anywhere,
+                        );
+                        for (line_index, line) in laid.lines.iter().enumerate() {
+                            if line.text.is_empty() {
+                                continue;
+                            }
+                            commands.push(PaintCommand::Text {
+                                x: rect.x,
+                                y: rect.y + laid.line_height * line_index as f32 + style.font_size,
+                                color,
+                                size: style.font_size,
+                                weight: style.font_weight,
+                                text: line.text.clone(),
+                            });
+                        }
                     }
                 }
             }

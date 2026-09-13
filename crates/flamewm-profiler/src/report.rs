@@ -11,9 +11,15 @@ use std::sync::OnceLock;
 
 static PROCESS_OVERRIDE: OnceLock<&'static str> = OnceLock::new();
 
-/// Set the owning process name once (first call wins).
+/// Set the owning process name once (first call wins). On the winning call,
+/// truncate `$FLAMEWM_PROFILE_DIR/<process>.profile.log` once so each
+/// process generation starts fresh; later calls in the same generation
+/// never wipe appended windows. A restart is a new generation and
+/// truncates again, keeping generations separated.
 pub(crate) fn set_process_override(name: &'static str) {
-    let _ = PROCESS_OVERRIDE.set(name);
+    if PROCESS_OVERRIDE.set(name).is_ok() {
+        truncate_profile_log_once(name);
+    }
 }
 
 fn fmt_ms(ns: u64) -> String {
@@ -33,10 +39,6 @@ fn process_name() -> String {
     })
     .clone()
 }
-
-/// Override the process name used for the log filename (tests only).
-#[cfg(test)]
-pub(crate) fn set_process_name_for_test(_name: &str) {}
 
 /// Sanitize to `[A-Za-z0-9_.-]`; empty becomes `flamewm`.
 pub(crate) fn profile_filename(process: &str) -> String {
@@ -193,6 +195,28 @@ fn append_to_profile_dir(text: &str) {
     {
         use std::io::Write as _;
         let _ = file.write_all(text.as_bytes());
+    }
+}
+
+/// Truncate the per-process profile log once per process generation.
+/// Only the winning `init_process` call truncates; a fresh process
+/// (restart) is a new generation and truncates again.
+fn truncate_profile_log_once(name: &str) {
+    let dir = match std::env::var_os("FLAMEWM_PROFILE_DIR") {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => return,
+    };
+    let path = dir.join(profile_filename(name));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+    {
+        drop(file);
     }
 }
 

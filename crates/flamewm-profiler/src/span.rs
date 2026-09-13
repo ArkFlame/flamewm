@@ -6,7 +6,7 @@
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const MAX_SPANS: usize = 64;
+pub(crate) const MAX_SPANS: usize = 128;
 const MAX_DEPTH: usize = 32;
 
 /// Fixed wall-time histogram buckets (inclusive upper bounds, ns).
@@ -73,7 +73,10 @@ macro_rules! span_slots {
 static SLOTS: [SpanSlot; MAX_SPANS] = span_slots!(
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
-    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73,
+    74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97,
+    98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
+    117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127
 );
 
 /// Resolve a static label to a registry slot, claiming an empty slot once.
@@ -130,6 +133,15 @@ pub(crate) fn record(
         slot.over_16ms.fetch_add(1, Ordering::Relaxed);
     }
     slot.hist[hist_bucket(wall_inclusive_ns)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a pre-measured wall elapsed time under a static label.
+/// Bounded: reuses the fixed slot registry, no allocation, no heap label
+/// keys. CPU components are recorded as zero.
+pub fn record_elapsed(label: &'static str, elapsed: std::time::Duration) {
+    let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let idx = slot_for(label);
+    record(idx, ns, ns, 0, 0);
 }
 
 #[derive(Clone, Copy)]
@@ -423,6 +435,111 @@ mod tests {
         let rows = peek();
         let row = rows.iter().find(|r| r.label == "t_slow").unwrap();
         assert_eq!(row.over_16ms, 1);
+        reset_for_test();
+    }
+
+    fn cap_span_label(i: usize) -> &'static str {
+        match i {
+            0 => "t_cap_span_00",
+            1 => "t_cap_span_01",
+            2 => "t_cap_span_02",
+            3 => "t_cap_span_03",
+            4 => "t_cap_span_04",
+            5 => "t_cap_span_05",
+            6 => "t_cap_span_06",
+            7 => "t_cap_span_07",
+            8 => "t_cap_span_08",
+            9 => "t_cap_span_09",
+            10 => "t_cap_span_10",
+            11 => "t_cap_span_11",
+            12 => "t_cap_span_12",
+            13 => "t_cap_span_13",
+            14 => "t_cap_span_14",
+            15 => "t_cap_span_15",
+            16 => "t_cap_span_16",
+            17 => "t_cap_span_17",
+            18 => "t_cap_span_18",
+            19 => "t_cap_span_19",
+            20 => "t_cap_span_20",
+            21 => "t_cap_span_21",
+            22 => "t_cap_span_22",
+            23 => "t_cap_span_23",
+            24 => "t_cap_span_24",
+            25 => "t_cap_span_25",
+            26 => "t_cap_span_26",
+            27 => "t_cap_span_27",
+            28 => "t_cap_span_28",
+            29 => "t_cap_span_29",
+            30 => "t_cap_span_30",
+            31 => "t_cap_span_31",
+            32 => "t_cap_span_32",
+            33 => "t_cap_span_33",
+            34 => "t_cap_span_34",
+            35 => "t_cap_span_35",
+            36 => "t_cap_span_36",
+            37 => "t_cap_span_37",
+            38 => "t_cap_span_38",
+            39 => "t_cap_span_39",
+            40 => "t_cap_span_40",
+            41 => "t_cap_span_41",
+            42 => "t_cap_span_42",
+            43 => "t_cap_span_43",
+            44 => "t_cap_span_44",
+            45 => "t_cap_span_45",
+            46 => "t_cap_span_46",
+            47 => "t_cap_span_47",
+            48 => "t_cap_span_48",
+            49 => "t_cap_span_49",
+            50 => "t_cap_span_50",
+            51 => "t_cap_span_51",
+            52 => "t_cap_span_52",
+            53 => "t_cap_span_53",
+            54 => "t_cap_span_54",
+            55 => "t_cap_span_55",
+            56 => "t_cap_span_56",
+            57 => "t_cap_span_57",
+            58 => "t_cap_span_58",
+            59 => "t_cap_span_59",
+            60 => "t_cap_span_60",
+            61 => "t_cap_span_61",
+            62 => "t_cap_span_62",
+            63 => "t_cap_span_63",
+            64 => "t_cap_span_64",
+            65 => "t_cap_span_65",
+            66 => "t_cap_span_66",
+            67 => "t_cap_span_67",
+            68 => "t_cap_span_68",
+            69 => "t_cap_span_69",
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn registry_holds_beyond_64_labels() {
+        let _guard = crate::span::TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        crate::point::counter_reset_for_test();
+        const N: usize = 70;
+        for i in 0..N {
+            fake_complete(cap_span_label(i), 1, 1);
+        }
+        // Snapshot owner path: rows come from peek (same registry the
+        // report window drains via snapshot_and_reset).
+        let rows = peek();
+        for i in 0..N {
+            let label = cap_span_label(i);
+            assert!(rows.iter().any(|r| r.label == label), "{}", label);
+        }
+        // Labels 65..N (past the old 64 cap) resolve to distinct slots.
+        let mut idxs = [0usize; N];
+        for i in 0..N {
+            idxs[i] = slot_for(cap_span_label(i));
+        }
+        let mut sorted = idxs.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), N);
+        assert!(N > 64);
         reset_for_test();
     }
 }

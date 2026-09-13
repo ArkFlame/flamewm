@@ -5,14 +5,18 @@ mod chrome;
 mod classifier;
 mod client;
 pub(crate) mod decoration;
+pub mod event_pump;
+mod frame;
 mod geometry;
 mod runtime;
+mod size_hints;
 pub(crate) mod snap_preview;
 mod wm;
 
 pub use runtime::run;
 pub use wm::WmConfig;
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -59,6 +63,8 @@ pub struct X11Desktop {
     atoms: BTreeMap<String, Atom>,
     next_transaction: u64,
     pending_mode: Option<PendingMode>,
+    generations: RefCell<BTreeMap<Window, u64>>,
+    next_generation: Cell<u64>,
 }
 
 impl X11Desktop {
@@ -121,6 +127,8 @@ impl X11Desktop {
             atoms,
             next_transaction: 0,
             pending_mode: None,
+            generations: RefCell::new(BTreeMap::new()),
+            next_generation: Cell::new(1),
         })
     }
 
@@ -163,15 +171,14 @@ impl X11Desktop {
                     .property32(window, "_NET_WM_WINDOW_TYPE")
                     .map(|types| types.contains(&self.atom("_NET_WM_WINDOW_TYPE_DOCK")))
                     .unwrap_or(false);
-                let has_identity = self
-                    .property_bytes(window, "WM_CLASS")
-                    .map(|value| !value.is_empty())
-                    .unwrap_or(false)
-                    || self
-                        .property_bytes(window, "_NET_WM_NAME")
-                        .map(|value| !value.is_empty())
-                        .unwrap_or(false);
-                !is_dock && has_identity
+                // Identity is advisory, not a liveness gate: a freshly
+                // mapped client may not have set WM_CLASS/_NET_WM_NAME yet,
+                // and a dead window must not linger. Liveness is proven by
+                // the window still existing on the server.
+                if is_dock {
+                    return false;
+                }
+                self.conn.get_geometry(window).is_ok()
             })
             .collect())
     }
@@ -196,20 +203,38 @@ impl X11Desktop {
             .map_err(io_error)?;
         self.flush()
     }
+    fn bump_generation(&self, window: Window) -> u64 {
+        let next = self.next_generation.get().max(1);
+        self.next_generation.set(next.saturating_add(1).max(1));
+        self.generations.borrow_mut().insert(window, next);
+        next
+    }
+    fn generation_of(&self, window: Window) -> u64 {
+        *self.generations.borrow().get(&window).unwrap_or(&0)
+    }
+    fn ensure_generation(&self, window: Window) -> u64 {
+        let current = self.generation_of(window);
+        if current != 0 {
+            return current;
+        }
+        self.bump_generation(window)
+    }
     fn check_window(&self, reference: WindowRef) -> FlameResult<Window> {
         if !reference.is_valid() {
             return Err(FlameError::invalid("window reference is invalid"));
         }
-        if reference.generation != 0 {
+        let window = self
+            .managed_windows()?
+            .into_iter()
+            .find(|&window| u64::from(window) == reference.id)
+            .ok_or_else(|| FlameError::not_found("window is not managed by X server"))?;
+        if reference.generation != 0 && reference.generation != self.generation_of(window) {
             return Err(FlameError::new(
                 ErrorCode::StaleRevision,
                 "X11 backend has no matching window generation",
             ));
         }
-        self.managed_windows()?
-            .into_iter()
-            .find(|&window| u64::from(window) == reference.id)
-            .ok_or_else(|| FlameError::not_found("window is not managed by X server"))
+        Ok(window)
     }
     fn root_work_area(&self) -> FlameResult<Rect> {
         let desktop = self
@@ -320,7 +345,7 @@ impl WindowPort for X11Desktop {
             flamewm_api::window::WindowState::Normal
         };
         Ok(flamewm_api::window::WindowSnapshot {
-            reference,
+            reference: WindowRef::new(u64::from(window), self.ensure_generation(window)),
             title,
             app_id: DesktopAppId::new(class),
             outer_geometry: Rect::new(
@@ -344,7 +369,7 @@ impl WindowPort for X11Desktop {
                 == Some(window),
             workspace: WorkspaceRef::new(signed(desktop) as i32, workspace.revision),
             output,
-            state_generation: 0,
+            state_generation: self.generation_of(window),
         })
     }
     fn snapshot(&self) -> FlameResult<Vec<flamewm_api::window::WindowSnapshot>> {
@@ -355,22 +380,25 @@ impl WindowPort for X11Desktop {
             .collect())
     }
     fn activate(&mut self, w: WindowRef) -> FlameResult<()> {
-        self.client_message(
-            self.check_window(w)?,
-            "_NET_ACTIVE_WINDOW",
-            [2, CURRENT_TIME, 0, 0, 0],
-        )
+        let window = self.check_window(w)?;
+        self.bump_generation(window);
+        self.client_message(window, "_NET_ACTIVE_WINDOW", [2, CURRENT_TIME, 0, 0, 0])
     }
     fn minimize(&mut self, w: WindowRef) -> FlameResult<()> {
-        self.conn
-            .unmap_window(self.check_window(w)?)
-            .map_err(io_error)?
-            .check()
-            .map_err(io_error)?;
-        self.flush()
+        // EWMH state route: ADD _NET_WM_STATE_HIDDEN so the in-WM minimize
+        // path runs with ignore_unmap protection and stays managed. Raw
+        // unmap would trigger handle_unmap -> unmanage (self-destruction).
+        let window = self.check_window(w)?;
+        self.bump_generation(window);
+        self.send_state(
+            window,
+            self.atom("_NET_WM_STATE_HIDDEN"),
+            FeatureAction::Add,
+        )
     }
     fn maximize(&mut self, w: WindowRef) -> FlameResult<()> {
         let window = self.check_window(w)?;
+        self.bump_generation(window);
         self.send_state(
             window,
             self.atom("_NET_WM_STATE_MAXIMIZED_VERT"),
@@ -384,6 +412,12 @@ impl WindowPort for X11Desktop {
     }
     fn restore(&mut self, w: WindowRef) -> FlameResult<()> {
         let window = self.check_window(w)?;
+        self.bump_generation(window);
+        self.send_state(
+            window,
+            self.atom("_NET_WM_STATE_HIDDEN"),
+            FeatureAction::Remove,
+        )?;
         self.send_state(
             window,
             self.atom("_NET_WM_STATE_MAXIMIZED_VERT"),
@@ -396,19 +430,20 @@ impl WindowPort for X11Desktop {
         )
     }
     fn close(&mut self, w: WindowRef) -> FlameResult<()> {
-        self.client_message(
-            self.check_window(w)?,
-            "_NET_CLOSE_WINDOW",
-            [CURRENT_TIME, 2, 0, 0, 0],
-        )
+        let window = self.check_window(w)?;
+        self.bump_generation(window);
+        self.generations.borrow_mut().remove(&window);
+        self.client_message(window, "_NET_CLOSE_WINDOW", [CURRENT_TIME, 2, 0, 0, 0])
     }
     fn set_outer_geometry(&mut self, w: WindowRef, geometry: Rect) -> FlameResult<()> {
         if !geometry.is_valid() {
             return Err(FlameError::invalid("window geometry is invalid"));
         }
+        let window = self.check_window(w)?;
+        self.bump_generation(window);
         self.conn
             .configure_window(
-                self.check_window(w)?,
+                window,
                 &xproto::ConfigureWindowAux::new()
                     .x(geometry.x)
                     .y(geometry.y)
@@ -462,7 +497,9 @@ impl WindowPort for X11Desktop {
             WindowFeature::Below => "_NET_WM_STATE_BELOW",
             WindowFeature::DemandsAttention => "_NET_WM_STATE_DEMANDS_ATTENTION",
         };
-        self.send_state(self.check_window(w)?, self.atom(atom), action)
+        let window = self.check_window(w)?;
+        self.bump_generation(window);
+        self.send_state(window, self.atom(atom), action)
     }
 }
 
@@ -504,15 +541,18 @@ impl WorkspacePort for X11Desktop {
             self.root,
             "_NET_CURRENT_DESKTOP",
             [index as u32, CURRENT_TIME, 0, 0, 0],
-        )
+        )?;
+        Ok(())
     }
     fn move_window_to_workspace(&mut self, w: WindowRef, target: usize) -> FlameResult<()> {
         let current = self.workspace_snapshot()?;
         if target >= current.count {
             return Err(FlameError::invalid("workspace index is outside topology"));
         }
+        let window = self.check_window(w)?;
+        self.bump_generation(window);
         self.client_message(
-            self.check_window(w)?,
+            window,
             "_NET_WM_DESKTOP",
             [target as u32, CURRENT_TIME, 0, 0, 0],
         )

@@ -148,6 +148,10 @@ final artifact packaging mode/proof
 
 No executor decisions such as \`choose best approach\`, \`adjust as needed\`, \`fix related places\`, \`wire it up\`, \`handle edge cases\`, or \`investigate and decide\`.
 
+\#\#\# 2.6 Domain complement loader
+
+Before emitting a handoff, load each matching domain complement. \*\*DOMAIN COMPLEMENT LAW:\*\* \`*.rs\`/\`Cargo*\` maps to \`project_sources/STEPWISE_RUST_SYSTEMS_COMPLEMENT.md\`; \`wm-x11\`/\`x11\` maps to the \`x11-window-manager-engineering\` skill. Complements add domain contracts; this planner remains the generic execution law. Recheck source/version facts named by a complement before relying on them.
+
 \---
 
 \#\# 3\. Handoff compiler — mandatory
@@ -566,4 +570,3 @@ RECONCILE EVERY ORIGINAL REQUIREMENT.
 DRAFT \-\> CRITIQUE \-\> REPAIR \-\> RECHECK \-\> EMIT.  
 NO PROOF \= NOT DONE.  
 \`\`\`
-

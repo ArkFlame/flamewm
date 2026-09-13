@@ -213,7 +213,7 @@ impl Default for ShellMetrics {
             clock_line_height: 16,
             popover_offset: 4,
             popover_padding: 13,
-            start_menu_width: 292,
+            start_menu_width: 550,
             start_menu_min_height: 349,
             start_submenu_width: 258,
             tray_popover_width: 310,

@@ -4,22 +4,32 @@
 //! slot edge, catalog `Icon=` rasters once per icon name. Thread-unsafe by
 //! design: owned by the single-threaded WM event loop.
 
-use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::{HashMap, VecDeque};
 
-use crate::chrome::ControlRole;
+#[cfg(test)]
+const TITLE_MEASURE_CACHE_CAPACITY: usize = 1_024;
+#[cfg(test)]
+const ICON_RASTER_CACHE_CAPACITY: usize = 128;
 
 /// WM-owned frame caches: control glyphs, icon rasters, title measures,
 /// profiler hook. Title measures cache the canonical Xft estimate
 /// (`external_text_measure`, IBM Plex Sans) so layout never re-measures
 /// per frame; native pixmap bytes track `external_pixmap_byte_estimate`.
+/// Control glyphs cache two materials per role: the resting glyph and the
+/// semantic hover glyph (white-circle dark-glyph for min/max/restore,
+/// red-circle light-glyph for close), decoded once each.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct DecorationCache {
-    control_glyphs: HashMap<ControlRole, flamewm_image_core::RgbaImage>,
     icon_rasters: HashMap<String, flamewm_integrations_linux::icons::Rgba8Raster>,
+    icon_raster_order: VecDeque<String>,
     title_measures: HashMap<(String, u32), i32>,
+    title_measure_order: VecDeque<(String, u32)>,
     image_cache_bytes: usize,
 }
 
+#[cfg(test)]
 impl DecorationCache {
     #[must_use]
     pub fn new() -> Self {
@@ -27,21 +37,13 @@ impl DecorationCache {
     }
 
     #[must_use]
-    pub fn control_glyph(&self, role: ControlRole) -> Option<flamewm_image_core::RgbaImage> {
-        self.control_glyphs.get(&role).cloned()
-    }
-
-    pub fn insert_control_glyph(
+    pub fn icon_raster(
         &mut self,
-        role: ControlRole,
-        glyph: flamewm_image_core::RgbaImage,
-    ) {
-        self.control_glyphs.insert(role, glyph);
-    }
-
-    #[must_use]
-    pub fn icon_raster(&self, key: &str) -> Option<flamewm_integrations_linux::icons::Rgba8Raster> {
-        self.icon_rasters.get(key).cloned()
+        key: &str,
+    ) -> Option<flamewm_integrations_linux::icons::Rgba8Raster> {
+        let raster = self.icon_rasters.get(key).cloned()?;
+        touch(&mut self.icon_raster_order, &key.to_owned());
+        Some(raster)
     }
 
     pub fn insert_icon_raster(
@@ -49,18 +51,42 @@ impl DecorationCache {
         key: String,
         raster: flamewm_integrations_linux::icons::Rgba8Raster,
     ) {
+        if self.icon_rasters.contains_key(&key) {
+            self.icon_rasters.insert(key.clone(), raster);
+            touch(&mut self.icon_raster_order, &key);
+            return;
+        }
+        evict_oldest(
+            &mut self.icon_rasters,
+            &mut self.icon_raster_order,
+            ICON_RASTER_CACHE_CAPACITY,
+        );
+        self.icon_raster_order.push_back(key.clone());
         self.icon_rasters.insert(key, raster);
     }
 
     #[must_use]
-    pub fn title_measure(&self, title: &str, size_bits: u32) -> Option<i32> {
-        self.title_measures
-            .get(&(title.to_owned(), size_bits))
-            .copied()
+    pub fn title_measure(&mut self, title: &str, size_bits: u32) -> Option<i32> {
+        let key = (title.to_owned(), size_bits);
+        let width = self.title_measures.get(&key).copied()?;
+        touch(&mut self.title_measure_order, &key);
+        Some(width)
     }
 
     pub fn insert_title_measure(&mut self, title: String, size_bits: u32, width: i32) {
-        self.title_measures.insert((title, size_bits), width);
+        let key = (title, size_bits);
+        if self.title_measures.contains_key(&key) {
+            self.title_measures.insert(key.clone(), width);
+            touch(&mut self.title_measure_order, &key);
+            return;
+        }
+        evict_oldest(
+            &mut self.title_measures,
+            &mut self.title_measure_order,
+            TITLE_MEASURE_CACHE_CAPACITY,
+        );
+        self.title_measure_order.push_back(key.clone());
+        self.title_measures.insert(key, width);
     }
 
     /// Native pixmap bytes for the live-target image cache (w*h*4 per
@@ -74,17 +100,12 @@ impl DecorationCache {
         self.image_cache_bytes = self.image_cache_bytes.saturating_add(bytes);
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn clear_image_cache_bytes(&mut self) {
         self.image_cache_bytes = 0;
     }
 
-    #[must_use]
-    pub fn control_glyph_count(&self) -> usize {
-        self.control_glyphs.len()
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[must_use]
     pub fn title_measure_count(&self) -> usize {
         self.title_measures.len()
@@ -93,6 +114,28 @@ impl DecorationCache {
     #[must_use]
     pub fn icon_raster_count(&self) -> usize {
         self.icon_rasters.len()
+    }
+}
+
+#[cfg(test)]
+fn touch<K: Clone + PartialEq>(order: &mut VecDeque<K>, key: &K) {
+    if let Some(position) = order.iter().position(|entry| entry == key) {
+        order.remove(position);
+    }
+    order.push_back(key.clone());
+}
+
+#[cfg(test)]
+fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
+    entries: &mut HashMap<K, V>,
+    order: &mut VecDeque<K>,
+    capacity: usize,
+) {
+    if entries.len() < capacity {
+        return;
+    }
+    if let Some(key) = order.pop_front() {
+        entries.remove(&key);
     }
 }
 
@@ -121,5 +164,42 @@ mod tests {
         assert_eq!(cache.image_cache_bytes(), 24);
         cache.clear_image_cache_bytes();
         assert_eq!(cache.image_cache_bytes(), 0);
+    }
+
+    #[test]
+    fn title_measure_cache_evicts_least_recently_used_entry() {
+        let mut cache = DecorationCache::new();
+        for index in 0..TITLE_MEASURE_CACHE_CAPACITY {
+            cache.insert_title_measure(index.to_string(), 12, index as i32);
+        }
+        assert_eq!(cache.title_measure("0", 12), Some(0));
+        cache.insert_title_measure("new".to_owned(), 12, 7);
+        assert_eq!(cache.title_measure("1", 12), None);
+        assert_eq!(cache.title_measure("0", 12), Some(0));
+        assert_eq!(cache.title_measure_count(), TITLE_MEASURE_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn icon_raster_cache_evicts_least_recently_used_entry() {
+        let mut cache = DecorationCache::new();
+        for index in 0..ICON_RASTER_CACHE_CAPACITY {
+            cache.insert_icon_raster(index.to_string(), test_raster());
+        }
+        assert!(cache.icon_raster("0").is_some());
+        cache.insert_icon_raster("new".to_owned(), test_raster());
+        assert!(cache.icon_raster("1").is_none());
+        assert!(cache.icon_raster("0").is_some());
+        assert_eq!(cache.icon_raster_count(), ICON_RASTER_CACHE_CAPACITY);
+    }
+
+    fn test_raster() -> flamewm_integrations_linux::icons::Rgba8Raster {
+        flamewm_integrations_linux::icons::Rgba8Raster {
+            source: "test".to_owned(),
+            width: 1,
+            height: 1,
+            pixels: vec![0; 4],
+            origin: flamewm_integrations_linux::icons::IconOrigin::PackagedFlame,
+            fallback_reason: None,
+        }
     }
 }

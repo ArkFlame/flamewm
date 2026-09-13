@@ -62,12 +62,6 @@ pub(crate) fn process_delta(window_fallback_ns: u64) -> (u64, u64, f64) {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_process_baseline_for_test() {
-    LAST_PROC_CPU.store(0, Ordering::Relaxed);
-    LAST_PROC_WALL.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

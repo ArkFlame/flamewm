@@ -1,5 +1,9 @@
 //! D-Bus transport glue for the transport-neutral Flame Control protocol.
 
+pub mod mutation_queue;
+
+pub use mutation_queue::{MutationDispatcher, drain_queue_inline};
+
 use std::ffi::CString;
 use std::time::Duration;
 
@@ -364,6 +368,37 @@ mod tests {
         let wire = encode_signal(&signal);
         assert_eq!(decode_signal(&wire), Ok(signal.clone()));
         assert_eq!(decode_bus_signal(&signal_message(&signal)), Some(signal));
+    }
+
+    #[test]
+    fn snapshot_signals_round_trip_through_bus_message() {
+        for signal in [
+            ControlSignal::WindowsSnapshotChanged {
+                revision: 9,
+                windows: Vec::new(),
+            },
+            ControlSignal::WorkspacesSnapshotChanged {
+                snapshot: flamewm_api::workspace::WorkspaceSnapshot {
+                    revision: 3,
+                    count: 1,
+                    active_index: 0,
+                    last_index: None,
+                    names: vec!["1".to_owned()],
+                },
+            },
+            ControlSignal::PanelsSnapshotChanged {
+                snapshot: flamewm_api::panels::PanelsSnapshot {
+                    revision: 4,
+                    panels: Vec::new(),
+                    tasks: Vec::new(),
+                    pinned_apps: Vec::new(),
+                },
+            },
+        ] {
+            let wire = encode_signal(&signal);
+            assert_eq!(decode_signal(&wire), Ok(signal.clone()));
+            assert_eq!(decode_bus_signal(&signal_message(&signal)), Some(signal));
+        }
     }
 
     #[test]

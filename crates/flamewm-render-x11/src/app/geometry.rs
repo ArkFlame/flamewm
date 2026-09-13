@@ -6,7 +6,6 @@ impl X11App {
     /// Transactional geometry commit: retained size -> backbuffer ->
     /// retarget Xft/XRender -> resize window -> shape -> repaint -> flush.
     /// Any failure aborts before partial state; the error is never swallowed.
-    #[allow(dead_code)]
     pub(crate) unsafe fn commit_geometry(
         &mut self,
         document: &RuntimeDocument,

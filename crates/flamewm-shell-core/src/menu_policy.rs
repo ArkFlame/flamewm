@@ -4,7 +4,9 @@
 use flamewm_api::TaskEntryId;
 use flamewm_api::panels::{PanelsSnapshot, TaskEntryKind};
 use flamewm_api::window::WindowSnapshot;
+use flamewm_api::{Point, Rect, Size};
 use flamewm_ui_core::MenuEntry;
+use flamewm_ui_core::context_menu::{self, MIN_ROW_WIDTH, MenuMetrics, MenuPart};
 
 /// Stable context-menu row ids. Rows are keyed by id, never by label.
 pub const TASK_ROW_ACTIVATE: &str = "activate";
@@ -62,4 +64,28 @@ pub fn task_menu_for_entry(
 #[must_use]
 pub fn row_identity(entry: &TaskEntryId, row: &str) -> String {
     format!("{}#{row}", entry.0)
+}
+
+/// C08 shell context-menu geometry. Height derives from the actual visible
+/// part list (one `MenuPart::Row` per visible entry row); minimum width is
+/// the canonical `MIN_ROW_WIDTH`. Only the returned `menu_rect` clamp
+/// touches the work area/output.
+#[must_use]
+pub fn menu_parts_for_rows(visible_rows: usize) -> Vec<MenuPart> {
+    vec![MenuPart::Row; visible_rows.max(1)]
+}
+
+#[must_use]
+pub fn context_menu_min_width() -> i32 {
+    MIN_ROW_WIDTH
+}
+
+#[must_use]
+pub fn context_menu_size(parts: &[MenuPart]) -> Size {
+    context_menu::menu_size(parts, MIN_ROW_WIDTH, MenuMetrics::canonical())
+}
+
+#[must_use]
+pub fn context_menu_rect(work_area: Rect, anchor: Point, size: Size) -> Rect {
+    context_menu::menu_rect(work_area, anchor, size)
 }

@@ -110,6 +110,7 @@ pub fn project(
     windows: &[WindowSnapshot],
     apps: &[DesktopApplication],
 ) -> Vec<TaskVisualState> {
+    let _span = crate::runtime::shell_span("shell.tasks.project").start();
     task_visual_states(panels, windows, apps)
 }
 

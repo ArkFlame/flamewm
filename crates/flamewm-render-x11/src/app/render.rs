@@ -1,6 +1,6 @@
 use super::primitives::scale_rect;
 use super::*;
-use crate::native::coverage::build_coverage;
+use crate::native::coverage::{build_coverage, build_coverage_scaled};
 
 /// Fingerprint of retained scroll state for the paint cache key.
 /// Revision alone is not enough: scroll writes are light-touch.
@@ -148,34 +148,44 @@ impl X11App {
         }
         drop(paint_guard);
         let _present_guard = flamewm_profiler::start("render.present");
-        self.clear_scene()?;
+        {
+            let _clear_guard = flamewm_profiler::start("render.clear");
+            self.clear_scene()?;
+        }
         // Borrow retained commands by index: build fresh only when cache
         // invalid; single coverage/shape per frame; no clone path.
-        let count = self
-            .cached_paint
-            .as_ref()
-            .expect("paint cached above")
-            .commands
-            .len();
-        for index in 0..count {
-            // Borrow retained command without cloning the vector or the
-            // item: raw pointer scoped to one iteration; paint takes &.
-            let command: &PaintCommand = unsafe {
-                let base = self
-                    .cached_paint
-                    .as_ref()
-                    .expect("paint cached above")
-                    .commands
-                    .as_ptr();
-                &*base.add(index)
-            };
-            // SAFETY: redraw is entered only with the app's initialized X11 resources.
-            unsafe { self.paint(command, document, scale)? };
+        {
+            let _draw_guard = flamewm_profiler::start("render.draw");
+            let count = self
+                .cached_paint
+                .as_ref()
+                .expect("paint cached above")
+                .commands
+                .len();
+            for index in 0..count {
+                // Borrow retained command without cloning the vector or the
+                // item: raw pointer scoped to one iteration; paint takes &.
+                let command: &PaintCommand = unsafe {
+                    let base = self
+                        .cached_paint
+                        .as_ref()
+                        .expect("paint cached above")
+                        .commands
+                        .as_ptr();
+                    &*base.add(index)
+                };
+                // SAFETY: redraw is entered only with the app's initialized X11 resources.
+                unsafe { self.paint(command, document, scale)? };
+            }
         }
         unsafe { self.present_scene()? };
+        unsafe { self.bind_presented_backbuffer_as_window_background()? };
         // Single shape per changed frame, from retained commands.
-        let cached = self.cached_paint.as_ref().expect("paint cached above");
-        unsafe { self.refresh_shape_mask_from_coverage(&cached.commands) };
+        {
+            let _shape_guard = flamewm_profiler::start("render.shape");
+            let cached = self.cached_paint.as_ref().expect("paint cached above");
+            unsafe { self.refresh_shape_mask_from_coverage_scaled(&cached.commands, scale) };
+        }
         Ok(())
     }
 
@@ -244,33 +254,123 @@ impl X11App {
 
     /// Present per SurfaceAlphaMode: composited/shape via backbuffer copy,
     /// opaque fallback paints flattened pixels (already flattened in pixel()).
+    ///
+    /// Owner of the retained background pixmap: binds the presented
+    /// backbuffer via XSetWindowBackgroundPixmap so expose repaints reuse
+    /// the last painted frame without recompute. Never binds an unpainted
+    /// pixmap: callers paint first, then call this, then present. The
+    /// previously retired pixmap (kept alive across resize) is released
+    /// only after the replacement is bound.
+    pub(crate) unsafe fn bind_presented_backbuffer_as_window_background(
+        &mut self,
+    ) -> Result<(), String> {
+        if self.backbuffer == 0 {
+            return Err("no backbuffer to bind as window background".to_string());
+        }
+        // Painted by contract: redraw paints before binding; expose returns
+        // only via present_retained (retained scene) or redraw.
+        let (should_bind, _) = background_bind_plan(
+            self.backbuffer,
+            self.background_bound,
+            self.retired_backbuffer,
+            true,
+        );
+        if should_bind {
+            unsafe { XSetWindowBackgroundPixmap(self.display, self.window, self.backbuffer) };
+            self.background_bound = self.backbuffer;
+        }
+        self.release_retired_after_bind();
+        Ok(())
+    }
+
+    fn release_retired_after_bind(&mut self) {
+        let Some((pixmap, bytes)) = self.retired_backbuffer.take() else {
+            return;
+        };
+        if pixmap == 0 || pixmap == self.background_bound {
+            if pixmap != 0 {
+                self.retired_backbuffer = Some((pixmap, bytes));
+            }
+            return;
+        }
+        unsafe {
+            self.allocator.free_pixmap(self.display, pixmap, bytes);
+        }
+        refresh_backbuffer_gauge(self.backbuffer_bytes as u64);
+    }
+}
+
+/// Pure background-pixmap lifecycle decision.
+// Returns (should_bind, releasable_retired): never bind 0 or an unpainted
+// replacement (painted=false); bind only when the painted backbuffer
+// differs from bound; release retired only after the new pixmap is bound.
+pub(crate) fn background_bind_plan(
+    backbuffer: Pixmap,
+    background_bound: Pixmap,
+    retired: Option<(Pixmap, usize)>,
+    painted: bool,
+) -> (bool, bool) {
+    if backbuffer == 0 || !painted {
+        return (false, false);
+    }
+    let should_bind = background_bound != backbuffer;
+    let releasable = match retired {
+        Some((pixmap, _)) => pixmap != 0 && pixmap != backbuffer && should_bind,
+        None => false,
+    };
+    (should_bind, releasable)
+}
+
+impl X11App {
     pub(crate) unsafe fn present_scene(&mut self) -> Result<(), String> {
         unsafe { XSetClipMask(self.display, self.gc, 0) };
         unsafe { XSetClipOrigin(self.display, self.gc, 0, 0) };
-        unsafe {
-            XCopyArea(
-                self.display,
-                self.backbuffer,
-                self.window,
-                self.gc,
-                0,
-                0,
-                self.width,
-                self.height,
-                0,
-                0,
-            )
-        };
-        unsafe { XFlush(self.display) };
+        {
+            let _copy_guard = flamewm_profiler::start("render.copy");
+            unsafe {
+                XCopyArea(
+                    self.display,
+                    self.backbuffer,
+                    self.window,
+                    self.gc,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    0,
+                    0,
+                )
+            };
+        }
+        {
+            let _flush_guard = flamewm_profiler::start("render.flush");
+            unsafe { XFlush(self.display) };
+        }
         Ok(())
     }
 
     /// Visual-coverage shape refresh from the coverage builder.
+    /// Scale-aware shape refresh: coverage matches the paint path for
+    /// rect/radius/stroke/clip in device pixels; text stays skipped.
     pub(crate) unsafe fn refresh_shape_mask_from_coverage(&self, commands: &[PaintCommand]) {
+        unsafe { self.refresh_shape_mask_from_coverage_scaled(commands, 1.0) };
+    }
+
+    /// Scale-aware shape refresh: coverage matches the paint path for
+    /// rect/radius/stroke/clip in device pixels; text stays skipped.
+    pub(crate) unsafe fn refresh_shape_mask_from_coverage_scaled(
+        &self,
+        commands: &[PaintCommand],
+        scale: f32,
+    ) {
         let Some(bridge) = self.xshape.as_ref() else {
             return;
         };
-        let spans = build_coverage(commands, self.width, self.height, 0.0);
+        let spans = if scale == 1.0 {
+            build_coverage(commands, self.width, self.height, 0.0)
+        } else {
+            build_coverage_scaled(commands, self.width, self.height, 0.0, scale)
+        };
         let rects: Vec<(u32, u32, u32)> = spans;
         if rects.is_empty() {
             return;
@@ -516,5 +616,38 @@ impl X11App {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::background_bind_plan;
+
+    #[test]
+    fn never_binds_unpainted_replacement() {
+        let (bind, release) = background_bind_plan(20, 10, Some((10, 64)), false);
+        assert!(!bind && !release);
+    }
+
+    #[test]
+    fn never_binds_zero_backbuffer() {
+        let (bind, release) = background_bind_plan(0, 0, None, true);
+        assert!(!bind && !release);
+    }
+
+    #[test]
+    fn binds_first_painted_frame_without_releasing_live() {
+        let (bind, release) = background_bind_plan(10, 0, None, true);
+        assert!(bind && !release);
+    }
+
+    #[test]
+    fn retains_old_until_replacement_bound() {
+        // Same painted pixmap as bound: no-op, retired stays.
+        let (bind, release) = background_bind_plan(10, 10, Some((5, 64)), true);
+        assert!(!bind && !release);
+        // Replacement painted and differs: bind, then release retired.
+        let (bind, release) = background_bind_plan(20, 10, Some((10, 64)), true);
+        assert!(bind && release);
     }
 }

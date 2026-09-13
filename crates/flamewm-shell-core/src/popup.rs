@@ -69,13 +69,51 @@ pub fn panel_popup_rect(
     .rect
 }
 
-/// Native context-menu width matches `.context-menu` in flamewm.css
-/// (205px) plus its 2x1px border. Height is padding (2x5px) plus one
-/// 31px row per visible row.
+/// Panel work area: pure rect math from resolved snapshot rects.
+/// Subtracts the panel strip along `edge` from `output_rect` using the
+/// already-scaled `panel_rect` (HiDPI baked in). Clamps to non-negative
+/// extents; handles negative origins.
+#[must_use]
+pub fn work_area_for_panel(output_rect: Rect, panel_rect: Rect, edge: PanelEdge) -> Rect {
+    match edge {
+        PanelEdge::Bottom => {
+            let height = (panel_rect.y - output_rect.y).clamp(0, output_rect.height.max(0));
+            Rect::new(
+                output_rect.x,
+                output_rect.y,
+                output_rect.width.max(0),
+                height,
+            )
+        }
+        PanelEdge::Top => {
+            let top = panel_rect.bottom().max(output_rect.y);
+            let height = (output_rect.bottom() - top).max(0);
+            Rect::new(output_rect.x, top, output_rect.width.max(0), height)
+        }
+        PanelEdge::Left => {
+            let left = panel_rect.right().max(output_rect.x);
+            let width = (output_rect.right() - left).max(0);
+            Rect::new(left, output_rect.y, width, output_rect.height.max(0))
+        }
+        PanelEdge::Right => {
+            let width = (panel_rect.x - output_rect.x).clamp(0, output_rect.width.max(0));
+            Rect::new(
+                output_rect.x,
+                output_rect.y,
+                width,
+                output_rect.height.max(0),
+            )
+        }
+    }
+}
+
+/// Native context-menu geometry (C08): width is the canonical outer
+/// minimum (195px row + 2x5px padding = 205px, border-box); height derives
+/// from the actual visible parts (one 31px row each + 2x5px padding).
+/// Only `menu_rect` clamps to the work area/output.
 #[must_use]
 pub fn context_menu_size(visible_rows: usize) -> Size {
-    let rows = visible_rows.max(1) as i32;
-    Size::new(207, 10 + rows * 31)
+    crate::menu_policy::context_menu_size(&crate::menu_policy::menu_parts_for_rows(visible_rows))
 }
 
 /// Pointer-anchored popup rect: point-anchored at the root click point,
@@ -88,13 +126,219 @@ pub fn context_menu_rect(
     pointer: Option<Point>,
     size: Size,
 ) -> Rect {
-    let Some(pointer) = pointer else {
-        return Rect::new(output_rect.x, output_rect.y, size.width, size.height);
-    };
     let _ = output;
-    Rect::new(pointer.x, pointer.y, size.width, size.height).clamp_inside(output_rect)
+    let anchor = pointer.unwrap_or(Point::new(output_rect.x, output_rect.y));
+    crate::menu_policy::context_menu_rect(output_rect, anchor, size)
 }
 
+/// Popup open refusal: the caller must not map a surface without a
+/// measured layout and a resolved anchor. Mapping at 0,0 is never a valid
+/// fallback for status/Start popovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupRefusal {
+    /// Intrinsic document size unavailable (layout pending).
+    PendingLayout,
+    /// Anchor node rect unavailable (anchor pending).
+    PendingAnchor,
+    /// Pointer grab contention (transient; retry on next toggle).
+    PointerGrabRefused,
+}
+
+impl std::fmt::Display for PopupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PendingLayout => write!(f, "popup layout pending measurement"),
+            Self::PendingAnchor => write!(f, "popup anchor pending resolution"),
+            Self::PointerGrabRefused => write!(f, "popup pointer grab refused"),
+        }
+    }
+}
+
+/// Measured placement: source rect + intrinsic size placed with
+/// `PopoverGeometry::place_aligned` + the given align, clamped to the work
+/// area. Refuses `PendingAnchor`/`PendingLayout` instead of falling back
+/// to 0,0.
+#[must_use]
+pub fn measured_popup_rect(
+    source: Option<Rect>,
+    intrinsic: Option<Size>,
+    edge: PopoverEdge,
+    align: flamewm_ui_core::popover::PopoverAlign,
+    work_area: Rect,
+    offset: i32,
+) -> Result<Rect, PopupRefusal> {
+    let source = source.ok_or(PopupRefusal::PendingAnchor)?;
+    let size = intrinsic.ok_or(PopupRefusal::PendingLayout)?;
+    if size.width <= 0 || size.height <= 0 {
+        return Err(PopupRefusal::PendingLayout);
+    }
+    let geometry = PopoverGeometry::place_aligned(source, size, edge, align, work_area, offset);
+    let rect = Rect::from_parts(geometry.origin, size);
+    Ok(rect)
+}
+
+/// Start-menu fitted placement: pure rect math with no runtime state.
+/// The popup opens adjacent to `anchor` on the side opposite `panel_edge`
+/// and its extent along the opening axis is capped to the space available
+/// in `work_area` minus `gap`. The cross axis is clamped inside the work
+/// area without changing the adjacent edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartPlacement {
+    pub rect: Rect,
+    pub content_was_capped: bool,
+}
+
+#[must_use]
+pub fn fitted_start_placement(
+    anchor: Rect,
+    intrinsic: Size,
+    panel_edge: PanelEdge,
+    work_area: Rect,
+    gap: i32,
+) -> Result<StartPlacement, PopupRefusal> {
+    if intrinsic.width <= 0 || intrinsic.height <= 0 {
+        return Err(PopupRefusal::PendingLayout);
+    }
+    let area_w = work_area.width.max(0);
+    let area_h = work_area.height.max(0);
+    match panel_edge {
+        PanelEdge::Bottom => {
+            let available = anchor.y - work_area.y - gap;
+            if available <= 0 {
+                return Err(PopupRefusal::PendingLayout);
+            }
+            let height = intrinsic.height.min(available);
+            let width = intrinsic.width.min(area_w);
+            let y = anchor.y - gap - height;
+            let x = clamp_start(anchor.x, width, work_area.x, work_area.right());
+            Ok(StartPlacement {
+                rect: Rect::new(x, y, width, height),
+                content_was_capped: width != intrinsic.width || height != intrinsic.height,
+            })
+        }
+        PanelEdge::Top => {
+            let available = work_area.bottom() - anchor.bottom() - gap;
+            if available <= 0 {
+                return Err(PopupRefusal::PendingLayout);
+            }
+            let height = intrinsic.height.min(available);
+            let width = intrinsic.width.min(area_w);
+            let y = anchor.bottom() + gap;
+            let x = clamp_start(anchor.x, width, work_area.x, work_area.right());
+            Ok(StartPlacement {
+                rect: Rect::new(x, y, width, height),
+                content_was_capped: width != intrinsic.width || height != intrinsic.height,
+            })
+        }
+        PanelEdge::Left => {
+            let available = work_area.right() - anchor.right() - gap;
+            if available <= 0 {
+                return Err(PopupRefusal::PendingLayout);
+            }
+            let width = intrinsic.width.min(available);
+            let height = intrinsic.height.min(area_h);
+            let x = anchor.right() + gap;
+            let y = clamp_start(anchor.y, height, work_area.y, work_area.bottom());
+            Ok(StartPlacement {
+                rect: Rect::new(x, y, width, height),
+                content_was_capped: width != intrinsic.width || height != intrinsic.height,
+            })
+        }
+        PanelEdge::Right => {
+            let available = anchor.x - work_area.x - gap;
+            if available <= 0 {
+                return Err(PopupRefusal::PendingLayout);
+            }
+            let width = intrinsic.width.min(available);
+            let height = intrinsic.height.min(area_h);
+            let x = anchor.x - gap - width;
+            let y = clamp_start(anchor.y, height, work_area.y, work_area.bottom());
+            Ok(StartPlacement {
+                rect: Rect::new(x, y, width, height),
+                content_was_capped: width != intrinsic.width || height != intrinsic.height,
+            })
+        }
+    }
+}
+
+fn clamp_start(pos: i32, len: i32, area_pos: i32, area_end: i32) -> i32 {
+    let max_pos = area_end - len;
+    if max_pos <= area_pos {
+        area_pos
+    } else {
+        pos.clamp(area_pos, max_pos)
+    }
+}
+
+#[cfg(test)]
+mod work_area_tests {
+    use super::*;
+
+    #[test]
+    fn bottom_excludes_panel_strip() {
+        let output = Rect::new(0, 0, 1920, 1080);
+        let panel = Rect::new(0, 1036, 1920, 44);
+        assert_eq!(
+            work_area_for_panel(output, panel, PanelEdge::Bottom),
+            Rect::new(0, 0, 1920, 1036)
+        );
+    }
+
+    #[test]
+    fn top_excludes_panel_strip() {
+        let output = Rect::new(0, 0, 1920, 1080);
+        let panel = Rect::new(0, 0, 1920, 44);
+        assert_eq!(
+            work_area_for_panel(output, panel, PanelEdge::Top),
+            Rect::new(0, 44, 1920, 1036)
+        );
+    }
+
+    #[test]
+    fn left_and_right_exclude_panel_strip() {
+        let output = Rect::new(0, 0, 1920, 1080);
+        assert_eq!(
+            work_area_for_panel(output, Rect::new(0, 0, 44, 1080), PanelEdge::Left),
+            Rect::new(44, 0, 1876, 1080)
+        );
+        assert_eq!(
+            work_area_for_panel(output, Rect::new(1876, 0, 44, 1080), PanelEdge::Right),
+            Rect::new(0, 0, 1876, 1080)
+        );
+    }
+
+    #[test]
+    fn negative_origins_preserved() {
+        let output = Rect::new(-1920, 0, 1920, 1080);
+        assert_eq!(
+            work_area_for_panel(output, Rect::new(-1920, 1036, 1920, 44), PanelEdge::Bottom),
+            Rect::new(-1920, 0, 1920, 1036)
+        );
+        assert_eq!(
+            work_area_for_panel(output, Rect::new(-44, 0, 44, 1080), PanelEdge::Right),
+            Rect::new(-1920, 0, 1876, 1080)
+        );
+    }
+
+    #[test]
+    fn hidpi_thickness_already_in_panel_rect() {
+        // 200% scale: 44 logical -> 88 physical; caller passes the
+        // already-scaled panel rect, so no scale math happens here.
+        let output = Rect::new(0, 0, 3840, 2160);
+        let panel = Rect::new(0, 2072, 3840, 88);
+        assert_eq!(
+            work_area_for_panel(output, panel, PanelEdge::Bottom),
+            Rect::new(0, 0, 3840, 2072)
+        );
+    }
+
+    #[test]
+    fn oversized_panel_clamps_to_zero() {
+        let output = Rect::new(0, 0, 100, 100);
+        let area = work_area_for_panel(output, Rect::new(0, -50, 100, 200), PanelEdge::Bottom);
+        assert!(area.height >= 0 && area.width >= 0);
+    }
+}
 /// Context-menu placement: Below/Start preferred, Above/Start opposite.
 /// Caps height to the work area and reports scrolling when capped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,5 +389,230 @@ pub fn context_menu_placement(
     ContextMenuPlacement {
         rect,
         requires_scroll,
+    }
+}
+
+#[cfg(test)]
+mod measured_tests {
+    use super::*;
+    use flamewm_ui_core::popover::{PopoverAlign, PopoverEdge};
+
+    fn work_area(width: i32, height: i32) -> Rect {
+        Rect::new(0, 0, width, height)
+    }
+
+    fn bottom_panel_anchor(area: Rect) -> Rect {
+        Rect::new(area.right() - 100, area.bottom() - 44, 30, 44)
+    }
+
+    #[test]
+    fn status_popover_right_aligned_above_panel_all_resolutions() {
+        for (width, height) in [(1350, 641), (1920, 1080), (2560, 1440)] {
+            let area = work_area(width, height);
+            let anchor = bottom_panel_anchor(area);
+            let size = Size::new(310, 200);
+            let rect = measured_popup_rect(
+                Some(anchor),
+                Some(size),
+                PopoverEdge::Above,
+                PopoverAlign::End,
+                area,
+                8,
+            )
+            .expect("measured");
+            assert_eq!((rect.width, rect.height), (310, 200), "{width}x{height}");
+            assert_eq!(
+                rect.right(),
+                anchor.right().min(area.right()),
+                "{width}x{height}"
+            );
+            assert!(
+                rect.x >= area.x && rect.right() <= area.right(),
+                "{width}x{height}"
+            );
+            assert!(
+                rect.y >= area.y && rect.bottom() <= area.bottom(),
+                "{width}x{height}"
+            );
+            assert!(rect.bottom() <= anchor.y, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn start_root_anchored_left_above_panel_all_resolutions() {
+        for (width, height) in [(1350, 641), (1920, 1080), (2560, 1440)] {
+            let area = work_area(width, height);
+            let anchor = Rect::new(area.x, area.bottom() - 44, 43, 44);
+            let size = Size::new(292, 380);
+            let rect = measured_popup_rect(
+                Some(anchor),
+                Some(size),
+                PopoverEdge::Above,
+                PopoverAlign::Start,
+                area,
+                8,
+            )
+            .expect("measured");
+            assert_eq!((rect.x, rect.width), (anchor.x, 292), "{width}x{height}");
+            assert!(rect.bottom() <= anchor.y, "{width}x{height}");
+            assert!(rect.y >= area.y, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn measured_refuses_without_layout_or_anchor() {
+        let area = work_area(1920, 1080);
+        assert_eq!(
+            measured_popup_rect(
+                None,
+                Some(Size::new(10, 10)),
+                PopoverEdge::Above,
+                PopoverAlign::End,
+                area,
+                8
+            ),
+            Err(PopupRefusal::PendingAnchor)
+        );
+        assert_eq!(
+            measured_popup_rect(
+                Some(Rect::new(0, 0, 10, 10)),
+                None,
+                PopoverEdge::Above,
+                PopoverAlign::End,
+                area,
+                8
+            ),
+            Err(PopupRefusal::PendingLayout)
+        );
+    }
+}
+
+#[cfg(test)]
+mod fitted_start_tests {
+    use super::*;
+
+    #[test]
+    fn bottom_normal() {
+        let area = Rect::new(0, 0, 1920, 1080);
+        let anchor = Rect::new(10, 1036, 43, 44);
+        let p = fitted_start_placement(anchor, Size::new(292, 380), PanelEdge::Bottom, area, 8)
+            .expect("placed");
+        assert!(!p.content_was_capped);
+        assert_eq!((p.rect.width, p.rect.height), (292, 380));
+        assert_eq!(p.rect.bottom(), anchor.y - 8);
+    }
+
+    #[test]
+    fn bottom_too_tall_caps() {
+        let area = Rect::new(0, 0, 1920, 1080);
+        let anchor = Rect::new(10, 300, 43, 44);
+        let p = fitted_start_placement(anchor, Size::new(292, 600), PanelEdge::Bottom, area, 8)
+            .expect("placed");
+        assert!(p.content_was_capped);
+        assert_eq!(p.rect.height, 300 - 8);
+        assert_eq!(p.rect.bottom(), anchor.y - 8);
+    }
+
+    #[test]
+    fn top_normal_and_too_tall() {
+        let area = Rect::new(0, 0, 1920, 1080);
+        let anchor = Rect::new(10, 0, 43, 44);
+        let p = fitted_start_placement(anchor, Size::new(292, 380), PanelEdge::Top, area, 8)
+            .expect("placed");
+        assert!(!p.content_was_capped);
+        assert_eq!(p.rect.y, anchor.bottom() + 8);
+        assert_eq!((p.rect.width, p.rect.height), (292, 380));
+        let p2 = fitted_start_placement(anchor, Size::new(292, 2000), PanelEdge::Top, area, 8)
+            .expect("placed");
+        assert!(p2.content_was_capped);
+        assert_eq!(p2.rect.height, area.bottom() - anchor.bottom() - 8);
+        assert_eq!(p2.rect.y, anchor.bottom() + 8);
+    }
+
+    #[test]
+    fn left_and_right() {
+        let area = Rect::new(0, 0, 1920, 1080);
+        let anchor = Rect::new(0, 100, 44, 43);
+        let p = fitted_start_placement(anchor, Size::new(200, 150), PanelEdge::Left, area, 8)
+            .expect("placed");
+        assert_eq!(p.rect.x, anchor.right() + 8);
+        assert_eq!((p.rect.width, p.rect.height), (200, 150));
+        let anchor_r = Rect::new(1876, 100, 44, 43);
+        let q = fitted_start_placement(anchor_r, Size::new(200, 150), PanelEdge::Right, area, 8)
+            .expect("placed");
+        assert_eq!(q.rect.right(), anchor_r.x - 8);
+        assert_eq!((q.rect.width, q.rect.height), (200, 150));
+    }
+
+    #[test]
+    fn horizontal_clamp_preserves_adjacency() {
+        let area = Rect::new(0, 0, 1920, 1080);
+        let anchor = Rect::new(1900, 1036, 20, 44);
+        let p = fitted_start_placement(anchor, Size::new(400, 200), PanelEdge::Bottom, area, 8)
+            .expect("placed");
+        assert_eq!(p.rect.bottom(), anchor.y - 8);
+        assert_eq!(p.rect.right(), area.right());
+        assert_eq!(p.rect.height, 200);
+    }
+
+    #[test]
+    fn zero_extent_refusal() {
+        let area = Rect::new(0, 0, 1920, 1080);
+        assert!(
+            fitted_start_placement(
+                Rect::new(10, 8, 43, 44),
+                Size::new(292, 380),
+                PanelEdge::Bottom,
+                area,
+                8
+            )
+            .is_err()
+        );
+        assert!(
+            fitted_start_placement(
+                Rect::new(10, 1036, 43, 44),
+                Size::new(0, 380),
+                PanelEdge::Bottom,
+                area,
+                8
+            )
+            .is_err()
+        );
+        assert!(
+            fitted_start_placement(
+                Rect::new(10, 1036, 43, 44),
+                Size::new(292, 0),
+                PanelEdge::Bottom,
+                area,
+                8
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nonzero_origin() {
+        let area = Rect::new(-1920, 0, 1920, 1080);
+        let anchor = Rect::new(-1900, 1036, 43, 44);
+        let p = fitted_start_placement(anchor, Size::new(292, 380), PanelEdge::Bottom, area, 8)
+            .expect("placed");
+        assert_eq!(p.rect.bottom(), anchor.y - 8);
+        assert!(p.rect.x >= area.x && p.rect.right() <= area.right());
+    }
+
+    #[test]
+    fn all_resolutions() {
+        for (w, h) in [(1350, 641), (1920, 1080), (2560, 1440)] {
+            let area = Rect::new(0, 0, w, h);
+            let anchor = Rect::new(area.x, area.bottom() - 44, 43, 44);
+            let p = fitted_start_placement(anchor, Size::new(292, 380), PanelEdge::Bottom, area, 8)
+                .expect("placed");
+            assert_eq!(p.rect.bottom(), anchor.y - 8, "{w}x{h}");
+            assert!(p.rect.y >= area.y, "{w}x{h}");
+            let anchor_t = Rect::new(area.x, area.y, 43, 44);
+            let q = fitted_start_placement(anchor_t, Size::new(292, 380), PanelEdge::Top, area, 8)
+                .expect("placed");
+            assert_eq!(q.rect.y, anchor_t.bottom() + 8, "{w}x{h}");
+        }
     }
 }

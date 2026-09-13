@@ -1,14 +1,7 @@
 use flamewm_reactor::Reactor;
 use flamewm_render_x11::SurfaceControllerEvent;
 
-use crate::input::action_scroll_delta;
 use crate::{SurfaceEvent, SurfaceRuntime, UiBackendError};
-
-/// True when a surface event is a Button4/5 wheel tick (semantic scroll,
-/// never a press/release). Translation happens once via [`action_scroll_delta`].
-pub fn is_wheel_scroll_event(event: &SurfaceEvent) -> bool {
-    action_scroll_delta(&event.action).is_some()
-}
 
 pub fn pump_events<F>(
     runtime: &mut SurfaceRuntime,

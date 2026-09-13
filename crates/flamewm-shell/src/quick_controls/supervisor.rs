@@ -1,0 +1,385 @@
+//! Parent-facing supervisor for the standalone quick-control host.
+//!
+//! Owns a [`std::process::Child`], polls with `try_wait` only (never blocks),
+//! bounds restarts, reaps on poll (no zombies), and shuts down idempotently.
+
+use std::process::Child;
+
+use super::protocol::{encode_command, Command, OpenRequest};
+
+pub const DEFAULT_MAX_RESTARTS: u32 = 3;
+
+#[derive(Debug)]
+pub enum SupervisorError {
+    Io(std::io::Error),
+    NotRunning,
+    RestartBudgetExhausted,
+    WouldBlock,
+}
+
+impl core::fmt::Display for SupervisorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "supervisor i/o: {e}"),
+            Self::NotRunning => write!(f, "quick-control host not running"),
+            Self::RestartBudgetExhausted => write!(f, "restart budget exhausted"),
+            Self::WouldBlock => write!(f, "quick-control host stdin backpressure"),
+        }
+    }
+}
+
+impl std::error::Error for SupervisorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::NotRunning | Self::RestartBudgetExhausted | Self::WouldBlock => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for SupervisorError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Pure seam: classify a write failure. WouldBlock becomes
+/// backpressure (nonfatal); anything else stays an I/O error.
+fn classify_write_error(error: std::io::Error) -> SupervisorError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        SupervisorError::WouldBlock
+    } else {
+        SupervisorError::Io(error)
+    }
+}
+
+/// Pure seam: CLOSE/SHUTDOWN swallow WouldBlock (best-effort).
+fn close_result(result: Result<(), SupervisorError>) -> Result<(), SupervisorError> {
+    match result {
+        Err(SupervisorError::WouldBlock) => Ok(()),
+        other => other,
+    }
+}
+
+/// Pure seam: OPEN coalesces to newest — a stalled request is replaced.
+fn coalesce_pending_open(slot: &mut Option<OpenRequest>, req: OpenRequest) {
+    *slot = Some(req);
+}
+fn set_stdin_nonblocking(child: &mut Child) -> Result<(), SupervisorError> {
+    use std::os::unix::io::AsFd;
+    let stdin = child.stdin.as_mut().ok_or(SupervisorError::NotRunning)?;
+    let flags = rustix::fs::fcntl_getfl(stdin.as_fd())
+        .map_err(|e| SupervisorError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))?;
+    rustix::fs::fcntl_setfl(stdin.as_fd(), flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|e| SupervisorError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))?;
+    Ok(())
+}
+
+pub struct QuickControlSupervisor {
+    child: Option<Child>,
+    program: String,
+    restarts: u32,
+    max_restarts: u32,
+    shut_down: bool,
+    pending: Option<OpenRequest>,
+}
+
+impl QuickControlSupervisor {
+    #[must_use]
+    pub fn new(program: String) -> Self {
+        Self::with_max_restarts(program, DEFAULT_MAX_RESTARTS)
+    }
+
+    #[must_use]
+    pub fn with_max_restarts(program: String, max_restarts: u32) -> Self {
+        Self {
+            child: None,
+            program,
+            restarts: 0,
+            max_restarts,
+            shut_down: false,
+            pending: None,
+        }
+    }
+
+    /// Spawn the host after the panel is up. Marks child stdin
+    /// O_NONBLOCK (rustix) so parent writes never block the shell loop;
+    /// a full pipe surfaces as WouldBlock backpressure (nonfatal).
+    pub fn start_after_panel(&mut self) -> Result<(), SupervisorError> {
+        if self.child.is_some() {
+            return Ok(());
+        }
+        self.shut_down = false;
+        let mut child = std::process::Command::new(&self.program)
+            .arg("--quick-control-host")
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        set_stdin_nonblocking(&mut child)?;
+        self.child = Some(child);
+        Ok(())
+    }
+
+    /// Nonblocking write of one encoded line. WouldBlock maps to
+    /// SupervisorError::WouldBlock (nonfatal backpressure), never blocks.
+    fn send(&mut self, cmd: &Command) -> Result<(), SupervisorError> {
+        use std::io::Write;
+        let child = self.child.as_mut().ok_or(SupervisorError::NotRunning)?;
+        let stdin = child.stdin.as_mut().ok_or(SupervisorError::NotRunning)?;
+        let line = encode_command(cmd);
+        let buf = format!("{line}\n");
+        match stdin.write_all(buf.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(classify_write_error(e)),
+        }
+    }
+
+    /// OPEN coalesces to newest: the newest request replaces any stalled
+    /// one; no synchronous retry after WouldBlock, the next tick's newest
+    /// state wins (caller passes latest state).
+    pub fn open(&mut self, req: OpenRequest) -> Result<(), SupervisorError> {
+        coalesce_pending_open(&mut self.pending, req.clone());
+        let result = self.send(&Command::Open(req));
+        if result.is_ok() {
+            self.pending = None;
+        }
+        result
+    }
+
+    /// CLOSE/SHUTDOWN are best-effort: WouldBlock is swallowed so a stalled
+    /// pipe never blocks shutdown paths.
+    pub fn close(&mut self) -> Result<(), SupervisorError> {
+        close_result(self.send(&Command::Close))
+    }
+
+    /// Non-blocking poll: reaps an exited child (`try_wait`), counts one
+    /// restart while budget remains, and never treats a nonzero exit as
+    /// fatal by itself. Returns the exit status when the child exited.
+    pub fn poll(&mut self) -> Result<Option<std::process::ExitStatus>, SupervisorError> {
+        let exited = match self.child.as_mut() {
+            None => return Ok(None),
+            Some(child) => child.try_wait()?,
+        };
+        let status = match exited {
+            None => return Ok(None),
+            Some(s) => s,
+        };
+        // Reaped via try_wait above; drop handle so no zombie lingers.
+        self.child = None;
+        if self.shut_down {
+            return Ok(Some(status));
+        }
+        if self.restarts >= self.max_restarts {
+            return Err(SupervisorError::RestartBudgetExhausted);
+        }
+        self.restarts += 1;
+        let mut child = std::process::Command::new(&self.program)
+            .arg("--quick-control-host")
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        set_stdin_nonblocking(&mut child)?;
+        self.child = Some(child);
+        Ok(Some(status))
+    }
+
+    /// Idempotent shutdown: best-effort Shutdown line + kill, then reap.
+    /// Safe to call repeatedly or when never started.
+    pub fn shutdown(&mut self) -> Result<(), SupervisorError> {
+        self.shut_down = true;
+        if let Some(mut child) = self.child.take() {
+            let _ = self.send_to(&mut child, &Command::Shutdown);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+
+    fn send_to(&self, child: &mut Child, cmd: &Command) -> Result<(), SupervisorError> {
+        use std::io::Write;
+        let line = encode_command(cmd);
+        match child.stdin.as_mut() {
+            Some(stdin) => {
+                let buf = format!("{line}\n");
+                match stdin.write_all(buf.as_bytes()) {
+                    Ok(()) => Ok(()),
+                    // Best-effort shutdown path: never block, never fail.
+                    Err(_) => Ok(()),
+                }
+            }
+            None => Ok(()),
+        }
+    }
+
+    #[must_use]
+    pub fn restart_count(self: &Self) -> u32 {
+        self.restarts
+    }
+
+    #[must_use]
+    pub fn is_running(self: &Self) -> bool {
+        self.child.is_some()
+    }
+}
+
+impl Drop for QuickControlSupervisor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quick_controls::protocol::QuickControlKind;
+    use flamewm_api::{PanelEdge, Rect};
+
+    fn req() -> OpenRequest {
+        OpenRequest {
+            kind: QuickControlKind::Audio,
+            anchor: Rect::new(0, 0, 10, 10),
+            work_area: Rect::new(0, 0, 100, 100),
+            panel_edge: PanelEdge::Bottom,
+        }
+    }
+
+    #[test]
+    fn fake_child_nonzero_exit_is_nonfatal() {
+        // `false` exits 1 immediately: poll reaps it and restarts.
+        let mut sup = QuickControlSupervisor::with_max_restarts("false".to_owned(), 5);
+        sup.start_after_panel().expect("spawn false");
+        // Wait briefly for the trivial child to exit.
+        for _ in 0..50 {
+            if sup.poll().is_ok() && sup.restart_count() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(sup.restart_count() > 0, "expected a restart after exit 1");
+        sup.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn restart_budget_is_bounded() {
+        let mut sup = QuickControlSupervisor::with_max_restarts("false".to_owned(), 1);
+        sup.start_after_panel().expect("spawn");
+        let mut exhausted = false;
+        for _ in 0..400 {
+            match sup.poll() {
+                Err(SupervisorError::RestartBudgetExhausted) => {
+                    exhausted = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(exhausted, "expected bounded restart budget to exhaust");
+        assert!(sup.restart_count() <= 1);
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_open_after_shutdown_fails_cleanly() {
+        let mut sup = QuickControlSupervisor::new("false".to_owned());
+        // Never started: still Ok.
+        sup.shutdown().expect("first shutdown");
+        sup.shutdown().expect("second shutdown");
+        assert!(matches!(sup.open(req()), Err(SupervisorError::NotRunning)));
+        assert!(matches!(sup.poll(), Ok(None)));
+    }
+
+    #[test]
+    fn full_stdin_pipe_is_nonblocking_wouldblock_immediate() {
+        // `sleep` holds the read end open without draining: writes must
+        // return WouldBlock instead of blocking the parent.
+        let mut sup = QuickControlSupervisor::new("sleep".to_owned());
+        // Spawn `sleep 30` directly to keep the pipe open and undrained.
+        sup.child = Some(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        set_stdin_nonblocking(sup.child.as_mut().expect("child")).expect("nonblocking stdin");
+        use std::io::Write;
+        let stdin = sup.child.as_mut().unwrap().stdin.as_mut().unwrap();
+        // Fill the pipe until the kernel refuses; must stay nonblocking.
+        let start = std::time::Instant::now();
+        let chunk = [0u8; 65536];
+        let mut saw_wouldblock = false;
+        for _ in 0..256 {
+            match stdin.write(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    saw_wouldblock = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected write error: {e}"),
+            }
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+        }
+        assert!(saw_wouldblock, "expected pipe to exert backpressure");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "write must be immediate, not blocked"
+        );
+        // A new OPEN after the stall is still nonblocking (WouldBlock, not hang).
+        let open_start = std::time::Instant::now();
+        let result = sup.open(req());
+        assert!(matches!(result, Err(SupervisorError::WouldBlock)));
+        assert!(open_start.elapsed() < std::time::Duration::from_secs(2));
+        // CLOSE/SHUTDOWN lines are best-effort: WouldBlock swallowed.
+        assert!(sup.close().is_ok());
+        sup.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn open_after_stall_stays_nonblocking() {
+        // Direct WouldBlock mapping: a second OPEN after backpressure
+        // returns immediately rather than blocking the shell loop.
+        let mut sup = QuickControlSupervisor::new("sleep".to_owned());
+        sup.child = Some(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        set_stdin_nonblocking(sup.child.as_mut().expect("child")).expect("nonblocking stdin");
+        use std::io::Write;
+        let chunk = [0u8; 65536];
+        for _ in 0..256 {
+            let stdin = sup.child.as_mut().unwrap().stdin.as_mut().unwrap();
+            match stdin.write(&chunk) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let start = std::time::Instant::now();
+        let _ = sup.open(req());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        sup.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn pure_seams_cover_backpressure_coalesce_best_effort() {
+        // classify_write_error: WouldBlock is nonfatal backpressure.
+        let wb = classify_write_error(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert!(matches!(wb, SupervisorError::WouldBlock));
+        let io = classify_write_error(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(matches!(io, SupervisorError::Io(_)));
+        // close_result: WouldBlock swallowed, real I/O still fatal.
+        assert!(close_result(Err(SupervisorError::WouldBlock)).is_ok());
+        assert!(close_result(Ok(())).is_ok());
+        // coalesce_pending_open: newest OPEN replaces the stalled one.
+        let mut slot: Option<OpenRequest> = None;
+        coalesce_pending_open(&mut slot, req());
+        assert!(slot.is_some());
+        let mut newer = req();
+        newer.anchor = Rect::new(5, 5, 10, 10);
+        coalesce_pending_open(&mut slot, newer);
+        assert_eq!(slot.unwrap().anchor.x, 5);
+    }
+}

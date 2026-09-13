@@ -91,92 +91,15 @@ pub struct IconThemeIndex {
 /// use [`IconThemeCaches::stats`] / `memory_estimate_bytes`.
 #[derive(Clone, Debug, Default)]
 pub struct IconThemeCaches {
-    roots: HashMap<(String, u64), Vec<PathBuf>>,
-    indexes: HashMap<(String, u64), Option<IconThemeIndex>>,
-    inheritance: HashMap<(String, u64), Vec<String>>,
     exists: HashMap<(PathBuf, u64), bool>,
+    inheritance: HashMap<(String, u64), Vec<String>>,
+    index: HashMap<(String, u64), Option<IconThemeIndex>>,
+    roots: HashMap<(String, u64), Vec<PathBuf>>,
     hits: u64,
     misses: u64,
 }
 
 impl IconThemeCaches {
-    fn roots(&mut self, theme: &str, generation: u64) -> Option<Vec<PathBuf>> {
-        let key = (theme.to_owned(), generation);
-        if let Some(hit) = self.roots.get(&key) {
-            self.hits += 1;
-            return Some(hit.clone());
-        }
-        self.misses += 1;
-        None
-    }
-
-    pub(crate) fn cached_roots(&mut self, theme: &str, generation: u64) -> Option<Vec<PathBuf>> {
-        self.roots(theme, generation)
-    }
-
-    pub(crate) fn store_roots(&mut self, theme: &str, generation: u64, roots: Vec<PathBuf>) {
-        bound_insert(&mut self.roots, (theme.to_owned(), generation), roots, 512);
-    }
-
-    fn index(&mut self, theme: &str, generation: u64) -> Option<Option<IconThemeIndex>> {
-        let key = (theme.to_owned(), generation);
-        if let Some(hit) = self.indexes.get(&key) {
-            self.hits += 1;
-            return Some(hit.clone());
-        }
-        self.misses += 1;
-        None
-    }
-
-    pub(crate) fn cached_index(
-        &mut self,
-        theme: &str,
-        generation: u64,
-    ) -> Option<Option<IconThemeIndex>> {
-        self.index(theme, generation)
-    }
-
-    pub(crate) fn store_index(
-        &mut self,
-        theme: &str,
-        generation: u64,
-        index: Option<IconThemeIndex>,
-    ) {
-        bound_insert(
-            &mut self.indexes,
-            (theme.to_owned(), generation),
-            index,
-            256,
-        );
-    }
-
-    fn inheritance(&mut self, seeds: &str, generation: u64) -> Option<Vec<String>> {
-        let key = (seeds.to_owned(), generation);
-        if let Some(hit) = self.inheritance.get(&key) {
-            self.hits += 1;
-            return Some(hit.clone());
-        }
-        self.misses += 1;
-        None
-    }
-
-    pub(crate) fn cached_inheritance(
-        &mut self,
-        seeds: &str,
-        generation: u64,
-    ) -> Option<Vec<String>> {
-        self.inheritance(seeds, generation)
-    }
-
-    pub(crate) fn store_inheritance(&mut self, seeds: &str, generation: u64, ordered: Vec<String>) {
-        bound_insert(
-            &mut self.inheritance,
-            (seeds.to_owned(), generation),
-            ordered,
-            128,
-        );
-    }
-
     fn exists(&mut self, path: &Path, generation: u64) -> Option<bool> {
         let key = (path.to_path_buf(), generation);
         if let Some(hit) = self.exists.get(&key) {
@@ -200,7 +123,63 @@ impl IconThemeCaches {
         );
     }
 
-    /// (hits, misses) across roots/index/inheritance/exists lookups.
+    pub(crate) fn cached_inheritance(&mut self, key: &str, generation: u64) -> Option<Vec<String>> {
+        let k = (key.to_owned(), generation);
+        if let Some(hit) = self.inheritance.get(&k) {
+            self.hits += 1;
+            return Some(hit.clone());
+        }
+        self.misses += 1;
+        None
+    }
+
+    pub(crate) fn store_inheritance(&mut self, key: &str, generation: u64, value: Vec<String>) {
+        bound_insert(
+            &mut self.inheritance,
+            (key.to_owned(), generation),
+            value,
+            256,
+        );
+    }
+
+    pub(crate) fn cached_index(
+        &mut self,
+        theme: &str,
+        generation: u64,
+    ) -> Option<Option<IconThemeIndex>> {
+        let k = (theme.to_owned(), generation);
+        if let Some(hit) = self.index.get(&k) {
+            self.hits += 1;
+            return Some(hit.clone());
+        }
+        self.misses += 1;
+        None
+    }
+
+    pub(crate) fn store_index(
+        &mut self,
+        theme: &str,
+        generation: u64,
+        value: Option<IconThemeIndex>,
+    ) {
+        bound_insert(&mut self.index, (theme.to_owned(), generation), value, 256);
+    }
+
+    pub(crate) fn cached_roots(&mut self, theme: &str, generation: u64) -> Option<Vec<PathBuf>> {
+        let k = (theme.to_owned(), generation);
+        if let Some(hit) = self.roots.get(&k) {
+            self.hits += 1;
+            return Some(hit.clone());
+        }
+        self.misses += 1;
+        None
+    }
+
+    pub(crate) fn store_roots(&mut self, theme: &str, generation: u64, value: Vec<PathBuf>) {
+        bound_insert(&mut self.roots, (theme.to_owned(), generation), value, 256);
+    }
+
+    /// (hits, misses) across exists lookups.
     #[must_use]
     pub fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
@@ -208,36 +187,12 @@ impl IconThemeCaches {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.roots.len() + self.indexes.len() + self.inheritance.len() + self.exists.len()
+        self.exists.len()
     }
 
     #[must_use]
     pub fn memory_estimate_bytes(&self) -> usize {
         let mut bytes = 0;
-        for ((theme, _), roots) in &self.roots {
-            bytes += theme.len() + 8;
-            for root in roots {
-                bytes += root.as_os_str().len() + 32;
-            }
-        }
-        for ((theme, _), index) in &self.indexes {
-            bytes += theme.len() + 8 + 64;
-            if let Some(index) = index {
-                bytes += index.name.len();
-                for parent in &index.inherits {
-                    bytes += parent.len();
-                }
-                for dir in &index.directories {
-                    bytes += dir.len() + 48;
-                }
-            }
-        }
-        for ((seeds, _), ordered) in &self.inheritance {
-            bytes += seeds.len() + 8;
-            for name in ordered {
-                bytes += name.len();
-            }
-        }
         for ((path, _), _) in &self.exists {
             bytes += path.as_os_str().len() + 16;
         }
@@ -247,7 +202,7 @@ impl IconThemeCaches {
     fn clear_generation(&mut self) {
         // Generations are key-scoped so no clear is required; this hook keeps
         // the bound small if a host cycles generations rapidly.
-        while self.len() > 4096 + 512 + 256 + 128 {
+        while self.len() > 4096 {
             if let Some(first) = self.exists.keys().next().cloned() {
                 self.exists.remove(&first);
             } else {
@@ -407,6 +362,129 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Splits `foo.png` -> `(foo, png)`; bare `foo` -> `None` (caller treats as
+/// base with no explicit ext). Never yields a double extension.
+fn split_icon_filename(name: &str) -> Option<(String, String)> {
+    let (base, ext) = name.rsplit_once('.')?;
+    if base.is_empty() || ext.is_empty() {
+        return None;
+    }
+    if !ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((base.to_owned(), ext.to_ascii_lowercase()))
+}
+
+fn walk_theme_dir(
+    base: &Path,
+    files: &mut HashMap<String, Vec<IndexedIconFile>>,
+    theme_rank: usize,
+    directory_rank: usize,
+    format_fallback: usize,
+) {
+    // One build-time walk per unindexed theme dir; lookup stays memory-only.
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = item.file_name().to_string_lossy().into_owned();
+            let Some((base_name, ext)) = split_icon_filename(&name) else {
+                continue;
+            };
+            let format_rank = IconLookupIndex::EXTENSIONS
+                .iter()
+                .position(|e| *e == ext)
+                .unwrap_or(format_fallback);
+            if format_rank == format_fallback && format_fallback == 9999 {
+                // Unindexed theme: accept only supported extensions.
+                if !IconLookupIndex::EXTENSIONS.contains(&ext.as_str()) {
+                    continue;
+                }
+            }
+            files.entry(base_name).or_default().push(IndexedIconFile {
+                path,
+                theme_rank,
+                directory_rank,
+                distance: 0,
+                format_rank,
+            });
+        }
+    }
+}
+
+fn explicit_matches(path: &Path, explicit: Option<&str>) -> bool {
+    match explicit {
+        None => true,
+        Some(want) => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|have| have.eq_ignore_ascii_case(want)),
+    }
+}
+
+fn child_filter(paths: &[PathBuf], explicit: Option<&str>) -> Vec<PathBuf> {
+    // Explicit ext pins exact filename; otherwise prefer format order.
+    let mut scored: Vec<(&PathBuf, usize)> = paths
+        .iter()
+        .filter(|p| explicit_matches(p, explicit))
+        .map(|p| {
+            let rank = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(|e| {
+                    IconLookupIndex::EXTENSIONS
+                        .iter()
+                        .position(|x| x.eq_ignore_ascii_case(e))
+                })
+                .unwrap_or(usize::MAX);
+            (p, rank)
+        })
+        .collect();
+    scored.sort_by_key(|(_, r)| *r);
+    scored.into_iter().map(|(p, _)| p.clone()).collect()
+}
+
+fn directory_distance(index: &IconLookupIndex, file: &IndexedIconFile, physical: u32) -> u64 {
+    let theme = match index.ordered_themes.get(file.theme_rank) {
+        Some(t) => t,
+        None => return u64::MAX / 2,
+    };
+    let dirs = match index.indexes.get(theme).and_then(|o| o.as_ref()) {
+        Some(d) => d,
+        None => return u64::MAX / 2,
+    };
+    let dir_name = match dirs.directories.get(file.directory_rank) {
+        Some(d) => d,
+        None => return u64::MAX / 2,
+    };
+    dirs.dirs
+        .get(dir_name)
+        .map(|e| e.distance(physical))
+        .unwrap_or(u64::MAX / 2)
+}
+
+fn current_watch_mtime(roots: &[PathBuf], data_dirs: &[PathBuf]) -> Option<std::time::SystemTime> {
+    let mut latest: Option<std::time::SystemTime> = None;
+    let mut tops: Vec<PathBuf> = roots.to_vec();
+    tops.extend(data_dirs.iter().cloned());
+    for top in &tops {
+        let mtime = fs::metadata(top).and_then(|m| m.modified()).ok();
+        latest = match (latest, mtime) {
+            (None, m) => m,
+            (Some(a), None) => Some(a),
+            (Some(a), Some(b)) => Some(a.max(b)),
+        };
+    }
+    latest
+}
+
 /// Cycle-safe recursive `Inherits` expansion. `hicolor` is always the final
 /// fallback. `loader` maps a theme name to its parsed index (or `None`).
 pub fn inheritance_chain(
@@ -476,6 +554,452 @@ pub fn theme_dir(theme: &str, data_dirs: &[PathBuf]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Generation-scoped shared lookup snapshot.
+///
+/// Built once per `(theme_names, data_dirs, generation)` and shared by all
+/// resolver workers. Holds search roots, parsed `index.theme` per theme in
+/// the inheritance chain, per-theme roots, a real `base-name -> existing
+/// files` index (each declared dir read once at build), pixmaps recorded at
+/// build, and a bounded `name -> paths` memo so repeated lookups are
+/// memory-only. Interior memo uses a `Mutex`; snapshots are replaced (never
+/// mutated) on generation bumps.
+#[derive(Debug)]
+pub struct IndexedIconFile {
+    pub path: PathBuf,
+    pub theme_rank: usize,
+    pub directory_rank: usize,
+    pub distance: u64,
+    pub format_rank: usize,
+}
+
+#[derive(Debug)]
+pub struct IconLookupIndex {
+    /// Theme generation this snapshot was built for.
+    pub generation: u64,
+    /// Deduped search roots (`$HOME/.icons`, `$XDG_DATA_HOME/icons`, ...).
+    pub roots: Vec<PathBuf>,
+    /// Ordered theme chain (seeds + inheritance, Breeze before hicolor).
+    pub ordered_themes: Vec<String>,
+    /// Parsed `index.theme` per theme (`None` = no index on disk).
+    pub indexes: HashMap<String, Option<IconThemeIndex>>,
+    /// Per-theme roots that actually carry the theme directory.
+    pub theme_roots: HashMap<String, Vec<PathBuf>>,
+    /// Real name -> existing-files index: base icon name -> files found by
+    /// reading each declared directory once at build.
+    pub files: HashMap<String, Vec<IndexedIconFile>>,
+    /// Pixmaps recorded at build (sibling `pixmaps` + `/usr/share/pixmaps`).
+    pub pixmaps: HashMap<String, Vec<PathBuf>>,
+    /// Top-level roots `mtime` snapshot + last check (5s cooldown owner).
+    pub watch_mtime: Option<std::time::SystemTime>,
+    pub last_mtime_check: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Build inputs needed for atomic rebuild on invalidation.
+    pub theme_names: Vec<String>,
+    pub data_dirs: Vec<PathBuf>,
+    memo: std::sync::Mutex<HashMap<(String, u32), Vec<PathBuf>>>,
+    /// Cap for the name memo (bounded legacy fallback below counts too).
+    pub memo_cap: usize,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+/// Live count of [`IconLookupIndex::build`] calls (one-time index proof).
+pub static INDEX_BUILD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl IconLookupIndex {
+    /// Candidate file extensions in probe order (PPM legacy last).
+    pub const EXTENSIONS: &'static [&'static str] = &["png", "svg", "xpm", "ppm"];
+
+    #[must_use]
+    pub fn new(
+        roots: Vec<PathBuf>,
+        ordered_themes: Vec<String>,
+        indexes: HashMap<String, Option<IconThemeIndex>>,
+        theme_roots: HashMap<String, Vec<PathBuf>>,
+        generation: u64,
+    ) -> Self {
+        Self::new_full(
+            roots,
+            ordered_themes,
+            indexes,
+            theme_roots,
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            generation,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        roots: Vec<PathBuf>,
+        ordered_themes: Vec<String>,
+        indexes: HashMap<String, Option<IconThemeIndex>>,
+        theme_roots: HashMap<String, Vec<PathBuf>>,
+        files: HashMap<String, Vec<IndexedIconFile>>,
+        pixmaps: HashMap<String, Vec<PathBuf>>,
+        theme_names: Vec<String>,
+        data_dirs: Vec<PathBuf>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            generation,
+            roots,
+            ordered_themes,
+            indexes,
+            theme_roots,
+            files,
+            pixmaps,
+            watch_mtime: None,
+            last_mtime_check: std::sync::Mutex::new(None),
+            theme_names,
+            data_dirs,
+            memo: std::sync::Mutex::new(HashMap::new()),
+            memo_cap: 2048,
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Builds a snapshot from live theme state (does FS I/O once).
+    #[must_use]
+    pub fn build(theme_names: &[String], data_dirs: &[PathBuf], generation: u64) -> Self {
+        INDEX_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let roots = search_roots(data_dirs);
+        let mut seeds: Vec<String> = theme_names
+            .iter()
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if seeds.is_empty() {
+            seeds.push("hicolor".to_owned());
+        }
+        // Parse needed indexes on demand through the inheritance walk.
+        let mut parsed: HashMap<String, Option<IconThemeIndex>> = HashMap::new();
+        let mut load = |theme: &str| -> Option<IconThemeIndex> {
+            if let Some(hit) = parsed.get(theme) {
+                return hit.clone();
+            }
+            let mut found = None;
+            for root in &roots {
+                let dir = root.join(theme);
+                if dir.join("index.theme").is_file() {
+                    if let Ok(text) = fs::read_to_string(dir.join("index.theme")) {
+                        found = Some(IconThemeIndex::parse(theme, &text));
+                        break;
+                    }
+                }
+            }
+            parsed.insert(theme.to_owned(), found.clone());
+            found
+        };
+        let mut ordered: Vec<String> = Vec::new();
+        for seed in &seeds {
+            // Borrow dance: inheritance_chain needs &dyn Fn; use a closure
+            // over a local loader that reads from disk directly.
+            let loader = |theme: &str| -> Option<IconThemeIndex> {
+                for root in search_roots(data_dirs) {
+                    let dir = root.join(theme);
+                    if dir.join("index.theme").is_file() {
+                        if let Ok(text) = fs::read_to_string(dir.join("index.theme")) {
+                            return Some(IconThemeIndex::parse(theme, &text));
+                        }
+                    }
+                }
+                None
+            };
+            for name in inheritance_chain(seed, &loader) {
+                // Ensure parsed entry exists for every chained theme.
+                let _ = load(&name.clone());
+                if !ordered.contains(&name) {
+                    ordered.push(name);
+                }
+            }
+        }
+        ordered.retain(|name| name != "hicolor");
+        if seeds.iter().all(|seed| seed != "Breeze") && !ordered.contains(&"Breeze".to_owned()) {
+            let mut seeded: Vec<String> =
+                seeds.iter().filter(|s| *s != "hicolor").cloned().collect();
+            let mut rest = Vec::new();
+            for name in ordered {
+                if !seeded.contains(&name) && name != "Breeze" {
+                    rest.push(name);
+                }
+            }
+            seeded.push("Breeze".to_owned());
+            seeded.extend(rest);
+            seeded.push("hicolor".to_owned());
+            ordered = seeded;
+            for theme in ordered.clone() {
+                let _ = load(&theme);
+            }
+        }
+        if !ordered.contains(&"hicolor".to_owned()) {
+            ordered.push("hicolor".to_owned());
+            let _ = load("hicolor");
+        }
+        let mut theme_roots: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for theme in &ordered {
+            let mut truth = Vec::new();
+            for root in &roots {
+                if root.join(theme).is_dir() && !truth.contains(root) {
+                    truth.push(root.clone());
+                }
+            }
+            theme_roots.insert(theme.clone(), truth);
+        }
+        // Real name -> existing-files index: read each declared dir once,
+        // record actual supported files only.
+        let mut files: HashMap<String, Vec<IndexedIconFile>> = HashMap::new();
+        for (theme_rank, theme) in ordered.iter().enumerate() {
+            let Some(Some(index)) = parsed.get(theme) else {
+                continue;
+            };
+            let Some(roots_for_theme) = theme_roots.get(theme) else {
+                continue;
+            };
+            for (directory_rank, dir) in index.directories.iter().enumerate() {
+                if index.dirs.get(dir).is_none() {
+                    continue;
+                };
+                for root in roots_for_theme {
+                    let dir_path = root.join(theme).join(dir);
+                    let Ok(read) = fs::read_dir(&dir_path) else {
+                        continue;
+                    };
+                    for item in read.flatten() {
+                        let name = item.file_name().to_string_lossy().into_owned();
+                        let Some((base, ext)) = split_icon_filename(&name) else {
+                            continue;
+                        };
+                        let Some(format_rank) = Self::EXTENSIONS.iter().position(|e| *e == ext)
+                        else {
+                            continue;
+                        };
+                        files.entry(base).or_default().push(IndexedIconFile {
+                            path: item.path(),
+                            theme_rank,
+                            directory_rank,
+                            distance: 0,
+                            format_rank,
+                        });
+                    }
+                }
+                let _ = directory_rank;
+            }
+        }
+        // Store per-file distance lazily at lookup (size-dependent).
+        for (theme_rank, theme) in ordered.iter().enumerate() {
+            if parsed.get(theme).is_some_and(|entry| entry.is_some()) {
+                continue;
+            }
+            let Some(roots_for_theme) = theme_roots.get(theme) else {
+                continue;
+            };
+            for root in roots_for_theme {
+                let base = root.join(theme);
+                walk_theme_dir(&base, &mut files, theme_rank, usize::MAX / 4, 9999);
+            }
+        }
+        let mut pixmaps: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut pixmap_dirs: Vec<PathBuf> = Vec::new();
+        for root in &roots {
+            if let Some(parent) = root.parent() {
+                let dir = parent.join("pixmaps");
+                if !pixmap_dirs.contains(&dir) {
+                    pixmap_dirs.push(dir);
+                }
+            }
+        }
+        for data_dir in data_dirs {
+            let dir = data_dir.join("pixmaps");
+            if !pixmap_dirs.contains(&dir) {
+                pixmap_dirs.push(dir);
+            }
+        }
+        let usr = Path::new("/usr/share/pixmaps");
+        if !pixmap_dirs.contains(&usr.to_path_buf()) {
+            pixmap_dirs.push(usr.to_path_buf());
+        }
+        for dir in &pixmap_dirs {
+            let Ok(read) = fs::read_dir(dir) else {
+                continue;
+            };
+            for item in read.flatten() {
+                let name = item.file_name().to_string_lossy().into_owned();
+                let Some((base, ext)) = split_icon_filename(&name) else {
+                    continue;
+                };
+                if !Self::EXTENSIONS.contains(&ext.as_str()) {
+                    continue;
+                }
+                pixmaps.entry(base).or_default().push(item.path());
+            }
+        }
+        let mut index = Self::new_full(
+            roots,
+            ordered,
+            parsed,
+            theme_roots,
+            files,
+            pixmaps,
+            theme_names.to_vec(),
+            data_dirs.to_vec(),
+            generation,
+        );
+        index.watch_mtime = current_watch_mtime(&index.roots, &index.data_dirs);
+        index
+    }
+
+    /// Normalizes `foo`, `foo.png`, `foo.svg`, `foo.xpm` to
+    /// `(base, Option<explicit ext>)`. Explicit ext pins the filename.
+    #[must_use]
+    pub fn normalize_name(name: &str) -> (String, Option<String>) {
+        if let Some((base, ext)) = split_icon_filename(name) {
+            if Self::EXTENSIONS.contains(&ext.as_str()) {
+                return (base, Some(ext));
+            }
+        }
+        (name.to_owned(), None)
+    }
+
+    /// Memory-only lookup: normalized -> files -> current theme exact then
+    /// nearest -> inherited -> hicolor -> pixmaps. `indexed_hit` means the
+    /// returned file exists (it was recorded at build).
+    #[must_use]
+    pub fn lookup(&self, name: &str, physical: u32) -> (Vec<PathBuf>, bool) {
+        let (base, explicit) = Self::normalize_name(name);
+        let Some(entries) = self.files.get(&base) else {
+            let mut tail = Vec::new();
+            if let Some(found) = self.pixmaps.get(&base) {
+                tail.extend(child_filter(found, explicit.as_deref()));
+            }
+            let hit = !tail.is_empty();
+            return (tail, hit);
+        };
+        // Per-theme: current-theme any-size beats inherited exact.
+        let mut theme_best: HashMap<usize, &IndexedIconFile> = HashMap::new();
+        for file in entries {
+            if !explicit_matches(&file.path, explicit.as_deref()) {
+                continue;
+            }
+            let distance = directory_distance(self, file, physical.max(1));
+            let better = match theme_best.get(&file.theme_rank) {
+                None => true,
+                Some(cur) => {
+                    let cur_d = directory_distance(self, cur, physical.max(1));
+                    (distance, file.directory_rank, file.format_rank)
+                        < (cur_d, cur.directory_rank, cur.format_rank)
+                }
+            };
+            if better {
+                theme_best.insert(file.theme_rank, file);
+            }
+        }
+        let mut ranks: Vec<usize> = theme_best.keys().copied().collect();
+        ranks.sort();
+        let ordered: Vec<PathBuf> = ranks
+            .into_iter()
+            .filter_map(|rank| theme_best.get(&rank).map(|file| file.path.clone()))
+            .collect();
+        let mut out = ordered;
+        if out.is_empty() {
+            if let Some(found) = self.pixmaps.get(&base) {
+                out.extend(child_filter(found, explicit.as_deref()));
+            }
+        }
+        let hit = !out.is_empty();
+        (out, hit)
+    }
+
+    /// At most one top-level mtime check per 5s. On change: atomically
+    /// rebuild, invalidate caller cache via generation owner, resubmit
+    /// visible high priority (caller performs resubmit when owner exists).
+    #[must_use]
+    pub fn needs_rebuild(&self) -> Option<IconLookupIndex> {
+        let mut guard = self.last_mtime_check.lock().ok()?;
+        let now = std::time::Instant::now();
+        if let Some(last) = *guard {
+            if now.duration_since(last).as_secs() < 5 {
+                return None;
+            }
+        }
+        *guard = Some(now);
+        let current = current_watch_mtime(&self.roots, &self.data_dirs);
+        if current == self.watch_mtime {
+            return None;
+        }
+        Some(Self::build(
+            &self.theme_names,
+            &self.data_dirs,
+            self.generation,
+        ))
+    }
+
+    /// (hits, misses) for the name memo.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    #[must_use]
+    pub fn memo_len(&self) -> usize {
+        self.memo.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn memo_get(&self, name: &str, physical: u32) -> Option<Vec<PathBuf>> {
+        let hit = self
+            .memo
+            .lock()
+            .ok()?
+            .get(&(name.to_owned(), physical))
+            .cloned();
+        if hit.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        hit
+    }
+
+    fn memo_store(&self, name: &str, physical: u32, paths: Vec<PathBuf>) {
+        if let Ok(mut memo) = self.memo.lock() {
+            if memo.len() >= self.memo_cap && !memo.contains_key(&(name.to_owned(), physical)) {
+                if let Some(first) = memo.keys().next().cloned() {
+                    memo.remove(&first);
+                }
+            }
+            memo.insert((name.to_owned(), physical), paths);
+        }
+    }
+
+    /// Indexed-theme-first candidate paths for `name` at `physical` px.
+    ///
+    /// Phase 1: exact-size (distance 0) matches anywhere in the chain, in
+    /// chain order (uses `index.ordered_dirs`). Phase 2: remaining indexed
+    /// candidates. Lazy bounded legacy fallback (`<theme>/<size>x<size>/ctx`)
+    /// is appended only when no indexed candidate file exists on disk
+    /// (bounded to 256 paths), plus `pixmaps` fallbacks.
+    /// Memory-only candidate paths for `name` at `physical` px.
+    /// Normalizes explicit extensions (never appends a second ext),
+    /// returns per-theme best (current theme any-size beats inherited
+    /// exact), then pixmaps recorded at build. No FS walk, no probe cap.
+    #[must_use]
+    pub fn candidates(&self, name: &str, physical: u32) -> Vec<PathBuf> {
+        if let Some(hit) = self.memo_get(name, physical) {
+            return hit;
+        }
+        let (ordered, _) = self.lookup(name, physical);
+        self.memo_store(name, physical, ordered.clone());
+        ordered
+    }
 }
 
 #[cfg(test)]

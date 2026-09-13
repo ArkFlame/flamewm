@@ -5,11 +5,18 @@
 
 extern crate pulse as libpulse_binding;
 
+pub mod icon_service;
 pub mod icon_theme;
 pub mod icons;
 pub mod mpris;
 pub mod network_manager;
 pub mod pulse;
+
+pub use icon_service::{
+    IconJob, IconPriority, IconResult, IconService, IconSubmit, IconSubmitError,
+};
+pub use icon_theme::IconLookupIndex;
+pub use icons::{IconKey, IconMetricsSnapshot, IconResolver};
 
 pub use mpris::{MprisProvider, MprisProviderState};
 pub use network_manager::{

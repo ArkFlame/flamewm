@@ -273,6 +273,87 @@ pub union XEvent {
     pub pad: [c_long; 24],
 }
 
+#[repr(C)]
+pub struct XErrorEvent {
+    pub type_: c_int,
+    pub display: *mut Display,
+    pub resourceid: c_ulong,
+    pub serial: c_ulong,
+    pub error_code: u8,
+    pub request_code: u8,
+    pub minor_code: u8,
+}
+
+pub type XErrorHandler = Option<unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int>;
+pub type XIOErrorHandler = Option<unsafe extern "C" fn(*mut Display) -> c_int>;
+
+// Process-lifetime X IO-error latch. Xlib invokes the IO-error handler on
+// a dead connection (fd may stay open, so fd probes see "alive" and the
+// normal path then issues X calls on dead state -> SIGSEGV in
+// XCloseDisplay). The handler only sets the flag and returns; it must
+// never exit. Checked in Drop paths to skip all X teardown.
+//
+// X_ERROR_SEEN is the second latch: mid-workload X failures observed as
+// ordinary Err returns (fd still present, connection dead) also poison
+// teardown. Any X failure return observed by SurfaceController must set it
+// via mark_x_error_seen(); Drop skips X teardown when either latch is set.
+static IO_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static X_ERROR_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IO_HANDLER_ONCE: std::sync::Once = std::sync::Once::new();
+
+unsafe extern "C" fn io_error_latch(_display: *mut Display) -> c_int {
+    IO_BROKEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+/// Install a non-fatal X error handler once per process so a stale
+/// Picture/drawable id (e.g. a freed RENDER Picture raced by a client
+/// exit during `manage`) is reported and skipped instead of killing the
+/// window manager. The default Xlib handler exits the process on any
+/// protocol error; the WM must survive those.
+unsafe extern "C" fn protocol_error_ignore(
+    _display: *mut Display,
+    _event: *mut XErrorEvent,
+) -> c_int {
+    0
+}
+
+static PROTOCOL_HANDLER_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Install the non-fatal protocol-error handler exactly once. Safe to call
+/// after each successful XOpenDisplay; the handler is process-wide.
+pub fn install_x_protocol_error_handler() {
+    PROTOCOL_HANDLER_ONCE.call_once(|| unsafe {
+        XSetErrorHandler(Some(protocol_error_ignore));
+    });
+}
+
+/// Install the process-lifetime IO-error handler exactly once. Call after
+/// each successful XOpenDisplay; the latch is process-wide by design.
+pub fn install_x_io_error_handler() {
+    IO_HANDLER_ONCE.call_once(|| unsafe {
+        XSetIOErrorHandler(Some(io_error_latch));
+    });
+}
+
+/// True once Xlib has reported a dead connection via the IO-error handler.
+pub fn x_io_broken() -> bool {
+    IO_BROKEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Record any observed X failure return. Mid-workload failures (sync-trap
+/// fire, commit/pump error returns) mean the connection is dead even while
+/// the fd still probes alive; the next X call (including XCloseDisplay)
+/// may SIGSEGV. Keep behavior identical: set-only latch, no branching.
+pub fn mark_x_error_seen() {
+    X_ERROR_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// True once any X failure return has been observed via mark_x_error_seen.
+pub fn x_error_seen() -> bool {
+    X_ERROR_SEEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub const KEY_PRESS_MASK: c_long = 1 << 0;
 pub const KEY_RELEASE_MASK: c_long = 1 << 1;
 pub const BUTTON_PRESS_MASK: c_long = 1 << 2;
@@ -301,6 +382,7 @@ pub const ZPIXMAP: c_int = 2;
 pub const QUEUED_AFTER_READING: c_int = 1;
 pub const PROP_MODE_REPLACE: c_int = 0;
 pub const XA_ATOM: Atom = 4;
+pub const XA_CARDINAL: Atom = 6;
 pub const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 9;
 pub const GRAB_MODE_ASYNC: c_int = 1;
 pub const CURRENT_TIME: Time = 0;
@@ -358,6 +440,9 @@ unsafe extern "C" {
         vinfo_return: *mut XVisualInfo,
     ) -> Status;
     pub fn XFree(data: *mut c_void) -> c_int;
+    pub fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+    pub fn XSetIOErrorHandler(handler: XIOErrorHandler) -> XIOErrorHandler;
+    pub fn XSync(display: *mut Display, discard: Bool) -> c_int;
     pub fn XCreateWindow(
         display: *mut Display,
         parent: Window,
@@ -405,6 +490,11 @@ unsafe extern "C" {
         depth: c_uint,
     ) -> Pixmap;
     pub fn XFreePixmap(display: *mut Display, pixmap: Pixmap) -> c_int;
+    pub fn XSetWindowBackgroundPixmap(
+        display: *mut Display,
+        window: Window,
+        background_pixmap: Pixmap,
+    ) -> c_int;
     pub fn XCopyArea(
         display: *mut Display,
         src: Drawable,
@@ -576,6 +666,7 @@ unsafe extern "C" {
         data: *const u8,
         nelements: c_int,
     ) -> c_int;
+    pub fn XDeleteProperty(display: *mut Display, window: Window, property: Atom) -> c_int;
     pub fn XSetWMProtocols(
         display: *mut Display,
         window: Window,
@@ -605,6 +696,16 @@ unsafe extern "C" {
         string: *const c_char,
         count: c_int,
     ) -> c_int;
+    pub fn XGetImage(
+        display: *mut Display,
+        drawable: Drawable,
+        x: c_int,
+        y: c_int,
+        width: c_uint,
+        height: c_uint,
+        plane_mask: c_ulong,
+        format: c_int,
+    ) -> *mut XImage;
 }
 
 unsafe extern "C" {

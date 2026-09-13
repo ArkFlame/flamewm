@@ -63,8 +63,3 @@ pub(crate) fn action_to_ui_event(event: &ActionEvent) -> Option<UiEvent> {
         action: ActionId::new(event.action.clone()),
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

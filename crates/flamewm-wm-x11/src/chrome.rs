@@ -1,19 +1,21 @@
+use flamewm_skin::recipes::window_chrome::{self as recipe, WINDOW_CHROME};
+
+#[cfg(test)]
 use flamewm_skin::DEFAULT;
+#[cfg(test)]
 use flamewm_skin::icons::IconRole;
-use flamewm_skin::recipes::window_chrome::{
-    self as recipe, SceneRect, WINDOW_CHROME, WindowChromeRecipe, WindowChromeScene,
-    WindowControlRole,
-};
+#[cfg(test)]
+use flamewm_skin::recipes::window_chrome::{SceneRect, WindowChromeScene, WindowControlRole};
+#[cfg(test)]
 use flamewm_skin::typography::Typography;
 
 /// Skin-owned titlebar height (flamewm-skin RWR 0.0.9 chrome titlebar).
-pub const TITLEBAR_HEIGHT: u16 = DEFAULT.chrome.titlebar;
+pub const TITLEBAR_HEIGHT: u16 = WINDOW_CHROME.metrics.titlebar;
 /// Frame border width (no skin token; WM-owned 1px border).
 pub const FRAME_BORDER: u16 = 1;
-/// Close-hover affordance radius (skin chrome radius).
-pub const CLOSE_HOVER_RADIUS: u16 = DEFAULT.chrome.radius;
 
 /// WM-owned view of control roles (mirrors skin WindowControlRole).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlRole {
     Minimize,
@@ -22,6 +24,7 @@ pub enum ControlRole {
     Close,
 }
 
+#[cfg(test)]
 impl ControlRole {
     #[must_use]
     pub const fn skin(self) -> WindowControlRole {
@@ -45,6 +48,7 @@ impl ControlRole {
     }
 }
 
+#[cfg(test)]
 impl From<WindowControlRole> for ControlRole {
     fn from(role: WindowControlRole) -> Self {
         match role {
@@ -55,18 +59,21 @@ impl From<WindowControlRole> for ControlRole {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPolicy {
     pub roles: [ControlRole; 3],
     pub button_width: u16,
 }
 
+#[cfg(test)]
 impl Default for ControlPolicy {
     fn default() -> Self {
         Self::for_state(false, false)
     }
 }
 
+#[cfg(test)]
 impl ControlPolicy {
     /// Skin control order; the middle slot becomes Restore when maximized or
     /// fullscreen so the hit target keeps its geometry while the glyph swaps.
@@ -82,33 +89,6 @@ impl ControlPolicy {
             button_width: WINDOW_CHROME.metrics.button_width,
         }
     }
-
-    #[must_use]
-    pub fn recipe() -> WindowChromeRecipe {
-        WINDOW_CHROME
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Metrics {
-    pub titlebar_height: u16,
-}
-
-impl Metrics {
-    pub const fn new(titlebar_height: u16) -> Self {
-        Self { titlebar_height }
-    }
-}
-
-/// Resolved app icon source, in priority order: live `_NET_WM_ICON` pixels,
-/// catalog `DesktopEntry` `Icon=` raster via the icon resolver, coarse
-/// `WM_CLASS` skin role as last resort before the generic fallback.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppIconSource {
-    Native(IconImage),
-    CatalogRaster(flamewm_integrations_linux::icons::Rgba8Raster),
-    ClassRole(flamewm_skin::icons::IconRole),
-    Generic,
 }
 
 /// Validated `_NET_WM_ICON` image (EWMH ARGB32 cardinals, non-premultiplied).
@@ -158,6 +138,7 @@ pub fn parse_net_wm_icon(cardinals: &[u32]) -> Option<IconImage> {
 }
 
 /// Nearest-neighbor scale into a square titlebar slot, alpha preserved.
+#[cfg(test)]
 pub fn scale_icon_to_slot(icon: &IconImage, slot: u32) -> Option<IconImage> {
     if slot == 0 || icon.width == 0 || icon.height == 0 {
         return None;
@@ -182,6 +163,7 @@ pub fn scale_icon_to_slot(icon: &IconImage, slot: u32) -> Option<IconImage> {
 
 /// Straight RGBA8 raster for a native `_NET_WM_ICON` selection, scaled into
 /// the square titlebar slot (canonical blit input for `blit_rgba`).
+#[cfg(test)]
 #[must_use]
 pub fn native_icon_rgba(icon: &IconImage, slot: u32) -> Option<flamewm_image_core::RgbaImage> {
     let scaled = scale_icon_to_slot(icon, slot)?;
@@ -197,11 +179,13 @@ pub fn native_icon_rgba(icon: &IconImage, slot: u32) -> Option<flamewm_image_cor
 
 /// Load a Breeze `window-*.svg` control glyph at its asset path with the
 /// semantic Flame color scheme (canonical `image-core` SVG entry point).
+#[cfg(test)]
 #[must_use]
 pub fn control_glyph_svg(role: ControlRole, edge: u32) -> Option<flamewm_image_core::RgbaImage> {
     control_glyph_svg_at(env!("CARGO_MANIFEST_DIR"), role, edge)
 }
 
+#[cfg(test)]
 fn control_glyph_svg_at(
     manifest_dir: &str,
     role: ControlRole,
@@ -224,6 +208,7 @@ fn control_glyph_svg_at(
 }
 
 /// Skin color as canonical `render-core` RGBA for `ExternalDrawableTarget`.
+#[cfg(test)]
 #[must_use]
 pub fn skin_color(color: flamewm_skin::Rgb) -> flamewm_render_core::Color {
     flamewm_render_core::Color {
@@ -235,6 +220,7 @@ pub fn skin_color(color: flamewm_skin::Rgb) -> flamewm_render_core::Color {
 }
 
 /// Titlebar icon slot edge for the configured titlebar height.
+#[cfg(test)]
 #[must_use]
 pub fn icon_slot_for(titlebar_height: u16) -> u16 {
     recipe::icon_slot_edge()
@@ -250,6 +236,7 @@ pub fn title_baseline(titlebar_height: u16) -> f32 {
 
 /// Map a `WM_CLASS` (instance or class, NUL-separated) to a skin icon role.
 /// Used only when `_NET_WM_ICON` is absent; pure fallback, no state minted.
+#[cfg(test)]
 #[must_use]
 pub fn icon_role_for_class(wm_class: &str) -> Option<IconRole> {
     let lowered = wm_class.to_ascii_lowercase();
@@ -282,6 +269,7 @@ pub fn icon_role_for_class(wm_class: &str) -> Option<IconRole> {
 /// present (mapped through the caller) or when the `WM_CLASS` fallback
 /// resolves, else `None`. Hit rects derive from skin
 /// `control_button_geometries`, never from glyph pixels.
+#[cfg(test)]
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_scene(
@@ -316,6 +304,7 @@ pub fn build_scene(
 /// (skin typography title). Proportional advance estimate: ASCII 7px, CJK
 /// 12px, other 8px; keeps the skin `center_title_x` contract without the
 /// retired 9px core-font advance.
+#[cfg(test)]
 #[must_use]
 pub fn title_text_width(title: &str) -> i32 {
     let mut width = 0_i32;
@@ -337,8 +326,10 @@ pub fn title_text_width(title: &str) -> i32 {
     width
 }
 
+#[cfg(test)]
 const TITLE_MAX_CHARS: usize = 96;
 
+#[cfg(test)]
 fn is_wide(ch: char) -> bool {
     matches!(ch,
         '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{A4CF}' | '\u{AC00}'..='\u{D7A3}'
@@ -347,6 +338,7 @@ fn is_wide(ch: char) -> bool {
 
 /// Center-title formula, delegated to the skin contract.
 /// `paint_x = clamp((W - tw) / 2, left + pad, right - pad - tw)`.
+#[cfg(test)]
 #[must_use]
 pub fn center_title_x(
     titlebar_width: i32,

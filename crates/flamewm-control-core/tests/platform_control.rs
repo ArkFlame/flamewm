@@ -483,6 +483,21 @@ fn system_action_reports_explicit_stale_and_unsupported_errors() {
 }
 
 #[test]
+fn canonical_dbus_protocol_keeps_snapshot_signals_with_legacy_compat() {
+    const XML: &str = include_str!("../protocol/com.arkflame.FlameWM1.xml");
+    for member in [
+        "WindowsChanged",
+        "WindowsSnapshotChanged",
+        "WorkspacesChanged",
+        "WorkspacesSnapshotChanged",
+        "PanelsChanged",
+        "PanelsSnapshotChanged",
+    ] {
+        assert!(XML.contains(&format!("name=\"{member}\"")));
+    }
+}
+
+#[test]
 fn canonical_dbus_protocol_keeps_v8_identity_based_reorder() {
     const XML: &str = include_str!("../protocol/com.arkflame.FlameWM1.xml");
     assert!(XML.contains("<method name=\"Reorder\">"));

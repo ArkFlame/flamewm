@@ -1,20 +1,16 @@
 # FlameWM Agent Governance
 
-This repository is FlameWM 0.0.7. Repository-local agent rules are defined in
-`.agents/README.md`, `.agents/CONTRACTS.md`, and `.agents/JOBS.md`.
+Before substantive work, read `FLAMEWM_VERSION`, `.opencode/HARNESS.md`, and
+`.opencode/ROUTES.md`; load routed skills and record route evidence. Read
+`.agents/README.md`, `.agents/CONTRACTS.md`, and `.agents/JOBS.md` for assigned
+work.
 
-## Architecture rules
+Current source and runtime evidence outrank documentation, plans, and reference
+material. Read `docs/ARCHITECTURE.md` before product-structure changes. One
+owner exists per mechanism: product code uses typed facades; `flamewm-reactor`
+owns native event sources; UI never becomes WM authority. `.vendor/**` is
+read-only reference, never dependency or runtime input. Exceptions are explicit
+path entries in `docs/ARCHITECTURE_EXCEPTIONS.toml`; no wildcards.
 
-- Read `docs/ARCHITECTURE.md` before changing product structure.
-- One owner exists for each mechanism. Extend that owner; do not duplicate it in a feature.
-- Product code uses feature facades and typed contracts. Product code does not render directly or call raw native APIs.
-- `flamewm-reactor` owns native event sources and dispatches typed events.
-- UI features project state through their feature facade. They do not become a second window manager or state authority.
-- `.vendor/**` is reference material only. It is never an active dependency or runtime input.
-- Exceptions are explicit path-level entries in `docs/ARCHITECTURE_EXCEPTIONS.toml`; wildcards are forbidden.
-
-## Handoff
-
-Keep changes within assigned paths, preserve unrelated work, and report exact
-verification. Do not claim migration or runtime completion from documentation or
-static inspection alone.
+Keep changes assigned and preserve unrelated work. Runtime, build, and release
+claims require fresh executed evidence; static inspection is not proof.

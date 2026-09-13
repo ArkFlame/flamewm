@@ -3,8 +3,17 @@ use flamewm_api::workspace::WorkspaceSnapshot;
 use flamewm_control_core::ControlRequest;
 
 pub use flamewm_shell_core::workspaces::{
-    project, slot_position, visible_page, workspace_labels, WorkspaceView, PAGE_SIZE,
+    project as core_project, slot_position, visible_page, workspace_labels, WorkspaceView,
+    PAGE_SIZE,
 };
+
+/// Pager projection with the J07 static shell span (`shell.pager.project`).
+/// Single owner: wraps the core workspace projection; no second pager.
+#[must_use]
+pub fn project(snapshot: Option<&WorkspaceSnapshot>) -> Vec<WorkspaceView> {
+    let _span = crate::runtime::shell_span("shell.pager.project").start();
+    core_project(snapshot)
+}
 
 #[must_use]
 pub fn intent_for_click(

@@ -99,21 +99,6 @@ pub fn start_category(application: &DesktopApplication) -> StartCategory {
     StartCategory::from_application(application)
 }
 
-fn compare_applications(
-    left: &DesktopApplication,
-    right: &DesktopApplication,
-) -> std::cmp::Ordering {
-    left.name
-        .to_lowercase()
-        .cmp(&right.name.to_lowercase())
-        .then_with(|| {
-            left.id
-                .as_str()
-                .to_lowercase()
-                .cmp(&right.id.as_str().to_lowercase())
-        })
-}
-
 #[must_use]
 pub fn filter_start_applications<'a>(
     applications: &'a [DesktopApplication],

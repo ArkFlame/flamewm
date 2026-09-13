@@ -126,6 +126,167 @@ impl Default for SurfaceConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SurfaceId(pub(crate) u64);
 
+/// Pure EWMH dock strut model (C11 native).
+///
+/// Root-coordinate edge reservation computed from the root extent and the
+/// panel rect. Exactly one edge is reserved: bottom-touch gives
+/// `bottom = root_h - panel.y` with `bottom_start_x = panel.x` and
+/// `bottom_end_x = panel.right - 1` (others 0); top/left/right are
+/// equivalent; a panel touching no root edge yields no strut (`None`).
+/// Guards exclude full-span rects (e.g. a full-height window with `y == 0`
+/// is not a bottom strut). Reference: `.vendor/.../wmtaskbar.cc`
+/// `updateWMHints` (thickness = height on the touched edge) and
+/// `wmclient.cc` `getNetWMStrutPartial` (12-long partial layout).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DockStrut {
+    pub left: u32,
+    pub right: u32,
+    pub top: u32,
+    pub bottom: u32,
+    pub left_start_y: u32,
+    pub left_end_y: u32,
+    pub right_start_y: u32,
+    pub right_end_y: u32,
+    pub top_start_x: u32,
+    pub top_end_x: u32,
+    pub bottom_start_x: u32,
+    pub bottom_end_x: u32,
+}
+
+impl DockStrut {
+    pub fn from_root_and_rect(
+        root_w: u32,
+        root_h: u32,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    ) -> Option<Self> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let root_w = root_w as i64;
+        let root_h = root_h as i64;
+        let x = x as i64;
+        let y = y as i64;
+        let w = w as i64;
+        let h = h as i64;
+        let zero = || Self {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 0,
+            left_start_y: 0,
+            left_end_y: 0,
+            right_start_y: 0,
+            right_end_y: 0,
+            top_start_x: 0,
+            top_end_x: 0,
+            bottom_start_x: 0,
+            bottom_end_x: 0,
+        };
+        // Bottom edge wins over left/right corners; the `y > 0` guard keeps
+        // full-height rects (y == 0) from misclassifying as bottom struts.
+        if y + h == root_h && y > 0 {
+            let mut s = zero();
+            s.bottom = (root_h - y).max(0) as u32;
+            s.bottom_start_x = x.max(0) as u32;
+            s.bottom_end_x = (x + w - 1).max(0) as u32;
+            return Some(s);
+        }
+        if y == 0 && y + h < root_h {
+            let mut s = zero();
+            s.top = h.max(0) as u32;
+            s.top_start_x = x.max(0) as u32;
+            s.top_end_x = (x + w - 1).max(0) as u32;
+            return Some(s);
+        }
+        if x == 0 && x + w < root_w {
+            let mut s = zero();
+            s.left = w.max(0) as u32;
+            s.left_start_y = y.max(0) as u32;
+            s.left_end_y = (y + h - 1).max(0) as u32;
+            return Some(s);
+        }
+        if x + w == root_w && x > 0 {
+            let mut s = zero();
+            s.right = (root_w - x).max(0) as u32;
+            s.right_start_y = y.max(0) as u32;
+            s.right_end_y = (y + h - 1).max(0) as u32;
+            return Some(s);
+        }
+        None
+    }
+
+    /// 12-long `_NET_WM_STRUT_PARTIAL` layout (authority): left, right,
+    /// top, bottom, left_start_y, left_end_y, right_start_y, right_end_y,
+    /// top_start_x, top_end_x, bottom_start_x, bottom_end_x.
+    pub fn partial12(&self) -> [u64; 12] {
+        [
+            self.left as u64,
+            self.right as u64,
+            self.top as u64,
+            self.bottom as u64,
+            self.left_start_y as u64,
+            self.left_end_y as u64,
+            self.right_start_y as u64,
+            self.right_end_y as u64,
+            self.top_start_x as u64,
+            self.top_end_x as u64,
+            self.bottom_start_x as u64,
+            self.bottom_end_x as u64,
+        ]
+    }
+
+    /// 4-long `_NET_WM_STRUT` layout: left, right, top, bottom.
+    pub fn strut4(&self) -> [u64; 4] {
+        [
+            self.left as u64,
+            self.right as u64,
+            self.top as u64,
+            self.bottom as u64,
+        ]
+    }
+}
+
+#[cfg(test)]
+mod dock_strut_tests {
+    use super::*;
+
+    #[test]
+    fn bottom_44px_panel_reserves_bottom_with_x_range() {
+        let s = DockStrut::from_root_and_rect(1920, 1080, 0, 1036, 1920, 44)
+            .expect("bottom panel reserves");
+        assert_eq!(s.bottom, 44);
+        assert_eq!((s.bottom_start_x, s.bottom_end_x), (0, 1919));
+        assert_eq!((s.left, s.right, s.top), (0, 0, 0));
+        assert_eq!(s.strut4(), [0, 0, 0, 44]);
+        let p = s.partial12();
+        assert_eq!(&p[0..4], &[0, 0, 0, 44]);
+        assert_eq!((p[10], p[11]), (0, 1919));
+    }
+
+    #[test]
+    fn top_left_right_reserve_their_edge_only() {
+        let top = DockStrut::from_root_and_rect(1920, 1080, 100, 0, 800, 30).unwrap();
+        assert_eq!(top.top, 30);
+        assert_eq!((top.top_start_x, top.top_end_x), (100, 899));
+        assert_eq!((top.left, top.right, top.bottom), (0, 0, 0));
+        let left = DockStrut::from_root_and_rect(1920, 1080, 0, 100, 48, 880).unwrap();
+        assert_eq!(left.left, 48);
+        assert_eq!((left.left_start_y, left.left_end_y), (100, 979));
+        let right = DockStrut::from_root_and_rect(1920, 1080, 1872, 100, 48, 880).unwrap();
+        assert_eq!(right.right, 48);
+        assert_eq!((right.right_start_y, right.right_end_y), (100, 979));
+    }
+
+    #[test]
+    fn floating_rect_reserves_nothing() {
+        assert!(DockStrut::from_root_and_rect(1920, 1080, 400, 300, 800, 600).is_none());
+        assert!(DockStrut::from_root_and_rect(1920, 1080, 0, 0, 1920, 1080).is_none());
+    }
+}
+
 impl SurfaceId {
     pub fn get(self) -> u64 {
         self.0
