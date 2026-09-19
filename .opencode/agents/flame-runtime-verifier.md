@@ -11,6 +11,9 @@ permissions:
   - action: subagent
     resource: "*"
     effect: deny
+  - action: skill
+    resource: "*"
+    effect: allow
 ---
 
 Verify assigned runtime behavior only. Read sources and run only necessary bounded shell commands. Never edit or delegate. Preserve host display: use an isolated nested display only after confirming target display is unused; never use, replace, kill, or reconfigure host `DISPLAY`; clean up only processes started by this verification.

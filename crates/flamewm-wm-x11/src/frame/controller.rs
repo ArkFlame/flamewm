@@ -31,13 +31,17 @@ use crate::size_hints::ClientSizeHints;
 ///
 /// Domain split: `ConfigureClientLocal` carries client-local geometry
 /// (origin (0, titlebar) + client size) for the reparented window;
-/// `ConfigureFrameRoot` carries the frame outer rect in root coords;
+/// `ConfigureFrameRoot` carries the frame outer rect in root coords
+/// (resize/general paths only);
+/// `MoveFrameRoot` carries a position-only frame origin in root coords
+/// for move sessions (w/h unrepresentable by construction);
 /// `NotifyClientRoot` carries the synthetic client-root rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameEffect {
     Grab { window: u32, cursor: CursorKind },
     Ungrab,
     ConfigureFrameRoot { x: i32, y: i32, w: i32, h: i32 },
+    MoveFrameRoot { x: i32, y: i32 },
     ConfigureClientLocal { x: i32, y: i32, w: u32, h: u32 },
     LayoutInput,
     PaintChrome,
@@ -112,8 +116,12 @@ pub enum FrameEvent {
     },
     Enter,
     Leave,
-    Configure {
-        origin: RootPoint,
+    /// Client intent only: a ConfigureRequest from the client window.
+    /// `root_origin`/`size` are client-window geometry (client-root rect),
+    /// never the frame outer rect and never a ConfigureNotify observation.
+    /// The live owner must never construct this from notify events (M01).
+    ClientConfigureRequest {
+        root_origin: RootPoint,
         size: Option<(u32, u32)>,
     },
     Snap {
@@ -168,16 +176,15 @@ fn configure_effects(frame: RootRect, extents: FrameExtents) -> Vec<FrameEffect>
     ]
 }
 
-/// Move plan: frame position + root notify only. No client configure,
-/// no layout, no paint, no shape.
+/// Move plan: position-only frame origin + root notify. No client
+/// configure, no layout, no paint, no shape. Position-only by type:
+/// `MoveFrameRoot` carries no w/h so a move cannot resize.
 fn move_effects(frame: RootRect, extents: FrameExtents) -> Vec<FrameEffect> {
     let root: ClientRootRect = frame_to_client_root(frame, extents);
     vec![
-        FrameEffect::ConfigureFrameRoot {
+        FrameEffect::MoveFrameRoot {
             x: frame.x,
             y: frame.y,
-            w: frame.w,
-            h: frame.h,
         },
         FrameEffect::NotifyClientRoot {
             x: root.x,
@@ -216,6 +223,119 @@ fn move_anchor(pointer: RootPoint, rect: RootRect) -> MoveAnchor {
     MoveAnchor::new(num, den, vert)
 }
 
+const MOVE_ACTIVATION_THRESHOLD_PX: i32 = 4;
+
+fn move_delta(start: RootPoint, current: RootPoint) -> (i32, i32) {
+    (
+        current.x.saturating_sub(start.x),
+        current.y.saturating_sub(start.y),
+    )
+}
+
+fn move_reached_activation(start: RootPoint, current: RootPoint) -> bool {
+    let (dx, dy) = move_delta(start, current);
+    dx >= MOVE_ACTIVATION_THRESHOLD_PX
+        || dx <= -MOVE_ACTIVATION_THRESHOLD_PX
+        || dy >= MOVE_ACTIVATION_THRESHOLD_PX
+        || dy <= -MOVE_ACTIVATION_THRESHOLD_PX
+}
+
+fn move_step(
+    state: &ControllerState,
+    mut session: MoveSession,
+    pointer: RootPoint,
+    final_commit: bool,
+) -> (ControllerState, Vec<FrameEffect>) {
+    let mut next = state.clone();
+    let first_activation = !session.anchor.is_activated();
+    if first_activation && !move_reached_activation(session.start_pointer, pointer) {
+        return (next, vec![FrameEffect::Noop]);
+    }
+
+    let delta = move_delta(session.start_pointer, pointer);
+    let req = request(
+        state,
+        GeometryReason::InteractiveMove,
+        session.start_placement,
+        delta,
+        ResizeEdges::none(),
+    );
+    let plan = plan_move(&req);
+    session.anchor.activate();
+    next.session.begin_move(session);
+
+    if first_activation && state.placement.mode != PlacementMode::Floating {
+        next.placement.mode = PlacementMode::Floating;
+        next.placement.resume = None;
+        next.placement.current = plan.frame;
+        next.placement.floating_restore = plan.frame;
+        let mut effects = vec![
+            FrameEffect::LayoutInput,
+            FrameEffect::PaintChrome,
+            FrameEffect::ApplyShape,
+        ];
+        effects.extend(configure_effects(plan.frame, state.extents));
+        return (next, effects);
+    }
+
+    if plan.noop && (!final_commit || state.placement.current == session.start_placement.rect) {
+        return (next, vec![FrameEffect::Noop]);
+    }
+    next.placement.current = plan.frame;
+    if next.placement.mode == PlacementMode::Floating {
+        next.placement.floating_restore = plan.frame;
+    }
+    (next, move_effects(plan.frame, state.extents))
+}
+
+fn resize_step(
+    state: &ControllerState,
+    session: ResizeSession,
+    pointer: RootPoint,
+    final_effects: bool,
+) -> (ControllerState, Vec<FrameEffect>) {
+    let mut next = state.clone();
+    if matches!(
+        state.placement.mode,
+        PlacementMode::Maximized | PlacementMode::Fullscreen
+    ) {
+        return (next, vec![FrameEffect::Noop]);
+    }
+    let delta = move_delta(session.start_pointer, pointer);
+    let req = request(
+        state,
+        GeometryReason::InteractiveResize,
+        session.start_placement,
+        delta,
+        session.edges,
+    );
+    let plan = plan_resize(&req);
+    let should_commit = !plan.noop || state.placement.current != session.start_placement.rect;
+    if !should_commit {
+        return (next, vec![FrameEffect::Noop]);
+    }
+
+    if matches!(state.placement.mode, PlacementMode::Snapped(_)) {
+        next.placement.mode = PlacementMode::Floating;
+        next.placement.resume = None;
+    }
+    next.placement.current = plan.frame;
+    if next.placement.mode == PlacementMode::Floating {
+        next.placement.floating_restore = plan.frame;
+    }
+    let mut effects = if final_effects {
+        vec![
+            FrameEffect::LayoutInput,
+            FrameEffect::PaintChrome,
+            FrameEffect::ApplyShape,
+        ]
+    } else {
+        Vec::new()
+    };
+    effects.extend(configure_effects(plan.frame, state.extents));
+    (next, effects)
+}
+
 /// Pure reducer: one event -> (next state, native effect plan).
 #[must_use]
 pub fn reduce(state: &ControllerState, event: FrameEvent) -> (ControllerState, Vec<FrameEffect>) {
@@ -225,25 +345,33 @@ pub fn reduce(state: &ControllerState, event: FrameEvent) -> (ControllerState, V
             let target = target_for_xid(&state.registry, state.client, source);
             match target.region {
                 FrameRegion::TitleDrag => {
-                    // Maximized drag re-anchors to the floating restore rect.
-                    let start_rect = if state.placement.mode == PlacementMode::Maximized {
-                        maximized_restore_rect(
-                            state.placement.floating_restore,
-                            pointer,
-                            move_anchor(pointer, state.placement.current).frac_num,
-                            move_anchor(pointer, state.placement.current).frac_den,
-                            pointer.y.saturating_sub(state.placement.current.y),
-                            TITLEBAR_H,
-                        )
-                    } else {
-                        state.placement.current
+                    let (start_mode, start_rect) = match state.placement.mode {
+                        PlacementMode::Fullscreen => return (next, vec![FrameEffect::Noop]),
+                        PlacementMode::Maximized | PlacementMode::Snapped(_) => {
+                            // Re-anchor the floating restore rect to the visible frame.
+                            let visible_anchor = move_anchor(pointer, state.placement.current);
+                            (
+                                PlacementMode::Floating,
+                                maximized_restore_rect(
+                                    state.placement.floating_restore,
+                                    pointer,
+                                    visible_anchor.frac_num,
+                                    visible_anchor.frac_den,
+                                    pointer.y.saturating_sub(state.placement.current.y),
+                                    TITLEBAR_H,
+                                ),
+                            )
+                        }
+                        PlacementMode::Floating => {
+                            (PlacementMode::Floating, state.placement.current)
+                        }
                     };
                     let anchor = move_anchor(pointer, start_rect);
                     next.session.begin_move(MoveSession {
                         client: state.client,
                         start_pointer: pointer,
                         start_placement: PlacementSnapshot {
-                            mode: state.placement.mode,
+                            mode: start_mode,
                             rect: start_rect,
                         },
                         anchor,
@@ -256,6 +384,12 @@ pub fn reduce(state: &ControllerState, event: FrameEvent) -> (ControllerState, V
                     (next, effects)
                 }
                 FrameRegion::Resize(edges) => {
+                    if matches!(
+                        state.placement.mode,
+                        PlacementMode::Maximized | PlacementMode::Fullscreen
+                    ) {
+                        return (next, vec![FrameEffect::Noop]);
+                    }
                     next.session.begin_resize(ResizeSession {
                         client: state.client,
                         start_pointer: pointer,
@@ -291,98 +425,31 @@ pub fn reduce(state: &ControllerState, event: FrameEvent) -> (ControllerState, V
             }
         }
         FrameEvent::Motion { pointer } => match state.session {
-            InteractionSession::Move(m) => {
-                let delta = (
-                    pointer.x.saturating_sub(m.start_pointer.x),
-                    pointer.y.saturating_sub(m.start_pointer.y),
-                );
-                let req = request(
-                    state,
-                    GeometryReason::InteractiveMove,
-                    m.start_placement,
-                    delta,
-                    ResizeEdges::none(),
-                );
-                let plan = plan_move(&req);
-                if plan.noop {
-                    return (next, vec![FrameEffect::Noop]);
-                }
-                next.placement.current = plan.frame;
-                (next, move_effects(plan.frame, state.extents))
-            }
-            InteractionSession::Resize(r) => {
-                let delta = (
-                    pointer.x.saturating_sub(r.start_pointer.x),
-                    pointer.y.saturating_sub(r.start_pointer.y),
-                );
-                let req = request(
-                    state,
-                    GeometryReason::InteractiveResize,
-                    r.start_placement,
-                    delta,
-                    r.edges,
-                );
-                let plan = plan_resize(&req);
-                if plan.noop {
-                    return (next, vec![FrameEffect::Noop]);
-                }
-                next.placement.current = plan.frame;
-                (next, configure_effects(plan.frame, state.extents))
-            }
+            InteractionSession::Move(m) => move_step(state, m, pointer, false),
+            InteractionSession::Resize(r) => resize_step(state, r, pointer, false),
             InteractionSession::ControlPress(_) | InteractionSession::Idle => {
                 (next, vec![FrameEffect::Noop])
             }
         },
         FrameEvent::Release { pointer } => match state.session {
             InteractionSession::Move(m) => {
-                let delta = (
-                    pointer.x.saturating_sub(m.start_pointer.x),
-                    pointer.y.saturating_sub(m.start_pointer.y),
-                );
-                let req = request(
-                    state,
-                    GeometryReason::InteractiveMove,
-                    m.start_placement,
-                    delta,
-                    ResizeEdges::none(),
-                );
-                let plan = plan_move(&req);
+                let (mut next, mut effects) = move_step(state, m, pointer, true);
                 next.session = InteractionSession::Idle;
-                if plan.noop && next.placement.current == m.start_placement.rect {
+                if effects == vec![FrameEffect::Noop] {
                     return (next, vec![FrameEffect::Ungrab]);
                 }
-                next.placement.current = plan.frame;
-                // Final geometry first, Ungrab last.
-                let mut effects = vec![FrameEffect::LayoutInput, FrameEffect::PaintChrome];
-                effects.extend(move_effects(plan.frame, state.extents));
+                // Final geometry first, Ungrab last. Move is position-only:
+                // no layout/paint/shape, just MoveFrameRoot + notify.
                 effects.push(FrameEffect::Ungrab);
                 (next, effects)
             }
             InteractionSession::Resize(r) => {
-                let delta = (
-                    pointer.x.saturating_sub(r.start_pointer.x),
-                    pointer.y.saturating_sub(r.start_pointer.y),
-                );
-                let req = request(
-                    state,
-                    GeometryReason::InteractiveResize,
-                    r.start_placement,
-                    delta,
-                    r.edges,
-                );
-                let plan = plan_resize(&req);
+                let (mut next, mut effects) = resize_step(state, r, pointer, true);
                 next.session = InteractionSession::Idle;
-                if plan.noop && next.placement.current == r.start_placement.rect {
+                if effects == vec![FrameEffect::Noop] {
                     return (next, vec![FrameEffect::Ungrab]);
                 }
-                next.placement.current = plan.frame;
                 // Final geometry first, Ungrab last.
-                let mut effects = vec![
-                    FrameEffect::LayoutInput,
-                    FrameEffect::PaintChrome,
-                    FrameEffect::ApplyShape,
-                ];
-                effects.extend(configure_effects(plan.frame, state.extents));
                 effects.push(FrameEffect::Ungrab);
                 (next, effects)
             }
@@ -422,7 +489,7 @@ pub fn reduce(state: &ControllerState, event: FrameEvent) -> (ControllerState, V
                 (next, vec![FrameEffect::Noop])
             }
         }
-        FrameEvent::Configure { origin, size } => {
+        FrameEvent::ClientConfigureRequest { root_origin, size } => {
             let req = request(
                 state,
                 GeometryReason::ClientConfigure,
@@ -433,7 +500,7 @@ pub fn reduce(state: &ControllerState, event: FrameEvent) -> (ControllerState, V
                 (0, 0),
                 ResizeEdges::none(),
             );
-            let plan = plan_client_configure(&req, origin, size);
+            let plan = plan_client_configure(&req, root_origin, size);
             if plan.noop {
                 return (next, vec![FrameEffect::Noop]);
             }
@@ -591,6 +658,50 @@ mod tests {
             .with_registry(registry)
     }
 
+    fn maximized_state() -> ControllerState {
+        let mut state = floating_state();
+        state.placement.mode = PlacementMode::Maximized;
+        state.placement.current = WA;
+        state.placement.resume = Some(PlacementSnapshot {
+            mode: PlacementMode::Floating,
+            rect: START,
+        });
+        state
+    }
+
+    fn snapped_state() -> ControllerState {
+        let mut state = floating_state();
+        state.placement.mode = PlacementMode::Snapped(SnapTarget::Left);
+        state.placement.current = RootRect::new(0, 0, 960, 1080);
+        state.placement.resume = Some(PlacementSnapshot {
+            mode: PlacementMode::Floating,
+            rect: START,
+        });
+        state
+    }
+
+    fn has_full_configure(effects: &[FrameEffect]) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, FrameEffect::ConfigureFrameRoot { .. }))
+            && effects
+                .iter()
+                .any(|effect| matches!(effect, FrameEffect::ConfigureClientLocal { .. }))
+            && effects
+                .iter()
+                .any(|effect| matches!(effect, FrameEffect::NotifyClientRoot { .. }))
+    }
+
+    fn assert_position_only(effects: &[FrameEffect]) {
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(effects[0], FrameEffect::MoveFrameRoot { .. }));
+        assert!(matches!(effects[1], FrameEffect::NotifyClientRoot { .. }));
+        assert!(!has_any_frame_root(effects));
+        assert!(!effects.contains(&FrameEffect::LayoutInput));
+        assert!(!effects.contains(&FrameEffect::PaintChrome));
+        assert!(!effects.contains(&FrameEffect::ApplyShape));
+    }
+
     fn has_frame(target: &[FrameEffect], x: i32, y: i32) -> bool {
         target.iter().any(|e| {
             matches!(
@@ -598,6 +709,21 @@ mod tests {
                 FrameEffect::ConfigureFrameRoot { x: fx, y: fy, .. } if *fx == x && *fy == y
             )
         })
+    }
+
+    fn has_move_frame(target: &[FrameEffect], x: i32, y: i32) -> bool {
+        target.iter().any(|e| {
+            matches!(
+                e,
+                FrameEffect::MoveFrameRoot { x: fx, y: fy } if *fx == x && *fy == y
+            )
+        })
+    }
+
+    fn has_any_frame_root(target: &[FrameEffect]) -> bool {
+        target
+            .iter()
+            .any(|e| matches!(e, FrameEffect::ConfigureFrameRoot { .. }))
     }
 
     fn count_local(target: &[FrameEffect]) -> usize {
@@ -626,7 +752,8 @@ mod tests {
             },
         );
         assert_eq!(s2.placement.current, RootRect::new(150, 150, 400, 300));
-        assert!(has_frame(&e2, 150, 150));
+        assert!(has_move_frame(&e2, 150, 150));
+        assert!(!has_any_frame_root(&e2));
         let (s3, e3) = reduce(
             &s2,
             FrameEvent::Release {
@@ -819,8 +946,9 @@ mod tests {
         assert_eq!(e2.len(), 2);
         assert!(matches!(
             e2[0],
-            FrameEffect::ConfigureFrameRoot { x: 150, y: 150, .. }
+            FrameEffect::MoveFrameRoot { x: 150, y: 150 }
         ));
+        assert!(!has_any_frame_root(&e2));
         // Client local origin is (0,titlebar); synthetic root notify at frame offset.
         assert!(matches!(
             e2[1],
@@ -922,17 +1050,18 @@ mod tests {
         );
         assert_eq!(s3.placement.current, RootRect::new(150, 150, 400, 300));
         assert_eq!(*e3.last().expect("nonempty"), FrameEffect::Ungrab);
-        let tail_frame = e3
+        let tail_move = e3
             .iter()
             .find_map(|e| match *e {
-                FrameEffect::ConfigureFrameRoot { x, y, w, h } => Some((x, y, w, h)),
+                FrameEffect::MoveFrameRoot { x, y } => Some((x, y)),
                 _ => None,
             })
-            .expect("final frame geometry");
-        assert_eq!(tail_frame, (150, 150, 400, 300));
+            .expect("final move geometry");
+        assert_eq!(tail_move, (150, 150));
+        assert!(!has_any_frame_root(&e3));
         let frame_pos = e3
             .iter()
-            .position(|e| matches!(e, FrameEffect::ConfigureFrameRoot { .. }))
+            .position(|e| matches!(e, FrameEffect::MoveFrameRoot { .. }))
             .expect("frame");
         let ungrab_pos = e3
             .iter()
@@ -952,6 +1081,13 @@ mod tests {
             },
         );
         let mut total_local = 0;
+        let mut total_configure_root = 0;
+        let mut total_layout = 0;
+        let mut total_paint = 0;
+        let mut total_shape = 0;
+        let mut total_move_root = 0;
+        let mut total_notify = 0;
+        let mut total_noop = 0;
         for i in 0..1000 {
             let dx = (i % 100) - 50;
             let dy = ((i * 7) % 100) - 50;
@@ -961,9 +1097,70 @@ mod tests {
                     pointer: RootPoint::new(150 + dx, 120 + dy),
                 },
             );
-            total_local += count_local(&e);
+            // Move motion emits either Noop (zero/non-plan delta) or exactly
+            // [MoveFrameRoot, NotifyClientRoot]; nothing else is representable.
+            if e == vec![FrameEffect::Noop] {
+                total_noop += 1;
+                continue;
+            }
+            assert_eq!(
+                e.len(),
+                2,
+                "move motion must emit exactly move+notify (sample {i})"
+            );
+            assert!(
+                matches!(e[0], FrameEffect::MoveFrameRoot { .. }),
+                "move[0] must be MoveFrameRoot (sample {i})"
+            );
+            assert!(
+                matches!(e[1], FrameEffect::NotifyClientRoot { .. }),
+                "move[1] must be NotifyClientRoot (sample {i})"
+            );
+            for fx in &e {
+                match fx {
+                    FrameEffect::ConfigureClientLocal { .. } => total_local += 1,
+                    FrameEffect::ConfigureFrameRoot { .. } => total_configure_root += 1,
+                    FrameEffect::LayoutInput => total_layout += 1,
+                    FrameEffect::PaintChrome => total_paint += 1,
+                    FrameEffect::ApplyShape => total_shape += 1,
+                    FrameEffect::MoveFrameRoot { .. } => total_move_root += 1,
+                    FrameEffect::NotifyClientRoot { .. } => total_notify += 1,
+                    _ => panic!("unexpected move effect {fx:?} (sample {i})"),
+                }
+            }
         }
         assert_eq!(total_local, 0);
+        assert_eq!(total_configure_root, 0);
+        assert_eq!(total_layout, 0);
+        assert_eq!(total_paint, 0);
+        assert_eq!(total_shape, 0);
+        assert_eq!(total_move_root, total_notify);
+        assert!(total_move_root > 0, "expected non-noop move samples");
+        assert!(total_noop > 0, "expected at least one noop sample");
+    }
+
+    #[test]
+    fn resize_still_uses_full_configure_frame_root() {
+        let s0 = floating_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 2,
+                pointer: RootPoint::new(500, 400),
+            },
+        );
+        let (_, e) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(550, 460),
+            },
+        );
+        assert!(
+            e.iter()
+                .any(|fx| matches!(fx, FrameEffect::ConfigureFrameRoot { .. })),
+            "resize motion must keep full ConfigureFrameRoot"
+        );
+        assert_eq!(count_local(&e), 1);
     }
 
     #[test]
@@ -1075,6 +1272,24 @@ mod tests {
     }
 
     #[test]
+    fn client_configure_request_frame_size_as_intent_grows_frame() {
+        // M01 intent: ClientConfigureRequest carries client-window geometry
+        // only. A frame-sized observation ((400,300) = outer incl. titlebar)
+        // fed as client intent grows the frame by the titlebar: (100,100,
+        // 400,300) -> (100,100,400,331). ConfigureNotify observations must
+        // therefore never be constructed into this event by the live owner.
+        let s0 = floating_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::ClientConfigureRequest {
+                root_origin: RootPoint::new(100, 131),
+                size: Some((400, 300)),
+            },
+        );
+        assert_eq!(s1.placement.current, RootRect::new(100, 100, 400, 331));
+    }
+
+    #[test]
     fn border_does_not_change_local_geometry() {
         use super::super::geometry::frame_to_client_local;
         let thin = FrameExtents::new(31, 0);
@@ -1083,5 +1298,450 @@ mod tests {
             frame_to_client_local(START, thin),
             frame_to_client_local(START, thick)
         );
+    }
+
+    // CONTRACT-REGRESSION T01: threshold keeps a press below activation inert.
+    // TRIGGER: title press followed by a three-pixel motion.
+    // OBSERVABLE RESULT: placement and motion effects remain unchanged.
+    // UNCOVERED GAP: current reducer activates every title press immediately.
+    // FAILURE MUTATION: remove the four-pixel activation threshold.
+    // REPRESENTATIVE CASE: ordinary floating title drag.
+    #[test]
+    fn t01_title_motion_below_four_pixels_is_pending() {
+        let s0 = floating_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(150, 120),
+            },
+        );
+        let (s2, _effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(153, 120),
+            },
+        );
+        assert!(matches!(s1.session, InteractionSession::Move(_)));
+        assert_eq!(s1.placement, s0.placement);
+        assert_eq!(s2.placement.mode, PlacementMode::Floating);
+        assert_eq!(s2.placement.current, s0.placement.current);
+        assert_eq!(
+            (s2.placement.current.w, s2.placement.current.h),
+            (s0.placement.current.w, s0.placement.current.h)
+        );
+        assert_eq!(s2.placement.floating_restore, s0.placement.floating_restore);
+    }
+
+    // CONTRACT-REGRESSION T02: activation occurs at the four-pixel boundary.
+    // TRIGGER: title press followed by exactly four pixels of motion.
+    // OBSERVABLE RESULT: max drag activates restore on the exact boundary.
+    // UNCOVERED GAP: threshold and press snapshot are not represented together.
+    // FAILURE MUTATION: change the boundary to three pixels or use incremental state.
+    // REPRESENTATIVE CASE: exact threshold maximized drag-away.
+    #[test]
+    fn t02_title_motion_at_four_pixels_activates_from_snapshot() {
+        let s0 = maximized_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        let (s2, effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(964, 20),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Floating);
+        assert_eq!(
+            (s2.placement.current.w, s2.placement.current.h),
+            (
+                s0.placement.floating_restore.w,
+                s0.placement.floating_restore.h
+            )
+        );
+        assert!(has_full_configure(&effects));
+    }
+
+    // CONTRACT-REGRESSION T03: maximized press keeps authoritative placement.
+    // TRIGGER: title press while maximized.
+    // OBSERVABLE RESULT: current remains work-area/maximized; pending snapshot is Floating.
+    // UNCOVERED GAP: current press labels the restore snapshot Maximized.
+    // FAILURE MUTATION: store the current mode instead of Floating in MoveSession.
+    // REPRESENTATIVE CASE: maximize then drag.
+    #[test]
+    fn t03_maximized_press_has_floating_pending_snapshot() {
+        let s0 = maximized_state();
+        let (s1, effects) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        assert_eq!(s1.placement, s0.placement);
+        assert!(effects.contains(&FrameEffect::Grab {
+            window: 71,
+            cursor: flamewm_render_core::CursorKind::Move,
+        }));
+        match s1.session {
+            InteractionSession::Move(session) => {
+                assert_eq!(session.start_placement.mode, PlacementMode::Floating);
+                assert_eq!(
+                    (
+                        session.start_placement.rect.w,
+                        session.start_placement.rect.h
+                    ),
+                    (
+                        s0.placement.floating_restore.w,
+                        s0.placement.floating_restore.h
+                    )
+                );
+                assert_ne!(session.start_placement.rect, s0.placement.current);
+            }
+            other => panic!("expected pending move session, got {other:?}"),
+        }
+    }
+
+    // CONTRACT-REGRESSION T04: snapped press also records a Floating restore.
+    // TRIGGER: title press while snapped left.
+    // OBSERVABLE RESULT: snapped current rect stays authoritative until activation.
+    // UNCOVERED GAP: current snapped branch snapshots the snapped mode/rect.
+    // FAILURE MUTATION: treat snapped press as an ordinary move immediately.
+    // REPRESENTATIVE CASE: snapped title drag-away.
+    #[test]
+    fn t04_snapped_press_has_floating_pending_snapshot() {
+        let s0 = snapped_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(500, 20),
+            },
+        );
+        assert_eq!(s1.placement, s0.placement);
+        match s1.session {
+            InteractionSession::Move(session) => {
+                assert_eq!(session.start_placement.mode, PlacementMode::Floating);
+                assert_eq!(
+                    (
+                        session.start_placement.rect.w,
+                        session.start_placement.rect.h
+                    ),
+                    (
+                        s0.placement.floating_restore.w,
+                        s0.placement.floating_restore.h
+                    )
+                );
+                assert_ne!(session.start_placement.rect, s0.placement.current);
+            }
+            other => panic!("expected pending move session, got {other:?}"),
+        }
+    }
+
+    // CONTRACT-REGRESSION T05: first maximized drag-away is a full restore.
+    // TRIGGER: maximized title press, then motion beyond four pixels.
+    // OBSERVABLE RESULT: Floating/restore size plus full configure effects.
+    // UNCOVERED GAP: current motion keeps Maximized and emits position-only effects.
+    // FAILURE MUTATION: replace restore configure with MoveFrameRoot only.
+    // REPRESENTATIVE CASE: maximized window first activated motion.
+    #[test]
+    fn t05_maximized_first_drag_away_restores_with_full_configure() {
+        let s0 = maximized_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        let (s2, effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(965, 25),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Floating);
+        assert_eq!(
+            (s2.placement.current.w, s2.placement.current.h),
+            (
+                s0.placement.floating_restore.w,
+                s0.placement.floating_restore.h
+            )
+        );
+        assert!(has_full_configure(&effects));
+        assert!(effects.contains(&FrameEffect::LayoutInput));
+        assert!(effects.contains(&FrameEffect::PaintChrome));
+        assert!(effects.contains(&FrameEffect::ApplyShape));
+        assert!(!effects.contains(&FrameEffect::Ungrab));
+    }
+
+    // CONTRACT-REGRESSION T06: snapped drag-away uses the same full restore path.
+    // TRIGGER: snapped title press, then motion beyond four pixels.
+    // OBSERVABLE RESULT: Floating restore dimensions and full configure effects.
+    // UNCOVERED GAP: current snapped motion resizes/moves while retaining Snapped.
+    // FAILURE MUTATION: omit the one-time snapped-to-floating transition.
+    // REPRESENTATIVE CASE: left-snapped window first activated motion.
+    #[test]
+    fn t06_snapped_first_drag_away_restores_with_full_configure() {
+        let s0 = snapped_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(500, 20),
+            },
+        );
+        let (s2, effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(505, 25),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Floating);
+        assert_eq!(
+            (s2.placement.current.w, s2.placement.current.h),
+            (
+                s0.placement.floating_restore.w,
+                s0.placement.floating_restore.h
+            )
+        );
+        assert!(has_full_configure(&effects));
+        assert!(effects.contains(&FrameEffect::LayoutInput));
+        assert!(effects.contains(&FrameEffect::PaintChrome));
+        assert!(effects.contains(&FrameEffect::ApplyShape));
+    }
+
+    // CONTRACT-REGRESSION T07: only the first activated motion restores size.
+    // TRIGGER: max drag-away followed by a second motion.
+    // OBSERVABLE RESULT: second motion is position-only and preserves Floating size.
+    // UNCOVERED GAP: current reducer has no first-activation distinction.
+    // FAILURE MUTATION: emit full configure effects on every move motion.
+    // REPRESENTATIVE CASE: repeated maximized drag motion.
+    #[test]
+    fn t07_second_motion_after_restore_is_position_only() {
+        let s0 = maximized_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        let (s2, _) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(965, 25),
+            },
+        );
+        let (s3, effects) = reduce(
+            &s2,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(985, 45),
+            },
+        );
+        assert_eq!(s3.placement.mode, PlacementMode::Floating);
+        assert_eq!(
+            (s3.placement.current.w, s3.placement.current.h),
+            (
+                s0.placement.floating_restore.w,
+                s0.placement.floating_restore.h
+            )
+        );
+        assert_position_only(&effects);
+    }
+
+    // CONTRACT-REGRESSION T08: WM-owned fullscreen/maximized resize is refused.
+    // TRIGGER: resize press and motion in each non-resizable WM-owned mode.
+    // OBSERVABLE RESULT: no resize session, geometry, or native effects.
+    // UNCOVERED GAP: current reducer starts ResizeSession in both modes.
+    // FAILURE MUTATION: allow plan_resize to mutate current while mode-owned.
+    // REPRESENTATIVE CASE: bottom-right resize against max/fullscreen.
+    #[test]
+    fn t08_maximized_and_fullscreen_resize_is_refused() {
+        for mode in [PlacementMode::Maximized, PlacementMode::Fullscreen] {
+            let mut s0 = floating_state();
+            s0.placement.mode = mode;
+            s0.placement.current = if mode == PlacementMode::Maximized {
+                WA
+            } else {
+                SCREEN
+            };
+            let (s1, press_effects) = reduce(
+                &s0,
+                FrameEvent::Press {
+                    source: 2,
+                    pointer: RootPoint::new(1900, 1050),
+                },
+            );
+            assert!(s1.session.is_idle(), "mode {mode:?}");
+            assert_eq!(s1.placement, s0.placement, "mode {mode:?}");
+            assert_eq!(press_effects, vec![FrameEffect::Noop], "mode {mode:?}");
+            let (s2, motion_effects) = reduce(
+                &s1,
+                FrameEvent::Motion {
+                    pointer: RootPoint::new(1950, 1100),
+                },
+            );
+            assert_eq!(s2.placement, s0.placement, "mode {mode:?}");
+            assert_eq!(motion_effects, vec![FrameEffect::Noop], "mode {mode:?}");
+        }
+    }
+
+    // CONTRACT-REGRESSION T09: snapped resize exits snapped mode once.
+    // TRIGGER: snapped resize press, first resize motion, then another motion.
+    // OBSERVABLE RESULT: one Floating transition; later resize stays Floating.
+    // UNCOVERED GAP: current resize retains Snapped while changing its rect.
+    // FAILURE MUTATION: apply resize without clearing the snapped mode.
+    // REPRESENTATIVE CASE: left-snapped bottom-right resize.
+    #[test]
+    fn t09_snapped_resize_exits_once_and_stays_floating() {
+        let s0 = snapped_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 2,
+                pointer: RootPoint::new(960, 1080),
+            },
+        );
+        let (s2, first_effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(965, 1085),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Floating);
+        assert!(has_full_configure(&first_effects));
+        let (s3, second_effects) = reduce(
+            &s2,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(985, 1105),
+            },
+        );
+        assert_eq!(s3.placement.mode, PlacementMode::Floating);
+        assert!(has_full_configure(&second_effects));
+    }
+
+    // CONTRACT-REGRESSION T11: mode/rect invariants survive pending max motion.
+    // TRIGGER: maximized title press followed by sub-threshold motion.
+    // OBSERVABLE RESULT: Maximized still owns the work-area rect.
+    // UNCOVERED GAP: current placement is rewritten from the restore snapshot.
+    // FAILURE MUTATION: mutate current before activation is complete.
+    // REPRESENTATIVE CASE: three-pixel max drag jitter.
+    #[test]
+    fn t11_maximized_pending_motion_preserves_mode_rect_invariant() {
+        let s0 = maximized_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        let (s2, _effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(963, 20),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Maximized);
+        assert!(!matches!(s2.placement.mode, PlacementMode::Snapped(_)));
+    }
+
+    // CONTRACT-REGRESSION T12: mode/rect invariants survive pending snap motion.
+    // TRIGGER: snapped title press followed by sub-threshold motion.
+    // OBSERVABLE RESULT: Snapped still owns its snap rect.
+    // UNCOVERED GAP: current move planner can change current under Snapped.
+    // FAILURE MUTATION: let pending motion update authoritative placement.
+    // REPRESENTATIVE CASE: three-pixel left-snap drag jitter.
+    #[test]
+    fn t12_snapped_pending_motion_preserves_mode_rect_invariant() {
+        let s0 = snapped_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(500, 20),
+            },
+        );
+        let (s2, _effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(503, 20),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Snapped(SnapTarget::Left));
+        assert_eq!(
+            (s2.placement.current.w, s2.placement.current.h),
+            (s0.placement.current.w, s0.placement.current.h)
+        );
+        assert_eq!(s2.placement.floating_restore, s0.placement.floating_restore);
+        assert_eq!(s2.placement.current, s0.placement.current);
+    }
+
+    // CONTRACT-REGRESSION T13: first restore is full configure, not a move alias.
+    // TRIGGER: max drag-away at the activation boundary.
+    // OBSERVABLE RESULT: frame root, client local, and client root all configure.
+    // UNCOVERED GAP: current max path emits only MoveFrameRoot plus notify.
+    // FAILURE MUTATION: collapse restore into position-only effects.
+    // REPRESENTATIVE CASE: exactly four-pixel max activation.
+    #[test]
+    fn t13_max_restore_activation_has_all_geometry_domains() {
+        let s0 = maximized_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        let (s2, effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(964, 24),
+            },
+        );
+        assert_eq!(s2.placement.mode, PlacementMode::Floating);
+        assert!(has_full_configure(&effects));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, FrameEffect::MoveFrameRoot { .. }))
+        );
+    }
+
+    // CONTRACT-REGRESSION T14: activation and later motion have distinct plans.
+    // TRIGGER: max press, first drag-away, then a second drag motion.
+    // OBSERVABLE RESULT: full configure once, position-only thereafter.
+    // UNCOVERED GAP: current reducer uses one position-only plan for both.
+    // FAILURE MUTATION: reuse the first activation plan for subsequent motions.
+    // REPRESENTATIVE CASE: two-sample maximized drag.
+    #[test]
+    fn t14_restore_then_motion_has_one_full_then_position_only_plan() {
+        let s0 = maximized_state();
+        let (s1, _) = reduce(
+            &s0,
+            FrameEvent::Press {
+                source: 1,
+                pointer: RootPoint::new(960, 20),
+            },
+        );
+        let (s2, first_effects) = reduce(
+            &s1,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(965, 25),
+            },
+        );
+        assert!(has_full_configure(&first_effects));
+        let (_, second_effects) = reduce(
+            &s2,
+            FrameEvent::Motion {
+                pointer: RootPoint::new(985, 45),
+            },
+        );
+        assert_position_only(&second_effects);
     }
 }

@@ -16,6 +16,7 @@ pub struct MoveAnchor {
     pub frac_num: u32,
     pub frac_den: u32,
     pub vertical_offset: i32,
+    activated: bool,
 }
 
 impl MoveAnchor {
@@ -25,7 +26,17 @@ impl MoveAnchor {
             frac_num,
             frac_den,
             vertical_offset,
+            activated: false,
         }
+    }
+
+    pub(crate) fn activate(&mut self) {
+        self.activated = true;
+    }
+
+    #[must_use]
+    pub(crate) const fn is_activated(self) -> bool {
+        self.activated
     }
 
     /// Horizontal anchor fraction clamped to `0..=1`.

@@ -8,6 +8,9 @@ permissions:
   - action: subagent
     resource: "*"
     effect: deny
+  - action: skill
+    resource: "*"
+    effect: allow
 ---
 
 Repair only exact paths named by parent handoff. Inspect those paths and necessary direct callers before editing. Make smallest root-cause patch. Do not touch any unassigned path, run shell commands, delegate, build, test, format, or expand scope. If exact scope cannot safely repair cause, stop and report blocker.

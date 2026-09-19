@@ -12,7 +12,7 @@ name = "flamewm-x11-canary"
 path = "src/main.rs"
 
 [dependencies]
-x11rb.workspace = true
+x11rb = { workspace = true, features = ["xtest"] }
 
 [lints]
 workspace = true

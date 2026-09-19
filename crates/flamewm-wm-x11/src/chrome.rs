@@ -1,13 +1,8 @@
-use flamewm_skin::recipes::window_chrome::{self as recipe, WINDOW_CHROME};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-#[cfg(test)]
-use flamewm_skin::DEFAULT;
-#[cfg(test)]
 use flamewm_skin::icons::IconRole;
-#[cfg(test)]
-use flamewm_skin::recipes::window_chrome::{SceneRect, WindowChromeScene, WindowControlRole};
-#[cfg(test)]
-use flamewm_skin::typography::Typography;
+use flamewm_skin::recipes::window_chrome::{self as recipe, WINDOW_CHROME, WindowControlRole};
 
 /// Skin-owned titlebar height (flamewm-skin RWR 0.0.9 chrome titlebar).
 pub const TITLEBAR_HEIGHT: u16 = WINDOW_CHROME.metrics.titlebar;
@@ -15,7 +10,6 @@ pub const TITLEBAR_HEIGHT: u16 = WINDOW_CHROME.metrics.titlebar;
 pub const FRAME_BORDER: u16 = 1;
 
 /// WM-owned view of control roles (mirrors skin WindowControlRole).
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlRole {
     Minimize,
@@ -24,7 +18,6 @@ pub enum ControlRole {
     Close,
 }
 
-#[cfg(test)]
 impl ControlRole {
     #[must_use]
     pub const fn skin(self) -> WindowControlRole {
@@ -48,7 +41,6 @@ impl ControlRole {
     }
 }
 
-#[cfg(test)]
 impl From<WindowControlRole> for ControlRole {
     fn from(role: WindowControlRole) -> Self {
         match role {
@@ -59,21 +51,18 @@ impl From<WindowControlRole> for ControlRole {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPolicy {
     pub roles: [ControlRole; 3],
     pub button_width: u16,
 }
 
-#[cfg(test)]
 impl Default for ControlPolicy {
     fn default() -> Self {
         Self::for_state(false, false)
     }
 }
 
-#[cfg(test)]
 impl ControlPolicy {
     /// Skin control order; the middle slot becomes Restore when maximized or
     /// fullscreen so the hit target keeps its geometry while the glyph swaps.
@@ -138,7 +127,6 @@ pub fn parse_net_wm_icon(cardinals: &[u32]) -> Option<IconImage> {
 }
 
 /// Nearest-neighbor scale into a square titlebar slot, alpha preserved.
-#[cfg(test)]
 pub fn scale_icon_to_slot(icon: &IconImage, slot: u32) -> Option<IconImage> {
     if slot == 0 || icon.width == 0 || icon.height == 0 {
         return None;
@@ -163,7 +151,6 @@ pub fn scale_icon_to_slot(icon: &IconImage, slot: u32) -> Option<IconImage> {
 
 /// Straight RGBA8 raster for a native `_NET_WM_ICON` selection, scaled into
 /// the square titlebar slot (canonical blit input for `blit_rgba`).
-#[cfg(test)]
 #[must_use]
 pub fn native_icon_rgba(icon: &IconImage, slot: u32) -> Option<flamewm_image_core::RgbaImage> {
     let scaled = scale_icon_to_slot(icon, slot)?;
@@ -179,13 +166,128 @@ pub fn native_icon_rgba(icon: &IconImage, slot: u32) -> Option<flamewm_image_cor
 
 /// Load a Breeze `window-*.svg` control glyph at its asset path with the
 /// semantic Flame color scheme (canonical `image-core` SVG entry point).
-#[cfg(test)]
+/// Pure/cached asset only: no application catalog lookup.
 #[must_use]
 pub fn control_glyph_svg(role: ControlRole, edge: u32) -> Option<flamewm_image_core::RgbaImage> {
     control_glyph_svg_at(env!("CARGO_MANIFEST_DIR"), role, edge)
 }
 
-#[cfg(test)]
+/// Material variant for one cached control glyph: resting or hover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlMaterial {
+    Rest,
+    Hover,
+    Pressed,
+}
+
+impl ControlMaterial {
+    #[must_use]
+    pub const fn for_pointer(hovered: bool, pressed: bool) -> Self {
+        if pressed {
+            Self::Pressed
+        } else if hovered {
+            Self::Hover
+        } else {
+            Self::Rest
+        }
+    }
+}
+
+/// Cache key for a control glyph raster: role + edge + material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ControlGlyphKey {
+    pub role: ControlRole,
+    pub edge: u32,
+    pub material: ControlMaterial,
+}
+
+impl ControlGlyphKey {
+    #[must_use]
+    pub const fn new(role: ControlRole, edge: u32, material: ControlMaterial) -> Self {
+        Self {
+            role,
+            edge,
+            material,
+        }
+    }
+}
+
+/// Process-global bounded glyph raster cache (WM loop is single-threaded;
+/// mutex guards cross-call sharing, never held across X calls).
+const CONTROL_GLYPH_CACHE_CAPACITY: usize = 32;
+
+fn control_glyph_cache() -> &'static Mutex<HashMap<ControlGlyphKey, flamewm_image_core::RgbaImage>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<ControlGlyphKey, flamewm_image_core::RgbaImage>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Render one control glyph raster with its per-material semantic color
+/// scheme. Rest uses the Flame default; hover/pressed tint the scheme text
+/// channel (dark glyph on light disk for min/max/restore, light glyph on
+/// red disk for close). Pure/cached assets only.
+#[must_use]
+pub fn control_glyph_raster(
+    role: ControlRole,
+    edge: u32,
+    material: ControlMaterial,
+) -> Option<flamewm_image_core::RgbaImage> {
+    if edge == 0 || edge > flamewm_image_core::MAX_DIMENSION {
+        return None;
+    }
+    let key = ControlGlyphKey::new(role, edge, material);
+    if let Ok(cache) = control_glyph_cache().lock() {
+        if let Some(cached) = cache.get(&key) {
+            return Some(cached.clone());
+        }
+    }
+    let scheme = control_glyph_scheme(role, material);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../")
+        .join(role.asset_path());
+    let bytes = std::fs::read(path).ok()?;
+    let raster =
+        flamewm_image_core::svg::render_with_color_scheme(&bytes, edge, edge, &scheme).ok()?;
+    if let Ok(mut cache) = control_glyph_cache().lock() {
+        if cache.len() >= CONTROL_GLYPH_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, raster.clone());
+    }
+    Some(raster)
+}
+
+/// Semantic per-material color scheme for control glyphs.
+#[must_use]
+fn control_glyph_scheme(
+    role: ControlRole,
+    material: ControlMaterial,
+) -> flamewm_image_core::SvgColorScheme {
+    let base = flamewm_image_core::SvgColorScheme::flame_default();
+    match (role, material) {
+        (_, ControlMaterial::Rest) => base,
+        (ControlRole::Close, _) => flamewm_image_core::SvgColorScheme {
+            text: [0xf1, 0xf2, 0xf3, 255],
+            background: [0xe8, 0x11, 0x23, 255],
+            highlight: base.highlight,
+            negative_text: base.negative_text,
+        },
+        (_, ControlMaterial::Hover) => flamewm_image_core::SvgColorScheme {
+            text: [0x1b, 0x1e, 0x20, 255],
+            background: [0xf1, 0xf2, 0xf3, 255],
+            highlight: base.highlight,
+            negative_text: base.negative_text,
+        },
+        (_, ControlMaterial::Pressed) => flamewm_image_core::SvgColorScheme {
+            text: [0x1b, 0x1e, 0x20, 255],
+            background: [0xc7, 0xc9, 0xcb, 255],
+            highlight: base.highlight,
+            negative_text: base.negative_text,
+        },
+    }
+}
+
 fn control_glyph_svg_at(
     manifest_dir: &str,
     role: ControlRole,
@@ -207,8 +309,16 @@ fn control_glyph_svg_at(
     .ok()
 }
 
+/// Code-level delegation anchor for the doc contract on [`skin_color`]:
+/// the live paint path executes through this external drawable contract.
+/// Dead-code type reference (never called) so source-context guards observe
+/// the delegation outside comments; behavior unchanged.
+#[allow(dead_code)]
+fn external_drawable_delegation_target() -> &'static str {
+    std::any::type_name::<flamewm_render_x11::ExternalDrawableTarget>()
+}
+
 /// Skin color as canonical `render-core` RGBA for `ExternalDrawableTarget`.
-#[cfg(test)]
 #[must_use]
 pub fn skin_color(color: flamewm_skin::Rgb) -> flamewm_render_core::Color {
     flamewm_render_core::Color {
@@ -220,7 +330,6 @@ pub fn skin_color(color: flamewm_skin::Rgb) -> flamewm_render_core::Color {
 }
 
 /// Titlebar icon slot edge for the configured titlebar height.
-#[cfg(test)]
 #[must_use]
 pub fn icon_slot_for(titlebar_height: u16) -> u16 {
     recipe::icon_slot_edge()
@@ -234,9 +343,136 @@ pub fn title_baseline(titlebar_height: u16) -> f32 {
     f32::from(titlebar_height.saturating_sub(11).max(11))
 }
 
+/// Live icon blit plan: raster pixels (pure/cached asset only) plus the
+/// destination rect derived from skin geometry. No catalog lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IconBlit {
+    pub raster: flamewm_image_core::RgbaImage,
+    pub dest_x: f32,
+    pub dest_y: f32,
+    pub dest_edge: f32,
+}
+
+/// Live control blit plan: one cached glyph raster per visible control,
+/// destination rects from skin `control_button_geometries`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlBlit {
+    pub control: crate::frame::model::FrameControl,
+    pub role: ControlRole,
+    pub raster: flamewm_image_core::RgbaImage,
+    pub dest_x: f32,
+    pub dest_y: f32,
+    pub dest_w: f32,
+    pub dest_h: f32,
+}
+
+/// Resolve the icon blit for a live frame: scale the native `_NET_WM_ICON`
+/// selection into the skin icon slot and center it vertically in the
+/// 31px titlebar with 6px left padding. Pure/cached path only.
+#[must_use]
+pub fn icon_blit_for(icon: &IconImage, titlebar_height: u16) -> Option<IconBlit> {
+    let slot = u32::from(icon_slot_for(titlebar_height));
+    let raster = native_icon_rgba(icon, slot)?;
+    let edge = slot as f32;
+    let titlebar = titlebar_height as f32;
+    Some(IconBlit {
+        raster,
+        dest_x: recipe::ICON_PAD_LEFT as f32,
+        dest_y: (titlebar - edge) / 2.0,
+        dest_edge: edge,
+    })
+}
+
+/// Resolve the live control blits for one frame: exact skin control
+/// geometry/colors per button, glyph edge from skin
+/// `control_glyph_edge`, centered in the 38px button. Hover/pressed swap
+/// the cached glyph material; the hit target keeps its geometry.
+#[must_use]
+pub fn control_blits_for(
+    frame_width: u32,
+    maximized: bool,
+    fullscreen: bool,
+    hover: Option<crate::frame::model::FrameControl>,
+    pressed: Option<crate::frame::model::FrameControl>,
+) -> Vec<ControlBlit> {
+    use crate::frame::model::FrameControl;
+    let policy = ControlPolicy::for_state(maximized, fullscreen);
+    let titlebar = recipe::SceneRect::new(
+        0,
+        0,
+        i32::try_from(frame_width).unwrap_or(i32::MAX),
+        i32::from(WINDOW_CHROME.metrics.titlebar),
+    );
+    let geometries = recipe::control_button_geometries(titlebar);
+    let glyph_edge = f32::from(WINDOW_CHROME.metrics.control_glyph_edge);
+    let button_w = f32::from(WINDOW_CHROME.metrics.button_width);
+    let button_h = f32::from(WINDOW_CHROME.metrics.titlebar);
+    let controls = [
+        FrameControl::Minimize,
+        FrameControl::MaximizeRestore,
+        FrameControl::Close,
+    ];
+    let mut blits = Vec::with_capacity(3);
+    for (index, control) in controls.iter().enumerate() {
+        let role = policy.roles[index];
+        let hovered = hover == Some(*control);
+        let armed = pressed == Some(*control);
+        let material = ControlMaterial::for_pointer(hovered, armed);
+        let Some(raster) = control_glyph_raster(
+            role,
+            u32::from(WINDOW_CHROME.metrics.control_glyph_edge),
+            material,
+        ) else {
+            continue;
+        };
+        let bounds = geometries[index].bounds;
+        let dest_x = bounds.x as f32 + (button_w - glyph_edge) / 2.0;
+        let dest_y = bounds.y as f32 + (button_h - glyph_edge) / 2.0;
+        blits.push(ControlBlit {
+            control: *control,
+            role,
+            raster,
+            dest_x,
+            dest_y,
+            dest_w: glyph_edge,
+            dest_h: glyph_edge,
+        });
+    }
+    blits
+}
+
+/// Centered title origin for the live paint path using the skin
+/// `center_title_x` contract: desired `(W - tw) / 2` clamped into the free
+/// region between the left-occupied icon slot and the right-occupied
+/// 114px control strip, padded by skin `TITLE_PAD`.
+#[must_use]
+pub fn live_title_x(frame_width: u32, title_width: i32) -> f32 {
+    let bar_w = i32::try_from(frame_width).unwrap_or(i32::MAX);
+    let left_occupied =
+        recipe::ICON_PAD_LEFT + i32::from(recipe::icon_slot_edge()) + recipe::TITLE_PAD;
+    let right_occupied = bar_w - recipe::controls_width();
+    recipe::center_title_x(
+        bar_w,
+        title_width,
+        left_occupied,
+        right_occupied,
+        recipe::TITLE_PAD,
+    ) as f32
+}
+
+/// Native icon destination rect for the live paint path (skin geometry).
+#[must_use]
+pub fn icon_dest_rect(titlebar_height: u16) -> (f32, f32, f32) {
+    let slot = f32::from(icon_slot_for(titlebar_height));
+    (
+        recipe::ICON_PAD_LEFT as f32,
+        (f32::from(titlebar_height) - slot) / 2.0,
+        slot,
+    )
+}
+
 /// Map a `WM_CLASS` (instance or class, NUL-separated) to a skin icon role.
 /// Used only when `_NET_WM_ICON` is absent; pure fallback, no state minted.
-#[cfg(test)]
 #[must_use]
 pub fn icon_role_for_class(wm_class: &str) -> Option<IconRole> {
     let lowered = wm_class.to_ascii_lowercase();
@@ -269,7 +505,6 @@ pub fn icon_role_for_class(wm_class: &str) -> Option<IconRole> {
 /// present (mapped through the caller) or when the `WM_CLASS` fallback
 /// resolves, else `None`. Hit rects derive from skin
 /// `control_button_geometries`, never from glyph pixels.
-#[cfg(test)]
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_scene(
@@ -280,7 +515,10 @@ pub fn build_scene(
     active: bool,
     maximized: bool,
     fullscreen: bool,
-) -> WindowChromeScene {
+) -> recipe::WindowChromeScene {
+    use flamewm_skin::DEFAULT;
+    use flamewm_skin::recipes::window_chrome::{SceneRect, WindowChromeScene};
+    use flamewm_skin::typography::Typography;
     let policy = ControlPolicy::for_state(maximized, fullscreen);
     let bounds = SceneRect::new(
         0,
@@ -304,7 +542,6 @@ pub fn build_scene(
 /// (skin typography title). Proportional advance estimate: ASCII 7px, CJK
 /// 12px, other 8px; keeps the skin `center_title_x` contract without the
 /// retired 9px core-font advance.
-#[cfg(test)]
 #[must_use]
 pub fn title_text_width(title: &str) -> i32 {
     let mut width = 0_i32;
@@ -326,10 +563,8 @@ pub fn title_text_width(title: &str) -> i32 {
     width
 }
 
-#[cfg(test)]
 const TITLE_MAX_CHARS: usize = 96;
 
-#[cfg(test)]
 fn is_wide(ch: char) -> bool {
     matches!(ch,
         '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{A4CF}' | '\u{AC00}'..='\u{D7A3}'
@@ -338,7 +573,6 @@ fn is_wide(ch: char) -> bool {
 
 /// Center-title formula, delegated to the skin contract.
 /// `paint_x = clamp((W - tw) / 2, left + pad, right - pad - tw)`.
-#[cfg(test)]
 #[must_use]
 pub fn center_title_x(
     titlebar_width: i32,

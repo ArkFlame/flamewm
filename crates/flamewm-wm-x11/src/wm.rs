@@ -20,21 +20,26 @@ use crate::chrome;
 use crate::classifier::{WindowKind, classify};
 use crate::client::ManagedClient;
 use crate::event_pump::WmEventPump;
-use crate::frame::chrome as frame_chrome;
-use crate::frame::controller::{ControllerState, FrameEffect, FrameEvent, reduce};
+use crate::frame::controller::{ControllerState, FrameEffect, FrameEvent};
 use crate::frame::coords::{RootPoint, RootRect};
 use crate::frame::geometry::{
     FrameExtents, GeometryReason, GeometryRequest, frame_to_client_root, plan_client_configure,
 };
-use crate::frame::layout::layout_frame_children_default;
-use crate::frame::model::{FrameControl, FrameRegion, PlacementMode, PlacementSnapshot};
+use crate::frame::model::{
+    FrameControl, FrameRegion, PlacementMode, PlacementSnapshot, ResizeEdges,
+};
 use crate::frame::resources::{
     FrameRegistry, FrameResources, INPUT_CHILD_EVENT_MASK, cursor_for_region,
 };
-use crate::frame::session::InteractionSession;
+use crate::frame::session::{InteractionSession, MoveSession};
 use crate::geometry::Rect;
 use crate::size_hints::ClientSizeHints;
 use crate::snap_preview::{self, SnapPreviewSurface};
+
+pub mod chrome_runtime;
+pub mod configure;
+pub mod interaction;
+pub mod lifecycle;
 
 const BUTTON_PRIMARY: Button = 1;
 const WM_STATE_WITHDRAWN: u32 = 0;
@@ -125,6 +130,9 @@ struct ResizeCounterSet {
     received: flamewm_profiler::CounterPoint,
     coalesced: flamewm_profiler::CounterPoint,
     committed: flamewm_profiler::CounterPoint,
+    received_total: std::sync::atomic::AtomicU64,
+    coalesced_total: std::sync::atomic::AtomicU64,
+    committed_total: std::sync::atomic::AtomicU64,
     max_batch: std::sync::atomic::AtomicU64,
 }
 
@@ -135,11 +143,43 @@ fn resize_counters() -> &'static ResizeCounterSet {
         received: flamewm_profiler::CounterPoint::new("wm.resize.received"),
         coalesced: flamewm_profiler::CounterPoint::new("wm.resize.coalesced"),
         committed: flamewm_profiler::CounterPoint::new("wm.resize.commit"),
+        received_total: std::sync::atomic::AtomicU64::new(0),
+        coalesced_total: std::sync::atomic::AtomicU64::new(0),
+        committed_total: std::sync::atomic::AtomicU64::new(0),
         max_batch: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
 impl ResizeCounterSet {
+    fn record_received(&self, value: u64) {
+        self.received.increment_by(value);
+        self.received_total
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_coalesced(&self, value: u64) {
+        self.coalesced.increment_by(value);
+        self.coalesced_total
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_committed(&self, value: u64) {
+        self.committed.increment_by(value);
+        self.committed_total
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.received_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.coalesced_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.committed_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn max_batch(&self) -> usize {
         self.max_batch.load(std::sync::atomic::Ordering::Relaxed) as usize
     }
@@ -154,10 +194,524 @@ fn emit_resize_summary() {
         flamewm_debug::WM_RESIZE_SUMMARY,
         flamewm_debug::WM_RESIZE_SUMMARY_COOLDOWN,
         || {
-            let max = resize_counters().max_batch();
-            format!("received=? coalesced=? commit=? max_batch={max}")
+            let counters = resize_counters();
+            let (received, coalesced, committed) = counters.snapshot();
+            let max = counters.max_batch();
+            format!("received={received} coalesced={coalesced} commit={committed} max_batch={max}")
         },
     );
+}
+
+struct ConfigureCounterSet {
+    request_received: flamewm_profiler::CounterPoint,
+    request_accepted: flamewm_profiler::CounterPoint,
+    request_refused_interactive: flamewm_profiler::CounterPoint,
+    request_refused_mode: flamewm_profiler::CounterPoint,
+    notify_root: flamewm_profiler::CounterPoint,
+    notify_frame: flamewm_profiler::CounterPoint,
+    notify_client: flamewm_profiler::CounterPoint,
+    notify_input_child: flamewm_profiler::CounterPoint,
+    notify_expected: flamewm_profiler::CounterPoint,
+    notify_mismatch: flamewm_profiler::CounterPoint,
+    feedback_reconfigure: flamewm_profiler::CounterPoint,
+    synthetic: flamewm_profiler::CounterPoint,
+    request_received_total: std::sync::atomic::AtomicU64,
+    request_accepted_total: std::sync::atomic::AtomicU64,
+    request_refused_interactive_total: std::sync::atomic::AtomicU64,
+    request_refused_mode_total: std::sync::atomic::AtomicU64,
+    notify_root_total: std::sync::atomic::AtomicU64,
+    notify_frame_total: std::sync::atomic::AtomicU64,
+    notify_client_total: std::sync::atomic::AtomicU64,
+    notify_input_child_total: std::sync::atomic::AtomicU64,
+    notify_expected_total: std::sync::atomic::AtomicU64,
+    notify_mismatch_total: std::sync::atomic::AtomicU64,
+    feedback_total: std::sync::atomic::AtomicU64,
+    synthetic_total: std::sync::atomic::AtomicU64,
+}
+
+fn configure_counters() -> &'static ConfigureCounterSet {
+    use std::sync::OnceLock;
+    static SET: OnceLock<ConfigureCounterSet> = OnceLock::new();
+    SET.get_or_init(|| ConfigureCounterSet {
+        request_received: flamewm_profiler::CounterPoint::new("wm.configure.request.received"),
+        request_accepted: flamewm_profiler::CounterPoint::new("wm.configure.request.accepted"),
+        request_refused_interactive: flamewm_profiler::CounterPoint::new(
+            "wm.configure.request.refused_interactive",
+        ),
+        request_refused_mode: flamewm_profiler::CounterPoint::new(
+            "wm.configure.request.refused_mode",
+        ),
+        notify_root: flamewm_profiler::CounterPoint::new("wm.configure.notify.root"),
+        notify_frame: flamewm_profiler::CounterPoint::new("wm.configure.notify.frame"),
+        notify_client: flamewm_profiler::CounterPoint::new("wm.configure.notify.client"),
+        notify_input_child: flamewm_profiler::CounterPoint::new("wm.configure.notify.input_child"),
+        notify_expected: flamewm_profiler::CounterPoint::new("wm.configure.notify.expected"),
+        notify_mismatch: flamewm_profiler::CounterPoint::new("wm.configure.notify.mismatch"),
+        feedback_reconfigure: flamewm_profiler::CounterPoint::new(
+            "wm.configure.feedback_reconfigure",
+        ),
+        synthetic: flamewm_profiler::CounterPoint::new("wm.configure.synthetic"),
+        request_received_total: std::sync::atomic::AtomicU64::new(0),
+        request_accepted_total: std::sync::atomic::AtomicU64::new(0),
+        request_refused_interactive_total: std::sync::atomic::AtomicU64::new(0),
+        request_refused_mode_total: std::sync::atomic::AtomicU64::new(0),
+        notify_root_total: std::sync::atomic::AtomicU64::new(0),
+        notify_frame_total: std::sync::atomic::AtomicU64::new(0),
+        notify_client_total: std::sync::atomic::AtomicU64::new(0),
+        notify_input_child_total: std::sync::atomic::AtomicU64::new(0),
+        notify_expected_total: std::sync::atomic::AtomicU64::new(0),
+        notify_mismatch_total: std::sync::atomic::AtomicU64::new(0),
+        feedback_total: std::sync::atomic::AtomicU64::new(0),
+        synthetic_total: std::sync::atomic::AtomicU64::new(0),
+    })
+}
+
+macro_rules! configure_bump {
+    ($point:ident, $total:ident) => {{
+        let counters = configure_counters();
+        counters.$point.increment();
+        counters
+            .$total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }};
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_configure_summary() {
+    flamewm_debug::emit(
+        flamewm_debug::WM_CONFIGURE_SUMMARY,
+        std::time::Duration::from_secs(1),
+        || {
+            let counters = configure_counters();
+            let load =
+                |v: &std::sync::atomic::AtomicU64| v.load(std::sync::atomic::Ordering::Relaxed);
+            format!(
+                "requests={} accepted={} refused_interactive={} refused_mode={} notify_frame={} notify_client={} expected={} mismatch={} feedback={} synthetic={}",
+                load(&counters.request_received_total),
+                load(&counters.request_accepted_total),
+                load(&counters.request_refused_interactive_total),
+                load(&counters.request_refused_mode_total),
+                load(&counters.notify_frame_total),
+                load(&counters.notify_client_total),
+                load(&counters.notify_expected_total),
+                load(&counters.notify_mismatch_total),
+                load(&counters.feedback_total),
+                load(&counters.synthetic_total),
+            )
+        },
+    );
+}
+
+struct MoveCounterSet {
+    received: flamewm_profiler::CounterPoint,
+    coalesced: flamewm_profiler::CounterPoint,
+    committed: flamewm_profiler::CounterPoint,
+    snap_target: flamewm_profiler::CounterPoint,
+    preview: flamewm_profiler::CounterPoint,
+    received_total: std::sync::atomic::AtomicU64,
+    coalesced_total: std::sync::atomic::AtomicU64,
+    committed_total: std::sync::atomic::AtomicU64,
+    snap_target_changes: std::sync::atomic::AtomicU64,
+    preview_updates: std::sync::atomic::AtomicU64,
+    last_target: std::sync::atomic::AtomicU64,
+    toggle_max_total: std::sync::atomic::AtomicU64,
+    client_message_maximize_total: std::sync::atomic::AtomicU64,
+    state_mutations_total: std::sync::atomic::AtomicU64,
+    maximized_transitions: std::sync::atomic::AtomicU64,
+    resize_snap_blocked_total: std::sync::atomic::AtomicU64,
+}
+
+fn move_counters() -> &'static MoveCounterSet {
+    use std::sync::OnceLock;
+    static SET: OnceLock<MoveCounterSet> = OnceLock::new();
+    SET.get_or_init(|| MoveCounterSet {
+        received: flamewm_profiler::CounterPoint::new("wm.move.received"),
+        coalesced: flamewm_profiler::CounterPoint::new("wm.move.coalesced"),
+        committed: flamewm_profiler::CounterPoint::new("wm.move.commit"),
+        snap_target: flamewm_profiler::CounterPoint::new("wm.move.snap_target.count"),
+        preview: flamewm_profiler::CounterPoint::new("wm.move.preview.count"),
+        received_total: std::sync::atomic::AtomicU64::new(0),
+        coalesced_total: std::sync::atomic::AtomicU64::new(0),
+        committed_total: std::sync::atomic::AtomicU64::new(0),
+        snap_target_changes: std::sync::atomic::AtomicU64::new(0),
+        preview_updates: std::sync::atomic::AtomicU64::new(0),
+        last_target: std::sync::atomic::AtomicU64::new(u64::MAX),
+        toggle_max_total: std::sync::atomic::AtomicU64::new(0),
+        client_message_maximize_total: std::sync::atomic::AtomicU64::new(0),
+        state_mutations_total: std::sync::atomic::AtomicU64::new(0),
+        maximized_transitions: std::sync::atomic::AtomicU64::new(0),
+        resize_snap_blocked_total: std::sync::atomic::AtomicU64::new(0),
+    })
+}
+
+impl MoveCounterSet {
+    fn record_received(&self, value: u64) {
+        self.received.increment_by(value);
+        self.received_total
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_coalesced(&self, value: u64) {
+        self.coalesced.increment_by(value);
+        self.coalesced_total
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_committed(&self, value: u64) {
+        self.committed.increment_by(value);
+        self.committed_total
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_snap_target(&self, target_bits: u64) {
+        self.snap_target.increment();
+        if self
+            .last_target
+            .swap(target_bits, std::sync::atomic::Ordering::Relaxed)
+            != target_bits
+        {
+            self.snap_target_changes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn record_preview(&self) {
+        self.preview.increment();
+        self.preview_updates
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_toggle_max(&self) {
+        self.toggle_max_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_client_message_maximize(&self) {
+        self.client_message_maximize_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_placement_transition(&self, before: PlacementMode, after: PlacementMode) {
+        if before == after {
+            return;
+        }
+        self.state_mutations_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if matches!(
+            (before, after),
+            (PlacementMode::Maximized, _) | (_, PlacementMode::Maximized)
+        ) {
+            self.maximized_transitions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn record_resize_snap_blocked(&self) {
+        self.resize_snap_blocked_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            self.received_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.coalesced_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.committed_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.snap_target_changes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.preview_updates
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.last_target.load(std::sync::atomic::Ordering::Relaxed),
+            self.toggle_max_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.client_message_maximize_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.state_mutations_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.maximized_transitions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.resize_snap_blocked_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+fn snap_target_bits(target: SnapTarget) -> u64 {
+    match target {
+        SnapTarget::None => 0,
+        SnapTarget::LeftHalf => 1,
+        SnapTarget::RightHalf => 2,
+        SnapTarget::TopHalf => 3,
+        SnapTarget::BottomHalf => 4,
+        SnapTarget::TopLeftQuarter => 5,
+        SnapTarget::TopRightQuarter => 6,
+        SnapTarget::BottomLeftQuarter => 7,
+        SnapTarget::BottomRightQuarter => 8,
+        SnapTarget::Maximize => 9,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseAction {
+    None,
+    Maximize,
+    Snap(crate::frame::model::SnapTarget),
+}
+
+fn activated_move(session: Option<MoveSession>) -> Option<MoveSession> {
+    match session {
+        Some(session) if session.anchor.is_activated() => Some(session),
+        _ => None,
+    }
+}
+
+fn release_action(target: SnapTarget) -> ReleaseAction {
+    match target {
+        SnapTarget::None => ReleaseAction::None,
+        SnapTarget::Maximize => ReleaseAction::Maximize,
+        SnapTarget::LeftHalf => ReleaseAction::Snap(crate::frame::model::SnapTarget::Left),
+        SnapTarget::RightHalf => ReleaseAction::Snap(crate::frame::model::SnapTarget::Right),
+        SnapTarget::TopHalf => ReleaseAction::Snap(crate::frame::model::SnapTarget::Top),
+        SnapTarget::BottomHalf => ReleaseAction::Snap(crate::frame::model::SnapTarget::Bottom),
+        SnapTarget::TopLeftQuarter => ReleaseAction::Snap(crate::frame::model::SnapTarget::TopLeft),
+        SnapTarget::TopRightQuarter => {
+            ReleaseAction::Snap(crate::frame::model::SnapTarget::TopRight)
+        }
+        SnapTarget::BottomLeftQuarter => {
+            ReleaseAction::Snap(crate::frame::model::SnapTarget::BottomLeft)
+        }
+        SnapTarget::BottomRightQuarter => {
+            ReleaseAction::Snap(crate::frame::model::SnapTarget::BottomRight)
+        }
+    }
+}
+
+fn release_action_for_move(
+    session: Option<MoveSession>,
+    placement: Option<PlacementMode>,
+    target: SnapTarget,
+) -> ReleaseAction {
+    if activated_move(session).is_none() || placement != Some(PlacementMode::Floating) {
+        return ReleaseAction::None;
+    }
+    release_action(target)
+}
+
+fn emit_move_summary() {
+    flamewm_debug::emit(
+        flamewm_debug::WM_FRAME_MOVE_COMMITS,
+        std::time::Duration::from_secs(1),
+        || {
+            let counters = move_counters();
+            let (
+                received,
+                coalesced,
+                committed,
+                target_changes,
+                preview_updates,
+                snap_target_last,
+                toggle_max,
+                client_message_maximize,
+                state_mutations,
+                maximized_transitions,
+                resize_snap_blocked,
+            ) = counters.snapshot();
+            format!(
+                "received={received} coalesced={coalesced} commit={committed} snap_target_changes={target_changes} snap_target_last={snap_target_last} preview_updates={preview_updates} toggle_max={toggle_max} client_message_maximize={client_message_maximize} state_mutations={state_mutations} maximized_transitions={maximized_transitions} resize_snap_blocked={resize_snap_blocked}"
+            )
+        },
+    );
+}
+
+fn emit_pointer_trace(
+    id: flamewm_debug::DebugEventId,
+    phase: &str,
+    client: Window,
+    source: Window,
+    region: Option<FrameRegion>,
+    event: FrameEvent,
+    pre: InteractionSession,
+    post: Option<InteractionSession>,
+    commit: Option<&interaction::PointerCommit>,
+    placement: Option<PlacementMode>,
+    post_placement: Option<PlacementMode>,
+    snap_target: Option<String>,
+    preview: Option<bool>,
+) {
+    let pointer = match event {
+        FrameEvent::Press { pointer, .. }
+        | FrameEvent::Motion { pointer }
+        | FrameEvent::Release { pointer } => Some(pointer),
+        _ => None,
+    };
+    let delta = pointer.and_then(|point| {
+        let start = match pre {
+            InteractionSession::Move(session) => session.start_pointer,
+            InteractionSession::Resize(session) => session.start_pointer,
+            _ => return None,
+        };
+        Some((
+            point.x.saturating_sub(start.x),
+            point.y.saturating_sub(start.y),
+        ))
+    });
+    let commit = commit.map(|commit| {
+        let effects = commit
+            .effects
+            .iter()
+            .map(|effect| format!("{effect:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "grab={:?} ungrab={} abort_on_grab_fail={} effects=[{effects}]",
+            commit.grab, commit.ungrab, commit.abort_on_grab_fail
+        )
+    });
+    let cooldown = if matches!(event, FrameEvent::Motion { .. }) {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(100)
+    };
+    flamewm_debug::emit(id, cooldown, || {
+        format!(
+            "phase={phase} client={client} source={source} region={region:?} event={event:?} pointer={pointer:?} delta={delta:?} pre={pre:?} post={post:?} placement={placement:?} post_placement={post_placement:?} snap_target={snap_target:?} preview={preview:?} commit={commit:?}"
+        )
+    });
+}
+
+fn emit_native_configure<T, E: std::fmt::Debug>(
+    id: flamewm_debug::DebugEventId,
+    client: Window,
+    xid: Window,
+    detail: String,
+    result: &Result<T, E>,
+) {
+    let outcome = match result {
+        Ok(_) => "ok".to_owned(),
+        Err(error) => format!("error={error:?}"),
+    };
+    flamewm_debug::emit(id, std::time::Duration::from_millis(100), || {
+        format!("client={client} xid={xid} {detail} result={outcome}")
+    });
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointerIngress {
+    kind: &'static str,
+    event: Window,
+    child: Window,
+    root_x: i16,
+    root_y: i16,
+}
+
+#[derive(Default)]
+struct PointerIngressProbe {
+    motion_dispatched: bool,
+    motion_handled: bool,
+    last_motion: Option<PointerIngress>,
+}
+
+#[derive(Debug)]
+struct ResizeProbe {
+    client: Window,
+    source: Window,
+    region: FrameRegion,
+    start_pointer: RootPoint,
+    last_pointer: RootPoint,
+    effect_seen: bool,
+    native_first: Option<String>,
+    native_last: Option<String>,
+}
+
+fn resize_edges(session: InteractionSession) -> Option<ResizeEdges> {
+    match session {
+        InteractionSession::Resize(session) => Some(session.edges),
+        _ => None,
+    }
+}
+
+fn emit_resize_probe(
+    stage: &str,
+    boundary: &str,
+    probe: &ResizeProbe,
+    pointer: Option<RootPoint>,
+    session: InteractionSession,
+    commit: Option<&interaction::PointerCommit>,
+) {
+    let delta = pointer.map(|point| {
+        (
+            point.x.saturating_sub(probe.start_pointer.x),
+            point.y.saturating_sub(probe.start_pointer.y),
+        )
+    });
+    let session_edges = resize_edges(session).or_else(|| match probe.region {
+        FrameRegion::Resize(edges) => Some(edges),
+        _ => None,
+    });
+    let (plan_noop, plan_rect, effects) = commit.map_or_else(
+        || (None, None, String::from("[]")),
+        |commit| {
+            let rect = commit.effects.iter().find_map(|effect| match effect {
+                FrameEffect::ConfigureFrameRoot { x, y, w, h } => Some((*x, *y, *w, *h)),
+                _ => None,
+            });
+            (
+                Some(
+                    commit
+                        .effects
+                        .iter()
+                        .all(|effect| matches!(effect, FrameEffect::Noop)),
+                ),
+                rect,
+                commit
+                    .effects
+                    .iter()
+                    .map(|effect| format!("{effect:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        },
+    );
+    let id = if stage == "effect" {
+        flamewm_debug::WM_FRAME_GEOMETRY_RESIZE_NATIVE
+    } else {
+        flamewm_debug::WM_FRAME_GEOMETRY_PLAN
+    };
+    flamewm_debug::emit(id, std::time::Duration::ZERO, || {
+        format!(
+            "probe=resize_edge stage={stage} boundary={boundary} client={} source={} region={:?} session_edges={session_edges:?} pointer={pointer:?} delta={delta:?} plan_noop={plan_noop:?} plan_rect={plan_rect:?} effects=[{effects}] native_first={:?} native_last={:?}",
+            probe.client, probe.source, probe.region, probe.native_first, probe.native_last,
+        )
+    });
+}
+
+fn pointer_ingress(event: &Event) -> Option<PointerIngress> {
+    match event {
+        Event::ButtonPress(event) => Some(PointerIngress {
+            kind: "ButtonPress",
+            event: event.event,
+            child: event.child,
+            root_x: event.root_x,
+            root_y: event.root_y,
+        }),
+        Event::ButtonRelease(event) => Some(PointerIngress {
+            kind: "ButtonRelease",
+            event: event.event,
+            child: event.child,
+            root_x: event.root_x,
+            root_y: event.root_y,
+        }),
+        Event::MotionNotify(event) => Some(PointerIngress {
+            kind: "MotionNotify",
+            event: event.event,
+            child: event.child,
+            root_x: event.root_x,
+            root_y: event.root_y,
+        }),
+        _ => None,
+    }
 }
 
 struct WorkspaceCounterSet {
@@ -221,19 +775,16 @@ where
         let mut pump = WmEventPump::new();
         let mut batch: usize = 0;
         while let Some(pumped) = pump.next(conn.as_ref()).map_err(any_conn_err)? {
-            resize_counters()
-                .received
-                .increment_by(pumped.received as u64);
-            resize_counters()
-                .coalesced
-                .increment_by(pumped.coalesced as u64);
+            resize_counters().record_received(pumped.received as u64);
+            resize_counters().record_coalesced(pumped.coalesced as u64);
             batch += 1;
             {
                 let _guard = flamewm_profiler::start("wm.resize.motion.drain");
+                wm.probe_event_dispatch(&pumped.event, pumped.received);
                 wm.handle_event(pumped.event)?;
             }
         }
-        resize_counters().committed.increment_by(batch as u64);
+        resize_counters().record_committed(batch as u64);
         if batch > resize_counters().max_batch() {
             resize_counters().set_max_batch(batch);
         }
@@ -243,23 +794,21 @@ where
         hook(&conn, screen_num, changes)?;
         let mut batch: usize = 0;
         while let Some(pumped) = pump.next(conn.as_ref()).map_err(any_conn_err)? {
-            resize_counters()
-                .received
-                .increment_by(pumped.received as u64);
-            resize_counters()
-                .coalesced
-                .increment_by(pumped.coalesced as u64);
+            resize_counters().record_received(pumped.received as u64);
+            resize_counters().record_coalesced(pumped.coalesced as u64);
             batch += 1;
             {
                 let _guard = flamewm_profiler::start("wm.resize.motion.drain");
+                wm.probe_event_dispatch(&pumped.event, pumped.received);
                 wm.handle_event(pumped.event)?;
             }
         }
-        resize_counters().committed.increment_by(batch as u64);
+        resize_counters().record_committed(batch as u64);
         if batch > resize_counters().max_batch() {
             resize_counters().set_max_batch(batch);
         }
         emit_resize_summary();
+        emit_move_summary();
         // Flush once per reactor turn.
         conn.flush()?;
         // Blocking wait: woken by X, provider, audio, or profiler sources.
@@ -288,6 +837,8 @@ struct Wm<'a, C: Connection> {
     config: WmConfig,
     atoms: Atoms,
     support_window: Window,
+    catalog: std::sync::Arc<flamewm_applications::ApplicationCatalog>,
+    icon_resolver: flamewm_integrations_linux::IconResolver,
     clients: HashMap<Window, ManagedClient>,
     managed_order: Vec<Window>,
     frame_to_client: HashMap<Window, Window>,
@@ -300,7 +851,10 @@ struct Wm<'a, C: Connection> {
     screen_rect: Rect,
     dock_struts: HashMap<Window, [u32; 12]>,
     snap_preview: SnapPreviewSurface,
+    chrome_runtimes: HashMap<Window, chrome_runtime::ChromeRuntime>,
     changes: WmChangeSet,
+    pointer_ingress_probe: PointerIngressProbe,
+    resize_probe: Option<ResizeProbe>,
 }
 
 impl<'a, C: Connection> Wm<'a, C> {
@@ -329,13 +883,18 @@ impl<'a, C: Connection> Wm<'a, C> {
         )?;
 
         let workspace_count = config.workspaces.max(1);
-        let _ = catalog;
+        // Retain the discover-once catalog (runtime composition root owns
+        // discovery); `Wm` is the synchronous icon fallback owner.
+        let icon_resolver =
+            flamewm_integrations_linux::IconResolver::from_environment(flamewm_workspace_root(), 0);
         Ok(Self {
             conn,
             screen_num,
             config,
             atoms,
             support_window,
+            catalog,
+            icon_resolver,
             clients: HashMap::new(),
             managed_order: Vec::new(),
             frame_to_client: HashMap::new(),
@@ -353,8 +912,97 @@ impl<'a, C: Connection> Wm<'a, C> {
             ),
             dock_struts: HashMap::new(),
             snap_preview: SnapPreviewSurface::new(),
+            chrome_runtimes: HashMap::new(),
             changes: WmChangeSet::default(),
+            pointer_ingress_probe: PointerIngressProbe::default(),
+            resize_probe: None,
         })
+    }
+
+    fn probe_event_dispatch(&mut self, event: &Event, received: usize) {
+        let Some(pointer) = pointer_ingress(event) else {
+            return;
+        };
+        let session_client = self.session_client();
+        match pointer.kind {
+            "ButtonPress" => {
+                self.pointer_ingress_probe = PointerIngressProbe::default();
+                flamewm_debug::emit(
+                    flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+                    std::time::Duration::ZERO,
+                    || {
+                        format!(
+                            "probe=pointer_ingress stage=pre_handle_event boundary=first raw={} event={} child={} root=({}, {}) session_client={session_client:?} pump_received={received}",
+                            pointer.kind,
+                            pointer.event,
+                            pointer.child,
+                            pointer.root_x,
+                            pointer.root_y
+                        )
+                    },
+                );
+            }
+            "MotionNotify" => {
+                self.pointer_ingress_probe.last_motion = Some(pointer);
+                if !self.pointer_ingress_probe.motion_dispatched {
+                    self.pointer_ingress_probe.motion_dispatched = true;
+                    flamewm_debug::emit(
+                        flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+                        std::time::Duration::ZERO,
+                        || {
+                            format!(
+                                "probe=pointer_ingress stage=pre_handle_event boundary=first_motion raw={} motion_seen_upstream=true event={} child={} root=({}, {}) session_client={session_client:?} pump_received={} pump_coalesced={}",
+                                pointer.kind,
+                                pointer.event,
+                                pointer.child,
+                                pointer.root_x,
+                                pointer.root_y,
+                                received,
+                                received.saturating_sub(1),
+                            )
+                        },
+                    );
+                }
+            }
+            "ButtonRelease" => {
+                let last_motion = self.pointer_ingress_probe.last_motion;
+                flamewm_debug::emit(
+                    flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+                    std::time::Duration::ZERO,
+                    || {
+                        format!(
+                            "probe=pointer_ingress stage=pre_handle_event boundary=last raw={} motion_seen_upstream={} release_seen_upstream=true event={} child={} root=({}, {}) session_client={session_client:?} last_motion={last_motion:?} pump_received={received}",
+                            pointer.kind,
+                            last_motion.is_some(),
+                            pointer.event,
+                            pointer.child,
+                            pointer.root_x,
+                            pointer.root_y,
+                        )
+                    },
+                );
+                self.pointer_ingress_probe = PointerIngressProbe::default();
+            }
+            _ => {}
+        }
+    }
+
+    fn probe_motion_entry(&mut self, event: &MotionNotifyEvent) {
+        if self.pointer_ingress_probe.motion_handled {
+            return;
+        }
+        self.pointer_ingress_probe.motion_handled = true;
+        let session_client = self.session_client();
+        flamewm_debug::emit(
+            flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+            std::time::Duration::ZERO,
+            || {
+                format!(
+                    "probe=pointer_ingress stage=handle_motion_entry boundary=first_motion raw=MotionNotify motion_seen_upstream=true event={} child={} root=({}, {}) session_client={session_client:?}",
+                    event.event, event.child, event.root_x, event.root_y
+                )
+            },
+        );
     }
 
     fn screen(&self) -> &Screen {
@@ -433,145 +1081,278 @@ impl<'a, C: Connection> Wm<'a, C> {
             .sessions
             .get(&client)
             .map_or(InteractionSession::Idle, |session| session.session);
-        let mut region_map = std::collections::HashMap::new();
+        let mut by_xid = std::collections::HashMap::new();
         for xid in res.children() {
             if let Some(target) = self.registry.lookup_by_xid(xid) {
-                region_map.insert(xid, target.region);
+                by_xid.insert(xid, target.region);
             }
         }
+        let region_map = interaction::region_map_for(&by_xid, &res.children());
         let screen_rect = RootRect::new(
             0,
             0,
             i32::try_from(self.screen().width_in_pixels).unwrap_or(i32::MAX),
             i32::try_from(self.screen().height_in_pixels).unwrap_or(i32::MAX),
         );
-        let mut controller = ControllerState::new(
+        Some(interaction::build_controller(
             client,
-            self.registry.capture().unwrap_or(self.screen().root),
+            state.frame,
             state.placement,
             self.work_root(),
+            screen_rect,
             state.hints,
             self.extents(),
-        )
-        .with_screen_rect(screen_rect)
-        .with_registry(region_map);
-        controller.session = session;
-        Some(controller)
+            session,
+            region_map,
+        ))
     }
 
     fn store_controller(&mut self, client: Window, controller: &ControllerState) {
-        let entry = self
-            .sessions
-            .entry(client)
-            .or_insert_with(|| controller.clone());
-        entry.session = controller.session;
-        entry.placement = controller.placement;
-        if let Some(state) = self.clients.get_mut(&client) {
-            state.apply_placement(controller.placement);
-        }
+        let (sessions, clients) = (&mut self.sessions, &mut self.clients);
+        interaction::store_controller(sessions, clients.get_mut(&client), client, controller);
     }
 
     fn execute_effects(
         &mut self,
         client: Window,
-        effects: &[FrameEffect],
+        commit: &interaction::PointerCommit,
     ) -> Result<(), ReplyError> {
-        for effect in effects {
-            match *effect {
-                FrameEffect::Grab { window, cursor } => {
-                    let ok = self.interaction_capture(window, cursor).unwrap_or(false);
-                    if !ok {
-                        self.abort_session_to_idle(client);
-                    }
-                }
-                FrameEffect::Ungrab => {
-                    self.release_capture_unmap();
-                    let _ = self.conn.ungrab_pointer(CURRENT_TIME);
-                }
-                FrameEffect::ConfigureFrameRoot { x, y, w, h } => {
-                    let Some(frame) = self.clients.get(&client).map(|state| state.frame) else {
-                        continue;
-                    };
-                    let _ = self.conn.configure_window(
-                        frame,
-                        &ConfigureWindowAux::new()
-                            .x(x)
-                            .y(y)
-                            .width(w.max(1) as u32)
-                            .height(h.max(1) as u32),
-                    );
-                    self.commit_frame_rect(client, x, y, w, h);
-                }
-                FrameEffect::ConfigureClientLocal { x, y, w, h } => {
-                    let _ = self.conn.configure_window(
-                        client,
-                        &ConfigureWindowAux::new()
-                            .x(x)
-                            .y(y)
-                            .width(w.max(1))
-                            .height(h.max(1)),
-                    );
-                }
-                FrameEffect::LayoutInput => {
-                    self.layout_input_children(client)?;
-                }
-                FrameEffect::PaintChrome => {
-                    self.paint_chrome(client)?;
-                }
-                FrameEffect::ApplyShape => {
-                    let (frame, maximized, fullscreen, outer) = match self.clients.get(&client) {
-                        Some(state) => (
-                            state.frame,
-                            state.is_maximized(),
-                            state.is_fullscreen(),
-                            state.outer,
-                        ),
-                        None => continue,
-                    };
-                    self.clear_frame_shape(frame, outer, maximized, fullscreen)?;
-                }
-                FrameEffect::NotifyClientRoot { x, y, w, h } => {
-                    let event = ConfigureNotifyEvent {
-                        response_type: CONFIGURE_NOTIFY_EVENT,
-                        sequence: 0,
-                        event: client,
-                        window: client,
-                        above_sibling: 0,
-                        x: clamp_i16(x),
-                        y: clamp_i16(y),
-                        width: clamp_u16(w.max(1) as u32),
-                        height: clamp_u16(h.max(1)),
-                        border_width: 0,
-                        override_redirect: false,
-                    };
-                    let _ = self
-                        .conn
-                        .send_event(false, client, EventMask::STRUCTURE_NOTIFY, event);
-                }
-                FrameEffect::SnapPreview { target } => {
-                    if target.is_none() {
-                        self.snap_preview.hide();
-                    }
-                }
-                FrameEffect::Noop => {}
+        let effect_boundary = self.resize_probe.as_ref().and_then(|probe| {
+            if !probe.effect_seen {
+                Some("first")
+            } else if commit.ungrab {
+                Some("last")
+            } else {
+                None
+            }
+        });
+        if effect_boundary == Some("first") {
+            let session = self
+                .sessions
+                .get(&client)
+                .map_or(InteractionSession::Idle, |state| state.session);
+            if let Some(probe) = self.resize_probe.as_ref() {
+                emit_resize_probe(
+                    "effect",
+                    "first",
+                    probe,
+                    Some(probe.last_pointer),
+                    session,
+                    Some(commit),
+                );
+            }
+            if let Some(probe) = self.resize_probe.as_mut() {
+                probe.effect_seen = true;
             }
         }
-        Ok(())
+        if let Some((window, cursor)) = commit.grab {
+            let ok = self.interaction_capture(window, cursor).unwrap_or(false);
+            flamewm_debug::emit(
+                flamewm_debug::WM_FRAME_GRAB,
+                std::time::Duration::from_millis(100),
+                || format!("client={client} window={window} result={ok}"),
+            );
+            if !ok {
+                if commit.abort_on_grab_fail {
+                    self.abort_session_to_idle(client);
+                }
+                self.resize_probe = None;
+                return Ok(());
+            }
+        }
+        let result: Result<(), ReplyError> = (|| {
+            for effect in &commit.effects {
+                match *effect {
+                    // PointerCommit owns the single native grab transaction.
+                    FrameEffect::Grab { .. } => {}
+                    FrameEffect::Ungrab => {
+                        if commit.ungrab {
+                            self.release_pointer();
+                        }
+                    }
+                    FrameEffect::ConfigureFrameRoot { x, y, w, h } => {
+                        let Some(frame) = self.clients.get(&client).map(|state| state.frame) else {
+                            continue;
+                        };
+                        let result = self.conn.configure_window(
+                            frame,
+                            &ConfigureWindowAux::new()
+                                .x(x)
+                                .y(y)
+                                .width(w.max(1) as u32)
+                                .height(h.max(1) as u32),
+                        );
+                        if let Some(probe) = self.resize_probe.as_mut() {
+                            if probe.client == client {
+                                let outcome = match &result {
+                                    Ok(_) => String::from("ok"),
+                                    Err(error) => format!("error={error:?}"),
+                                };
+                                let detail =
+                                    format!("xid={frame} rect=({x},{y},{w},{h}) result={outcome}");
+                                if probe.native_first.is_none() {
+                                    probe.native_first = Some(detail.clone());
+                                }
+                                probe.native_last = Some(detail);
+                            }
+                        }
+                        emit_native_configure(
+                            flamewm_debug::WM_FRAME_GEOMETRY_RESIZE_NATIVE,
+                            client,
+                            frame,
+                            format!("effect=ConfigureFrameRoot rect=({x},{y},{w},{h})"),
+                            &result,
+                        );
+                        result?;
+                        self.commit_frame_rect(client, x, y, w, h);
+                    }
+                    // Move is position-only: frame .x/.y + placement x/y commit;
+                    // w/h and floating_restore size are preserved exactly.
+                    FrameEffect::MoveFrameRoot { x, y } => {
+                        let _guard = flamewm_profiler::start("wm.move.frame_position");
+                        let Some(frame) = self.clients.get(&client).map(|state| state.frame) else {
+                            continue;
+                        };
+                        let result = self
+                            .conn
+                            .configure_window(frame, &ConfigureWindowAux::new().x(x).y(y));
+                        emit_native_configure(
+                            flamewm_debug::WM_FRAME_GEOMETRY_MOVE_NATIVE,
+                            client,
+                            frame,
+                            format!("effect=MoveFrameRoot position=({x},{y})"),
+                            &result,
+                        );
+                        result?;
+                        self.commit_frame_position(client, x, y);
+                        move_counters().record_committed(1);
+                    }
+                    FrameEffect::ConfigureClientLocal { x, y, w, h } => {
+                        let result = self.conn.configure_window(
+                            client,
+                            &ConfigureWindowAux::new()
+                                .x(x)
+                                .y(y)
+                                .width(w.max(1))
+                                .height(h.max(1)),
+                        );
+                        emit_native_configure(
+                            flamewm_debug::WM_FRAME_GEOMETRY_RESIZE_NATIVE,
+                            client,
+                            client,
+                            format!("effect=ConfigureClientLocal rect=({x},{y},{w},{h})"),
+                            &result,
+                        );
+                        result?;
+                    }
+                    FrameEffect::LayoutInput => {
+                        self.layout_input_children(client)?;
+                    }
+                    FrameEffect::PaintChrome => {
+                        self.paint_chrome(client)?;
+                    }
+                    FrameEffect::ApplyShape => {
+                        let (frame, maximized, fullscreen, outer) = match self.clients.get(&client)
+                        {
+                            Some(state) => (
+                                state.frame,
+                                state.is_maximized(),
+                                state.is_fullscreen(),
+                                state.outer,
+                            ),
+                            None => continue,
+                        };
+                        self.clear_frame_shape(frame, outer, maximized, fullscreen)?;
+                    }
+                    FrameEffect::NotifyClientRoot { x, y, w, h } => {
+                        let _guard = flamewm_profiler::start("wm.move.notify");
+                        let event = ConfigureNotifyEvent {
+                            response_type: CONFIGURE_NOTIFY_EVENT,
+                            sequence: 0,
+                            event: client,
+                            window: client,
+                            above_sibling: 0,
+                            x: clamp_i16(x),
+                            y: clamp_i16(y),
+                            width: clamp_u16(w.max(1) as u32),
+                            height: clamp_u16(h.max(1)),
+                            border_width: 0,
+                            override_redirect: false,
+                        };
+                        self.conn
+                            .send_event(false, client, EventMask::STRUCTURE_NOTIFY, event)?;
+                    }
+                    FrameEffect::SnapPreview { target } => {
+                        if target.is_none() {
+                            self.snap_preview.hide();
+                        }
+                    }
+                    FrameEffect::Noop => {}
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.abort_session_to_idle(client);
+        }
+        if effect_boundary == Some("last") {
+            let session = self
+                .sessions
+                .get(&client)
+                .map_or(InteractionSession::Idle, |state| state.session);
+            if let Some(probe) = self.resize_probe.as_ref() {
+                emit_resize_probe(
+                    "effect",
+                    "last",
+                    probe,
+                    Some(probe.last_pointer),
+                    session,
+                    Some(commit),
+                );
+            }
+        }
+        if commit.ungrab {
+            self.resize_probe = None;
+        }
+        result
+    }
+
+    fn commit_frame_position(&mut self, client: Window, x: i32, y: i32) {
+        let (state, session) = match (
+            self.clients.get_mut(&client),
+            self.sessions.get_mut(&client),
+        ) {
+            (Some(state), Some(session)) => (state, session),
+            _ => return,
+        };
+        let current = state.placement.current;
+        let next = RootRect::new(x, y, current.w.max(1), current.h.max(1));
+        state.placement.current = next;
+        if state.placement.mode == PlacementMode::Floating {
+            let restore = state.placement.floating_restore;
+            state.placement.floating_restore =
+                RootRect::new(x, y, restore.w.max(1), restore.h.max(1));
+        }
+        state.outer = crate::client::root_to_rect(next);
+        session.placement.current = next;
     }
 
     fn commit_frame_rect(&mut self, client: Window, x: i32, y: i32, w: i32, h: i32) {
+        let (state, session) = match (
+            self.clients.get_mut(&client),
+            self.sessions.get_mut(&client),
+        ) {
+            (Some(state), Some(session)) => (state, session),
+            _ => return,
+        };
         let frame = RootRect::new(x, y, w.max(1), h.max(1)).to_legacy();
-        if let Some(state) = self.clients.get_mut(&client) {
-            let mode = state.placement.mode;
-            state.placement.current = crate::client::rect_to_root(frame);
-            if mode == PlacementMode::Floating {
-                state.placement.floating_restore = state.placement.current;
-            }
-            state.outer = frame;
+        let mode = state.placement.mode;
+        state.placement.current = crate::client::rect_to_root(frame);
+        if mode == PlacementMode::Floating {
+            state.placement.floating_restore = state.placement.current;
         }
-        if let Some(session) = self.sessions.get_mut(&client) {
-            session.placement.current = crate::client::rect_to_root(frame);
-        }
+        state.outer = frame;
+        session.placement.current = state.placement.current;
     }
 
     fn release_capture_unmap(&self) {
@@ -580,11 +1361,20 @@ impl<'a, C: Connection> Wm<'a, C> {
         }
     }
 
+    fn release_pointer(&self) {
+        self.release_capture_unmap();
+        let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+    }
+
     fn interaction_capture(
         &mut self,
         grab_window: Window,
         cursor: flamewm_render_core::CursorKind,
     ) -> Result<bool, ReplyOrIdError> {
+        let Some(grab_target) = self.live_pointer_grab_target(grab_window) else {
+            self.release_pointer();
+            return Ok(false);
+        };
         let capture = match self.registry.capture() {
             Some(existing) => existing,
             None => {
@@ -607,39 +1397,54 @@ impl<'a, C: Connection> Wm<'a, C> {
                 id
             }
         };
-        let _ = grab_window;
         if let Some(renderer) = self.renderer.as_mut() {
             let _ = renderer.define_cursor(u64::from(capture), cursor);
         }
         let _ = self.conn.map_window(capture);
-        let _ = self.conn.configure_window(
+        let result = self.conn.configure_window(
             capture,
             &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
         );
-        let reply = self
-            .conn
-            .grab_pointer(
-                false,
-                capture,
-                EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                0u32,
-                0u32,
-                CURRENT_TIME,
-            )?
-            .reply();
-        match reply {
-            Ok(reply) if reply.status == GrabStatus::SUCCESS => Ok(true),
-            _ => {
-                self.release_capture_unmap();
-                flamewm_debug::emit(
-                    flamewm_debug::WM_FRAME_GRAB_FAIL,
-                    std::time::Duration::from_secs(1),
-                    || "grab refused".to_owned(),
-                );
-                Ok(false)
+        emit_native_configure(
+            flamewm_debug::WM_FRAME_GEOMETRY_MOVE_NATIVE,
+            0,
+            capture,
+            "effect=GrabCapture stack=above".to_owned(),
+            &result,
+        );
+        let _ = result;
+        let reply = match self.conn.grab_pointer(
+            false,
+            grab_target,
+            EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            0u32,
+            0u32,
+            CURRENT_TIME,
+        ) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => reply,
+                Err(error) => {
+                    self.release_pointer();
+                    return Err(error.into());
+                }
+            },
+            Err(error) => {
+                self.release_pointer();
+                return Err(ReplyOrIdError::ConnectionError(error));
             }
+        };
+        if reply.status == GrabStatus::SUCCESS {
+            Ok(true)
+        } else {
+            self.release_pointer();
+            flamewm_debug::emit(
+                flamewm_debug::WM_FRAME_GRAB_FAIL,
+                std::time::Duration::from_secs(1),
+                || "grab refused".to_owned(),
+            );
+            Ok(false)
         }
     }
 
@@ -647,17 +1452,115 @@ impl<'a, C: Connection> Wm<'a, C> {
         if let Some(session) = self.sessions.get_mut(&client) {
             session.session.cancel();
         }
-        self.release_capture_unmap();
+        self.release_pointer();
     }
 
     fn reduce_and_execute(&mut self, client: Window, event: FrameEvent) -> Result<(), ReplyError> {
         let Some(controller) = self.controller_for(client) else {
             return Ok(());
         };
-        let (next, effects) = reduce(&controller, event);
+        let placement = controller.placement.mode;
+        let (source, region) = match event {
+            FrameEvent::Press { source, .. } => (
+                source,
+                Some(
+                    controller
+                        .registry
+                        .get(&source)
+                        .copied()
+                        .unwrap_or(FrameRegion::Client),
+                ),
+            ),
+            _ => (0, None),
+        };
+        // Move accounting: pre-event session decides. Motion/Release out of a
+        // Move session count as received; an all-Noop plan counts as coalesced
+        // (zero-delta, no X commit). Committed counts land in MoveFrameRoot.
+        let is_move_event = matches!(controller.session, InteractionSession::Move(_))
+            && matches!(
+                event,
+                FrameEvent::Motion { .. } | FrameEvent::Release { .. }
+            );
+        if is_move_event {
+            move_counters().record_received(1);
+        }
+        let (next, commit) = {
+            let _guard = if is_move_event {
+                Some(flamewm_profiler::start("wm.move.plan_or_reduce"))
+            } else {
+                None
+            };
+            interaction::step(&controller, event)
+        };
+        let drag_away_from_tiled = matches!(controller.session, InteractionSession::Move(_))
+            && matches!(
+                placement,
+                PlacementMode::Maximized | PlacementMode::Snapped(_)
+            )
+            && next.placement.mode == PlacementMode::Floating;
+        let pointer = match event {
+            FrameEvent::Press { pointer, .. }
+            | FrameEvent::Motion { pointer }
+            | FrameEvent::Release { pointer } => Some(pointer),
+            _ => None,
+        };
+        if let (Some(probe), Some(pointer)) = (self.resize_probe.as_mut(), pointer) {
+            probe.last_pointer = pointer;
+        }
+        let resize_boundary = self.resize_probe.as_ref().and_then(|_| match event {
+            FrameEvent::Press { .. } if matches!(region, Some(FrameRegion::Resize(_))) => {
+                Some(("first", next.session))
+            }
+            FrameEvent::Release { .. }
+                if matches!(controller.session, InteractionSession::Resize(_)) =>
+            {
+                Some(("last", controller.session))
+            }
+            _ => None,
+        });
+        if let Some((boundary, session)) = resize_boundary {
+            if let Some(probe) = self.resize_probe.as_ref() {
+                emit_resize_probe("reduce", boundary, probe, pointer, session, Some(&commit));
+            }
+        }
+        if matches!(event, FrameEvent::ToggleMax) {
+            move_counters().record_toggle_max();
+        }
+        move_counters().record_placement_transition(placement, next.placement.mode);
+        emit_pointer_trace(
+            flamewm_debug::WM_FRAME_GEOMETRY_PLAN,
+            "reduce",
+            client,
+            source,
+            region,
+            event,
+            controller.session,
+            Some(next.session),
+            Some(&commit),
+            Some(placement),
+            Some(next.placement.mode),
+            match event {
+                FrameEvent::Snap { target } => Some(format!("{target:?}")),
+                _ => None,
+            },
+            None,
+        );
+        if is_move_event
+            && commit
+                .effects
+                .iter()
+                .all(|e| matches!(e, FrameEffect::Noop))
+        {
+            move_counters().record_coalesced(1);
+        }
         // Zero-X-configure fast path: controller already returned Noop.
         self.store_controller(client, &next);
-        self.execute_effects(client, &effects)
+        let result = self.execute_effects(client, &commit);
+        if result.is_ok() && drag_away_from_tiled {
+            self.mark_windows();
+            self.publish_window_state(client)?;
+        }
+        result
     }
 
     fn hover_control_engine(&self, client: Window) -> Option<FrameControl> {
@@ -667,25 +1570,34 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn paint_chrome(&mut self, client: Window) -> Result<(), ReplyError> {
-        let (frame, title, active, maximized, fullscreen, w, h, hover, pressed) =
-            match self.clients.get(&client) {
-                Some(state) => (
-                    state.frame,
-                    state.title.clone(),
-                    self.active.is_none_or(|current| current == client),
-                    state.is_maximized(),
-                    state.is_fullscreen(),
-                    state.outer.width.max(1),
-                    state.outer.height.max(1),
-                    self.hover_control_engine(client),
-                    self.pressed_control(client),
-                ),
-                None => return Ok(()),
-            };
-        let scene =
-            frame_chrome::plan_scene(w, h, &title, active, hover, pressed, maximized, fullscreen);
+        // Single chrome paint path: delegate scene build to chrome_runtime
+        // (J08 paint_plan seam); this owner only bridges cached rasters.
+        let Some((chrome_state, identity, icon, frame)) = self.clients.get(&client).map(|state| {
+            (
+                chrome_runtime::ChromeState {
+                    frame_w: state.outer.width.max(1),
+                    frame_h: state.outer.height.max(1),
+                    active: self.active.is_none_or(|current| current == client),
+                    hover: state.hover_control,
+                    pressed: self.pressed_control(client),
+                    maximized: state.is_maximized(),
+                    fullscreen: state.is_fullscreen(),
+                },
+                chrome_runtime::ChromeIdentity {
+                    title: state.title.clone(),
+                    wm_instance: state.wm_instance.clone(),
+                    wm_class: state.wm_class.clone(),
+                },
+                state.icon.clone(),
+                state.frame,
+            )
+        }) else {
+            return Ok(());
+        };
+        let runtime = self.chrome_runtimes.entry(client).or_default();
+        runtime.scene_for(&identity, chrome_state, icon);
         if let Some(renderer) = self.renderer.as_mut() {
-            let _ = frame_chrome::render(renderer, u64::from(frame), &scene);
+            let _ = runtime.paint_cached(renderer, u64::from(frame));
         }
         Ok(())
     }
@@ -706,41 +1618,33 @@ impl<'a, C: Connection> Wm<'a, C> {
         let Some(state) = self.clients.get(&client) else {
             return Ok(());
         };
-        let origin = RootPoint::new(state.outer.x, state.outer.y);
-        let layout = layout_frame_children_default(
+        // Single input-child layout owner: lifecycle placements (J19 wiring).
+        let ids = lifecycle::LifecycleIds::new(client, state.frame, res.children());
+        for placement in &lifecycle::input_child_placements(
             state.outer.width.max(1) as i32,
             state.outer.height.max(1) as i32,
-        );
-        let mut pairs: Vec<(u32, i32, i32, u32, u32)> = Vec::with_capacity(12);
-        for (index, rect) in layout.resize_rects().iter().enumerate() {
-            pairs.push((
-                res.resize[index],
-                rect.x,
-                rect.y,
-                rect.w.max(1) as u32,
-                rect.h.max(1) as u32,
-            ));
-        }
-        pairs.push((
-            res.title_drag,
-            layout.title_drag.x,
-            layout.title_drag.y,
-            layout.title_drag.w.max(1) as u32,
-            layout.title_drag.h.max(1) as u32,
-        ));
-        for (index, rect) in layout.controls.iter().enumerate() {
-            pairs.push((
-                res.controls[index],
-                rect.x,
-                rect.y,
-                rect.w.max(1) as u32,
-                rect.h.max(1) as u32,
-            ));
-        }
-        let _ = origin;
-        for (xid, x, y, w, h) in pairs {
-            self.conn
-                .configure_window(xid, &ConfigureWindowAux::new().x(x).y(y).width(w).height(h))?;
+            i32::from(self.config.titlebar_height),
+            ids,
+        ) {
+            let result = self.conn.configure_window(
+                placement.xid,
+                &ConfigureWindowAux::new()
+                    .x(placement.x)
+                    .y(placement.y)
+                    .width(placement.w)
+                    .height(placement.h),
+            );
+            emit_native_configure(
+                flamewm_debug::WM_FRAME_GEOMETRY_RESIZE_NATIVE,
+                client,
+                placement.xid,
+                format!(
+                    "effect=LayoutInput rect=({},{},{},{})",
+                    placement.x, placement.y, placement.w, placement.h
+                ),
+                &result,
+            );
+            result?;
         }
         Ok(())
     }
@@ -1111,7 +2015,8 @@ impl<'a, C: Connection> Wm<'a, C> {
         let title = self
             .read_title(window)
             .unwrap_or_else(|_| "Application".to_owned());
-        let (icon, icon_fallback) = self.read_frame_icon(window);
+        let (wm_instance, wm_class) = self.wm_identity(window);
+        let (icon, icon_fallback) = self.read_frame_icon(&wm_instance, &wm_class, window);
         let transient_for = self.read_transient_for(window)?;
         let hints = self.read_hints(window);
         let _wm_class = self.wm_class(window).unwrap_or_default();
@@ -1161,29 +2066,33 @@ impl<'a, C: Connection> Wm<'a, C> {
             &CreateWindowAux::new()
                 .background_pixel(0x1b1e20)
                 .border_pixel(0x1b1e20)
-                .event_mask(EventMask::EXPOSURE | EventMask::SUBSTRUCTURE_NOTIFY),
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::SUBSTRUCTURE_NOTIFY
+                        | EventMask::SUBSTRUCTURE_REDIRECT,
+                ),
         )?;
 
         // Grab-server only for save-set/reparent/structural-configure.
+        // Reparent offset + client configure from the lifecycle contract
+        // (single geometry source); this owner performs the X calls.
         self.conn.grab_server()?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
+        let (reparent_x, reparent_y) = lifecycle::reparent_offset(self.extents());
         self.conn
-            .reparent_window(window, frame, 0, self.config.titlebar_height as i16)?;
+            .reparent_window(window, frame, reparent_x as i16, reparent_y as i16)?;
         self.conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new()
                 .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         )?;
-        let client_w = outer.width.max(1);
-        let client_h = outer
-            .height
-            .saturating_sub(u32::from(self.config.titlebar_height))
-            .max(1);
+        let (client_x, client_y, client_w, client_h) =
+            lifecycle::client_configure(crate::client::rect_to_root(outer), self.extents());
         self.conn.configure_window(
             window,
             &ConfigureWindowAux::new()
-                .x(0)
-                .y(i32::from(self.config.titlebar_height))
+                .x(client_x)
+                .y(client_y)
                 .width(client_w)
                 .height(client_h)
                 .border_width(0),
@@ -1204,24 +2113,25 @@ impl<'a, C: Connection> Wm<'a, C> {
             self.conn.generate_id()?,
             self.conn.generate_id()?,
         ];
-        let layout =
-            layout_frame_children_default(outer.width.max(1) as i32, outer.height.max(1) as i32);
-        let rects = {
-            let mut all = layout.resize_rects().to_vec();
-            all.push(layout.title_drag);
-            all.extend(layout.controls);
-            all
-        };
-        for (index, xid) in child_ids.iter().enumerate() {
-            let rect = rects[index];
+        // Single lifecycle transaction: ids + placements from lifecycle
+        // policy; this owner only performs the X create/configure loop.
+        let lifecycle_ids = lifecycle::LifecycleIds::new(window, frame, child_ids);
+        let resources = lifecycle_ids.resources();
+        let placements = lifecycle::input_child_placements(
+            outer.width.max(1) as i32,
+            outer.height.max(1) as i32,
+            i32::from(self.config.titlebar_height),
+            lifecycle_ids,
+        );
+        for placement in &placements {
             self.conn.create_window(
                 COPY_DEPTH_FROM_PARENT,
-                *xid,
+                placement.xid,
                 frame,
-                rect.x as i16,
-                rect.y as i16,
-                rect.w.max(1) as u16,
-                rect.h.max(1) as u16,
+                placement.x as i16,
+                placement.y as i16,
+                placement.w.max(1) as u16,
+                placement.h.max(1) as u16,
                 0,
                 WindowClass::INPUT_ONLY,
                 0,
@@ -1232,22 +2142,6 @@ impl<'a, C: Connection> Wm<'a, C> {
         self.conn.flush()?;
 
         // Insert FrameResources + ManagedClient.
-        let resources = FrameResources::new(
-            window,
-            frame,
-            child_ids[8],
-            [child_ids[9], child_ids[10], child_ids[11]],
-            [
-                child_ids[0],
-                child_ids[1],
-                child_ids[2],
-                child_ids[3],
-                child_ids[4],
-                child_ids[5],
-                child_ids[6],
-                child_ids[7],
-            ],
-        );
         let _ = self.registry.register(resources);
         let title_width = flamewm_render_x11::external_text_measure(&title, 12.0)
             .0
@@ -1263,6 +2157,8 @@ impl<'a, C: Connection> Wm<'a, C> {
             title_text_width: title_width,
             icon,
             icon_fallback,
+            wm_instance,
+            wm_class,
             transient_for,
             minimized: false,
             sticky: false,
@@ -1275,6 +2171,8 @@ impl<'a, C: Connection> Wm<'a, C> {
             self.frame_to_client.insert(xid, window);
         }
         self.clients.insert(window, client);
+        self.chrome_runtimes
+            .insert(window, chrome_runtime::ChromeRuntime::new());
         self.managed_order.push(window);
         let controller = self.controller_for(window).unwrap_or_else(|| {
             ControllerState::new(
@@ -1331,9 +2229,9 @@ impl<'a, C: Connection> Wm<'a, C> {
         // before `clients.remove` because `controller_for` reads it.
         if let Some(controller) = self.controller_for(window) {
             if !controller.session.is_idle() {
-                let (next, effects) = reduce(&controller, FrameEvent::Cancel);
+                let (next, commit) = interaction::step(&controller, FrameEvent::Cancel);
                 self.store_controller(window, &next);
-                self.execute_effects(window, &effects)?;
+                self.execute_effects(window, &commit)?;
             }
         }
         let Some(client) = self.clients.remove(&window) else {
@@ -1341,12 +2239,13 @@ impl<'a, C: Connection> Wm<'a, C> {
         };
         self.managed_order.retain(|managed| *managed != window);
         self.frame_to_client.remove(&client.frame);
+        self.chrome_runtimes.remove(&window);
         let removed = self.registry.remove_client(window);
         for xid in &removed {
             let _ = self.conn.destroy_window(*xid);
             self.frame_to_client.remove(xid);
         }
-        self.release_capture_unmap();
+        self.release_pointer();
         self.sessions.remove(&window);
         if self.active == Some(window) {
             self.active = None;
@@ -1409,7 +2308,22 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn handle_configure_notify(&mut self, event: ConfigureNotifyEvent) -> Result<(), ReplyError> {
+        // Observation-only: classify and compare through configure policy;
+        // never commit geometry from a ConfigureNotify.
+        let synthetic = event.response_type & 0x80 != 0;
+        if synthetic {
+            let _ = configure::classify_notify(
+                event.window,
+                event.window,
+                event.window,
+                false,
+                true,
+                true,
+            );
+            return Ok(());
+        }
         if event.window == self.screen().root {
+            configure_bump!(notify_root, notify_root_total);
             self.screen_rect.width = u32::from(event.width).max(1);
             self.screen_rect.height = u32::from(event.height).max(1);
             self.mark_work_area();
@@ -1417,21 +2331,111 @@ impl<'a, C: Connection> Wm<'a, C> {
             self.publish_workspace_metadata()?;
             return Ok(());
         }
+        // Classify the observed window before touching placement. Frame,
+        // client, and InputOnly children all resolve to one managed client
+        // via `client_for`, so disambiguate with the authoritative frame id
+        // and the input-child registry first.
         let Some(client_id) = self.client_for(event.window) else {
+            let _ = configure::classify_notify(event.window, 0, 0, false, false, false);
             return Ok(());
         };
-        let Some(controller) = self.controller_for(client_id) else {
-            return Ok(());
+        let (frame_id, expected_frame, mode) = match self.clients.get(&client_id) {
+            Some(state) => (state.frame, state.placement.current, state.placement.mode),
+            None => return Ok(()),
         };
-        let origin = RootPoint::new(
-            i32::from(event.x).saturating_sub(controller.extents.client_offset().0),
-            i32::from(event.y).saturating_sub(controller.extents.client_offset().1),
+        let _guard = flamewm_profiler::start("wm.configure.notify.observe");
+        let extents = self.extents();
+        let class = configure::classify_notify(
+            event.window,
+            frame_id,
+            client_id,
+            self.registry.lookup_by_xid(event.window).is_some(),
+            false,
+            true,
         );
-        let size = Some((
-            u32::from(event.width).max(1),
-            u32::from(event.height).max(1),
-        ));
-        let _ = self.reduce_and_execute(client_id, FrameEvent::Configure { origin, size });
+        match class {
+            configure::NotifyClass::FrameObserved => {
+                // Expected frame observation: outer rect in root coords.
+                configure_bump!(notify_frame, notify_frame_total);
+                let observed = RootRect::new(
+                    i32::from(event.x),
+                    i32::from(event.y),
+                    i32::from(event.width).max(1),
+                    i32::from(event.height).max(1),
+                );
+                match configure::observe_frame(expected_frame, observed) {
+                    configure::Observation::Current => {
+                        configure_bump!(notify_expected, notify_expected_total);
+                    }
+                    configure::Observation::Stale => {
+                        configure_bump!(notify_expected, notify_expected_total);
+                    }
+                    configure::Observation::Mismatch => {
+                        configure_bump!(notify_mismatch, notify_mismatch_total);
+                        flamewm_debug::emit(
+                            flamewm_debug::WM_CONFIGURE_MISMATCH,
+                            std::time::Duration::from_secs(1),
+                            || {
+                                format!(
+                                    "client={client_id} source=frame expected=({},{},{},{}) observed=({},{},{},{}) mode={mode:?}",
+                                    expected_frame.x,
+                                    expected_frame.y,
+                                    expected_frame.w,
+                                    expected_frame.h,
+                                    observed.x,
+                                    observed.y,
+                                    observed.w,
+                                    observed.h,
+                                )
+                            },
+                        );
+                    }
+                }
+            }
+            configure::NotifyClass::ClientObserved => {
+                // Expected client observation: local (0,titlebar) + interior size.
+                configure_bump!(notify_client, notify_client_total);
+                let (ox, oy, expected_w, expected_h) =
+                    configure::expected_client_geometry(expected_frame, extents);
+                match configure::observe_client(
+                    expected_frame,
+                    extents,
+                    (
+                        i32::from(event.x),
+                        i32::from(event.y),
+                        i32::from(event.width),
+                        i32::from(event.height),
+                    ),
+                ) {
+                    configure::Observation::Current => {
+                        configure_bump!(notify_expected, notify_expected_total);
+                    }
+                    configure::Observation::Stale => {
+                        configure_bump!(notify_expected, notify_expected_total);
+                    }
+                    configure::Observation::Mismatch => {
+                        configure_bump!(notify_mismatch, notify_mismatch_total);
+                        flamewm_debug::emit(
+                            flamewm_debug::WM_CONFIGURE_MISMATCH,
+                            std::time::Duration::from_secs(1),
+                            || {
+                                format!(
+                                    "client={client_id} source=client expected=({ox},{oy},{expected_w},{expected_h}) observed=({},{},{},{}) mode={mode:?}",
+                                    event.x, event.y, event.width, event.height,
+                                )
+                            },
+                        );
+                    }
+                }
+            }
+            configure::NotifyClass::InputChildObserved => {
+                // Registered InputOnly child: WM-owned detail, never placement.
+                configure_bump!(notify_input_child, notify_input_child_total);
+                configure_bump!(notify_expected, notify_expected_total);
+            }
+            configure::NotifyClass::SyntheticEchoDrop | configure::NotifyClass::StaleUnknown => {}
+        }
+        emit_configure_summary();
         Ok(())
     }
 
@@ -1468,6 +2472,7 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn handle_configure_request(&mut self, event: ConfigureRequestEvent) -> Result<(), ReplyError> {
+        let _guard = flamewm_profiler::start("wm.configure.request.total");
         let Some(client_id) = self.client_for(event.window) else {
             self.conn.configure_window(
                 event.window,
@@ -1478,26 +2483,71 @@ impl<'a, C: Connection> Wm<'a, C> {
         let Some(controller) = self.controller_for(client_id) else {
             return Ok(());
         };
+        configure_bump!(request_received, request_received_total);
+        // Stack/sibling intent is orthogonal to the geometry decision:
+        // carried alongside via configure policy, never flips accept/refuse.
+        let has_stack = event.value_mask.contains(ConfigWindow::STACK_MODE);
+        let stack = has_stack.then(|| {
+            let frame = self
+                .clients
+                .get(&client_id)
+                .map(|state| state.frame)
+                .unwrap_or(client_id);
+            let sibling = if event.value_mask.contains(ConfigWindow::SIBLING) && event.sibling != 0
+            {
+                self.client_for(event.sibling)
+                    .and_then(|id| self.clients.get(&id).map(|state| state.frame))
+                    .or(Some(event.sibling))
+            } else {
+                None
+            };
+            (frame, event.stack_mode, sibling)
+        });
+        // Single geometry policy: exactly one owner decides accept/refuse.
+        let (decision, _) = configure::carry_stack_intent(
+            configure::decide_request(&controller.session, controller.placement.mode),
+            has_stack,
+        );
+        // Active gesture owns geometry: acknowledge current root geometry,
+        // never mutate the frame from the client request.
+        if decision == configure::RequestDecision::RefuseInteractive {
+            configure_bump!(
+                request_refused_interactive,
+                request_refused_interactive_total
+            );
+            self.send_configure_notify(client_id)?;
+            emit_configure_summary();
+            if let Some((frame, mode, sibling)) = stack {
+                self.restack(frame, mode, sibling)?;
+                self.publish_client_list()?;
+            }
+            return Ok(());
+        }
+        // WM-owned modes stay authoritative against client geometry.
+        if decision == configure::RequestDecision::RefuseMode {
+            configure_bump!(request_refused_mode, request_refused_mode_total);
+            self.send_configure_notify(client_id)?;
+            emit_configure_summary();
+            if let Some((frame, mode, sibling)) = stack {
+                self.restack(frame, mode, sibling)?;
+                self.publish_client_list()?;
+            }
+            return Ok(());
+        }
         let extents = controller.extents;
         let prev_root = frame_to_client_root(controller.placement.current, extents);
         let (prev_origin, prev_size) = (prev_root.origin(), prev_root.size_u32());
         let mask = event.value_mask;
-        let req_origin = if mask.contains(ConfigWindow::X) || mask.contains(ConfigWindow::Y) {
-            RootPoint::new(
-                if mask.contains(ConfigWindow::X) {
-                    i32::from(event.x).saturating_sub(extents.client_offset().0)
-                } else {
-                    prev_origin.x
-                },
-                if mask.contains(ConfigWindow::Y) {
-                    i32::from(event.y).saturating_sub(extents.client_offset().1)
-                } else {
-                    prev_origin.y
-                },
-            )
-        } else {
-            prev_origin
-        };
+        // ICCCM 4.1.5: ConfigureRequest coordinates from a top-level client
+        // are in root coordinates irrespective of reparenting (verbatim
+        // client-root origin; no frame-offset subtraction).
+        let req_origin = configure::request_origin(
+            mask.contains(ConfigWindow::X),
+            mask.contains(ConfigWindow::Y),
+            i32::from(event.x),
+            i32::from(event.y),
+            prev_origin,
+        );
         let req_size = if mask.contains(ConfigWindow::WIDTH) || mask.contains(ConfigWindow::HEIGHT)
         {
             Some((
@@ -1529,6 +2579,7 @@ impl<'a, C: Connection> Wm<'a, C> {
         };
         let plan = plan_client_configure(&req, req_origin, req_size);
         if !plan.noop {
+            configure_bump!(request_accepted, request_accepted_total);
             let mode = controller.placement.mode;
             if let Some(state) = self.clients.get_mut(&client_id) {
                 state.placement.mode = mode;
@@ -1546,21 +2597,9 @@ impl<'a, C: Connection> Wm<'a, C> {
         } else {
             self.send_configure_notify(client_id)?;
         }
-        if event.value_mask.contains(ConfigWindow::STACK_MODE) {
-            let frame = self
-                .clients
-                .get(&client_id)
-                .map(|state| state.frame)
-                .unwrap_or(client_id);
-            let sibling = if event.value_mask.contains(ConfigWindow::SIBLING) && event.sibling != 0
-            {
-                self.client_for(event.sibling)
-                    .and_then(|id| self.clients.get(&id).map(|state| state.frame))
-                    .or(Some(event.sibling))
-            } else {
-                None
-            };
-            self.restack(frame, event.stack_mode, sibling)?;
+        emit_configure_summary();
+        if let Some((frame, mode, sibling)) = stack {
+            self.restack(frame, mode, sibling)?;
             self.publish_client_list()?;
         }
         Ok(())
@@ -1587,6 +2626,9 @@ impl<'a, C: Connection> Wm<'a, C> {
     /// yet selecting SubstructureRedirect), manage it now. Frame/child
     /// MapNotify events are ignored.
     fn handle_map_notify(&mut self, window: Window) -> Result<(), ReplyOrIdError> {
+        if self.registry.capture() == Some(window) {
+            return Ok(());
+        }
         if window == self.screen().root || self.clients.contains_key(&window) {
             return Ok(());
         }
@@ -1655,8 +2697,14 @@ impl<'a, C: Connection> Wm<'a, C> {
                 self.paint_chrome(client_id)?;
             }
         } else if atom == self.atoms.net_wm_icon {
-            let (icon, fallback) = self.read_frame_icon(client_id);
+            // Icon property path only: refresh the cached identity (the
+            // client may have set WM_CLASS after the initial map) and the
+            // cached raster, then repaint exactly this frame.
+            let (wm_instance, wm_class) = self.wm_identity(client_id);
+            let (icon, fallback) = self.read_frame_icon(&wm_instance, &wm_class, client_id);
             if let Some(client) = self.clients.get_mut(&client_id) {
+                client.wm_instance = wm_instance;
+                client.wm_class = wm_class;
                 client.icon = icon;
                 client.icon_fallback = fallback;
             }
@@ -1682,16 +2730,29 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn handle_enter(&mut self, event: EnterNotifyEvent) -> Result<(), ReplyError> {
-        let Some(client_id) = self.client_for(event.event) else {
+        let source = resolve_frame_event_source(&self.registry, event.event, event.child);
+        let Some(client_id) = self.client_for(source) else {
             return Ok(());
         };
+        // Passive observers only: Enter/Motion-to-idle-session repaint paths
+        // must not reconfigure native input children, or each Enter =>
+        // ConfigureNotify => Enter feedback loop sustains a motion storm.
+        // Focus/hover state updates stay; layout stays frozen.
+        let active_session = self
+            .sessions
+            .get(&client_id)
+            .map_or(false, |session| !session.session.is_idle());
+        if active_session {
+            return Ok(());
+        }
         self.focus(client_id)?;
         let _ = self.reduce_and_execute(client_id, FrameEvent::Enter);
         Ok(())
     }
 
     fn handle_leave(&mut self, event: LeaveNotifyEvent) -> Result<(), ReplyError> {
-        let Some(client_id) = self.client_for(event.event) else {
+        let source = resolve_frame_event_source(&self.registry, event.event, event.child);
+        let Some(client_id) = self.client_for(source) else {
             return Ok(());
         };
         let active_session = self
@@ -1710,7 +2771,8 @@ impl<'a, C: Connection> Wm<'a, C> {
         if event.detail != BUTTON_PRIMARY {
             return Ok(());
         }
-        let Some(client_id) = self.client_for(event.event) else {
+        let source = resolve_frame_event_source(&self.registry, event.event, event.child);
+        let Some(client_id) = self.client_for(source) else {
             return Ok(());
         };
         self.focus(client_id)?;
@@ -1721,13 +2783,48 @@ impl<'a, C: Connection> Wm<'a, C> {
             .get(&client_id)
             .map_or(false, |session| !session.session.is_idle());
         let _ = had_session;
-        match self.reduce_and_execute(
+        let event = FrameEvent::Press { source, pointer };
+        let pre = self
+            .sessions
+            .get(&client_id)
+            .map_or(InteractionSession::Idle, |session| session.session);
+        let region = self
+            .registry
+            .lookup_by_xid(source)
+            .map_or(FrameRegion::Client, |target| target.region);
+        if let FrameRegion::Resize(_) = region {
+            self.resize_probe = Some(ResizeProbe {
+                client: client_id,
+                source,
+                region,
+                start_pointer: pointer,
+                last_pointer: pointer,
+                effect_seen: false,
+                native_first: None,
+                native_last: None,
+            });
+            if let Some(probe) = self.resize_probe.as_ref() {
+                emit_resize_probe("press", "first", probe, Some(pointer), pre, None);
+            }
+        }
+        emit_pointer_trace(
+            flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+            "button_press",
             client_id,
-            FrameEvent::Press {
-                source: event.event,
-                pointer,
-            },
-        ) {
+            source,
+            Some(region),
+            event,
+            pre,
+            None,
+            None,
+            self.clients
+                .get(&client_id)
+                .map(|state| state.placement.mode),
+            None,
+            None,
+            None,
+        );
+        match self.reduce_and_execute(client_id, event) {
             Ok(()) => {
                 let grabbed = self
                     .sessions
@@ -1760,97 +2857,184 @@ impl<'a, C: Connection> Wm<'a, C> {
             return Ok(());
         }
         // Route release through controller reduce(); control clicks execute here.
-        let Some(client_id) = self.client_for(event.event) else {
+        let source = resolve_frame_event_source(&self.registry, event.event, event.child);
+        let Some(client_id) = self.session_client().or_else(|| self.client_for(source)) else {
             return Ok(());
         };
-        let was_control = matches!(
-            self.sessions.get(&client_id).map(|session| session.session),
-            Some(InteractionSession::ControlPress(_))
-        );
+        // Snapshot the release origin BEFORE the reducer runs: the release
+        // reducer always idles the session, so post-reducer reads cannot tell
+        // Move from resize/control-terminal origins.
+        let release_move =
+            self.sessions
+                .get(&client_id)
+                .and_then(|session| match session.session {
+                    InteractionSession::Move(move_session) => Some(move_session),
+                    _ => None,
+                });
+        let release_from_move = release_move.is_some();
+        let release_from_resize = self
+            .sessions
+            .get(&client_id)
+            .is_some_and(|session| matches!(session.session, InteractionSession::Resize(_)));
+        let (was_control, control) =
+            match self.sessions.get(&client_id).map(|session| session.session) {
+                Some(InteractionSession::ControlPress(session)) => (
+                    true,
+                    if session.armed {
+                        Some(session.control)
+                    } else {
+                        None
+                    },
+                ),
+                _ => (false, None),
+            };
         let pointer = RootPoint::new(i32::from(event.root_x), i32::from(event.root_y));
         let _ = self.reduce_and_execute(client_id, FrameEvent::Release { pointer });
-        if was_control {
-            let armed = true;
-            if armed {
-                let region = self
-                    .registry
-                    .lookup_by_xid(event.event)
-                    .map(|target| target.region);
-                match region {
-                    Some(FrameRegion::Control(FrameControl::Close)) => self.close(client_id)?,
-                    Some(FrameRegion::Control(FrameControl::MaximizeRestore)) => {
-                        self.reduce_and_execute(client_id, FrameEvent::ToggleMax)?;
-                        self.mark_windows();
-                        self.publish_window_state(client_id)?;
-                    }
-                    Some(FrameRegion::Control(FrameControl::Minimize)) => {
-                        self.minimize(client_id)?
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(());
+        if release_from_move {
+            self.snap_preview.hide();
         }
-        // Move-release snap: controller release already un-grabbed; apply snap target.
-        let target = core_snap_target(
-            flamewm_api::Point::new(i32::from(event.root_x), i32::from(event.root_y)),
-            to_core_rect(self.work_area()),
-        );
-        if target != SnapTarget::None {
-            let moved = self.sessions.get(&client_id).map_or(false, |_| true);
-            let _ = moved;
-            // Only snap when the pointer is at a screen edge (target found) and
-            // the client is floating (controller Snap event handles resume).
-            if let Some(state) = self.clients.get(&client_id) {
-                if state.placement.mode == PlacementMode::Floating {
-                    self.reduce_and_execute(
-                        client_id,
-                        FrameEvent::Snap {
-                            target: Self::snap_to_engine(target),
-                        },
-                    )?;
+        if let Some(control) = control {
+            match control {
+                FrameControl::Close => self.close(client_id)?,
+                FrameControl::MaximizeRestore => {
+                    move_counters().record_toggle_max();
                     self.mark_windows();
                     self.publish_window_state(client_id)?;
                 }
+                FrameControl::Minimize => self.minimize(client_id)?,
+            }
+            return Ok(());
+        }
+        if was_control {
+            return Ok(());
+        }
+        // Move-release policy: only a Move session may evaluate/commit a
+        // release action. Resize/control-terminal releases never reach this
+        // path.
+        if !release_from_move {
+            if release_from_resize {
+                // CONTRACT-REGRESSION: resize release never evaluates snap.
+                // OBSERVABLE: bounded counter appears in the move summary.
+                move_counters().record_resize_snap_blocked();
+            }
+            return Ok(());
+        }
+        let target = {
+            let _guard = flamewm_profiler::start("wm.move.snap_target");
+            core_snap_target(
+                flamewm_api::Point::new(i32::from(event.root_x), i32::from(event.root_y)),
+                to_core_rect(self.work_area()),
+            )
+        };
+        move_counters().record_snap_target(snap_target_bits(target));
+        let placement = self
+            .clients
+            .get(&client_id)
+            .map(|state| state.placement.mode);
+        match release_action_for_move(release_move, placement, target) {
+            ReleaseAction::None => {}
+            ReleaseAction::Maximize => self.toggle_maximize(client_id)?,
+            ReleaseAction::Snap(target) => {
+                self.reduce_and_execute(client_id, FrameEvent::Snap { target })?;
+                self.mark_windows();
+                self.publish_window_state(client_id)?;
             }
         }
         Ok(())
     }
 
-    fn snap_to_engine(target: SnapTarget) -> crate::frame::model::SnapTarget {
-        match target {
-            SnapTarget::LeftHalf => crate::frame::model::SnapTarget::Left,
-            SnapTarget::RightHalf => crate::frame::model::SnapTarget::Right,
-            SnapTarget::TopHalf => crate::frame::model::SnapTarget::Top,
-            SnapTarget::BottomHalf => crate::frame::model::SnapTarget::Bottom,
-            SnapTarget::TopLeftQuarter => crate::frame::model::SnapTarget::TopLeft,
-            SnapTarget::TopRightQuarter => crate::frame::model::SnapTarget::TopRight,
-            SnapTarget::BottomLeftQuarter => crate::frame::model::SnapTarget::BottomLeft,
-            SnapTarget::BottomRightQuarter => crate::frame::model::SnapTarget::BottomRight,
-            SnapTarget::Maximize | SnapTarget::None => crate::frame::model::SnapTarget::Left,
-        }
-    }
-
     fn handle_motion(&mut self, event: MotionNotifyEvent) -> Result<(), ReplyError> {
+        self.probe_motion_entry(&event);
         // Root points during active session; route through controller reduce().
-        let Some(client_id) = self
-            .client_for(event.event)
-            .or_else(|| self.session_client())
-        else {
+        let source = resolve_frame_event_source(&self.registry, event.event, event.child);
+        let Some(client_id) = self.session_client().or_else(|| self.client_for(source)) else {
             return Ok(());
         };
         let pointer = RootPoint::new(i32::from(event.root_x), i32::from(event.root_y));
+        let move_session =
+            self.sessions
+                .get(&client_id)
+                .and_then(|session| match session.session {
+                    InteractionSession::Move(move_session) => Some(move_session),
+                    _ => None,
+                });
+        let move_active = move_session.is_some();
         let active = self
             .sessions
             .get(&client_id)
             .map_or(false, |session| !session.session.is_idle());
         if active {
-            let _ = self.reduce_and_execute(client_id, FrameEvent::Motion { pointer });
-            self.update_snap_preview(event.root_x, event.root_y, self.work_area(), client_id);
+            let frame_event = FrameEvent::Motion { pointer };
+            let pre = self
+                .sessions
+                .get(&client_id)
+                .map_or(InteractionSession::Idle, |session| session.session);
+            emit_pointer_trace(
+                flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+                "motion",
+                client_id,
+                source,
+                Some(
+                    self.registry
+                        .lookup_by_xid(source)
+                        .map_or(FrameRegion::Client, |target| target.region),
+                ),
+                frame_event,
+                pre,
+                None,
+                None,
+                self.clients
+                    .get(&client_id)
+                    .map(|state| state.placement.mode),
+                None,
+                if move_active {
+                    let target = core_snap_target(
+                        flamewm_api::Point::new(i32::from(event.root_x), i32::from(event.root_y)),
+                        to_core_rect(self.work_area()),
+                    );
+                    Some(format!("{target:?}"))
+                } else {
+                    None
+                },
+                if move_active {
+                    let target = core_snap_target(
+                        flamewm_api::Point::new(i32::from(event.root_x), i32::from(event.root_y)),
+                        to_core_rect(self.work_area()),
+                    );
+                    Some(target != SnapTarget::None)
+                } else {
+                    None
+                },
+            );
+            {
+                let _guard = if move_active {
+                    Some(flamewm_profiler::start("wm.move.total"))
+                } else {
+                    None
+                };
+                let _ = self.reduce_and_execute(client_id, frame_event);
+            }
+            // Snap preview requires an already activated move and the
+            // post-reducer placement to be Floating. Resize and control
+            // motion never reach the preview path.
+            let preview_allowed = activated_move(move_session).is_some()
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|state| state.placement.mode == PlacementMode::Floating);
+            if preview_allowed {
+                self.update_snap_preview(event.root_x, event.root_y, self.work_area(), client_id);
+            } else if move_active {
+                self.snap_preview.hide();
+            }
             return Ok(());
         }
         // Idle hover: track control hover, repaint chrome on change.
-        let hover = self.idle_hover(client_id, event.event_x, event.event_y, event.event);
+        // Never reconfigure input children here: Enter/Motion crossover
+        // between adjacent children would otherwise reconfigure on every
+        // crossing and sustain ConfigureNotify churn. (WM_NORMAL_HINTS
+        // updates still relayout via handle_property; that path is rare.)
+        let hover = self.idle_hover(client_id, event.event_x, event.event_y, source);
         let changed = if let Some(state) = self.clients.get_mut(&client_id) {
             let changed = state.hover_control != hover;
             state.hover_control = hover;
@@ -1927,7 +3111,42 @@ impl<'a, C: Connection> Wm<'a, C> {
             }
         } else if event.type_ == self.atoms.net_wm_state && self.clients.contains_key(&event.window)
         {
+            let wants_maximize = [data[1], data[2]].iter().any(|atom| {
+                *atom == self.atoms.net_wm_state_maximized_horz
+                    || *atom == self.atoms.net_wm_state_maximized_vert
+            });
+            let before = self
+                .clients
+                .get(&event.window)
+                .map(|state| state.placement.mode);
+            if wants_maximize {
+                move_counters().record_client_message_maximize();
+            }
             self.apply_net_wm_state(event.window, data[0], data[1], data[2])?;
+            let after = self
+                .clients
+                .get(&event.window)
+                .map(|state| state.placement.mode);
+            if let (Some(before), Some(after)) = (before, after) {
+                flamewm_debug::emit(
+                    flamewm_debug::WM_FRAME_EVENT_DISPATCH,
+                    std::time::Duration::ZERO,
+                    || {
+                        format!(
+                            "phase=client_message client={} source={} region=None pointer=None pre_session={:?} post_session={:?} placement={before:?} post_placement={after:?} maximize_request={wants_maximize} state_mutation={}",
+                            event.window,
+                            event.window,
+                            self.sessions
+                                .get(&event.window)
+                                .map(|session| session.session),
+                            self.sessions
+                                .get(&event.window)
+                                .map(|session| session.session),
+                            before != after,
+                        )
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -2136,10 +3355,14 @@ impl<'a, C: Connection> Wm<'a, C> {
     /// shared `snap_geometry`. `None` hides. Skips redraw when unchanged.
     /// No new native renderer: the compiled snap-preview surface moves/shows.
     fn update_snap_preview(&mut self, root_x: i16, root_y: i16, work: Rect, client: Window) {
-        let target = core_snap_target(
-            flamewm_api::Point::new(i32::from(root_x), i32::from(root_y)),
-            to_core_rect(work),
-        );
+        let target = {
+            let _guard = flamewm_profiler::start("wm.move.snap_target");
+            core_snap_target(
+                flamewm_api::Point::new(i32::from(root_x), i32::from(root_y)),
+                to_core_rect(work),
+            )
+        };
+        move_counters().record_snap_target(snap_target_bits(target));
         if target == SnapTarget::None {
             self.snap_preview.hide();
             return;
@@ -2169,11 +3392,15 @@ impl<'a, C: Connection> Wm<'a, C> {
         ) {
             return;
         }
-        self.snap_preview.update(
-            Some(target),
-            Some(geometry),
-            snap_preview::DEFAULT_PREVIEW_OPACITY_PERCENT,
-        );
+        {
+            let _guard = flamewm_profiler::start("wm.move.preview");
+            self.snap_preview.update(
+                Some(target),
+                Some(geometry),
+                snap_preview::DEFAULT_PREVIEW_OPACITY_PERCENT,
+            );
+        }
+        move_counters().record_preview();
     }
 
     fn apply_frame_geometry(&mut self, client: Window) -> Result<(), ReplyError> {
@@ -2204,19 +3431,24 @@ impl<'a, C: Connection> Wm<'a, C> {
         }
         {
             let _guard = flamewm_profiler::start("wm.resize.client_configure");
-            let titlebar = u32::from(self.config.titlebar_height);
+            let (x, y, width, height) =
+                lifecycle::client_configure(crate::client::rect_to_root(outer), self.extents());
             self.conn.configure_window(
                 client,
                 &ConfigureWindowAux::new()
-                    .x(0)
-                    .y(i32::from(self.config.titlebar_height))
-                    .width(outer.width.max(1))
-                    .height(outer.height.saturating_sub(titlebar).max(1)),
+                    .x(x)
+                    .y(y)
+                    .width(width)
+                    .height(height),
             )?;
         }
         {
             let _guard = flamewm_profiler::start("wm.resize.commit");
-            self.layout_input_children(client)?;
+            // Geometry commit only: child layout is idempotent for an
+            // unchanged outer rect, and reconfiguring 12 children per commit
+            // sustains ConfigureNotify churn under SUBSTRUCTURE_NOTIFY.
+            // Full relayout stays on manage / WM_NORMAL_HINTS / final resize
+            // release (execute_effects LayoutInput arm).
         }
         Ok(())
     }
@@ -2401,31 +3633,29 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn send_configure_notify(&self, client: Window) -> Result<(), ReplyError> {
+        configure_bump!(synthetic, synthetic_total);
         let Some(state) = self.clients.get(&client) else {
             return Ok(());
         };
-        // Synthetic ConfigureNotify with client-root coords.
-        let extents = self.extents();
-        let root = frame_to_client_root(
-            RootRect::new(
-                state.outer.x,
-                state.outer.y,
-                state.outer.width.max(1) as i32,
-                state.outer.height.max(1) as i32,
-            ),
-            extents,
+        // Synthetic contract owned by configure policy: current client-root
+        // geometry; the frame is never moved by a notify.
+        let notify = configure::synthetic_notify_for(
+            state.outer.x,
+            state.outer.y,
+            state.outer.width.max(1) as i32,
+            state.outer.height.max(1) as i32,
+            self.extents(),
         );
-        let (cw, ch) = root.size_u32();
         let event = ConfigureNotifyEvent {
             response_type: CONFIGURE_NOTIFY_EVENT,
             sequence: 0,
             event: client,
             window: client,
             above_sibling: 0,
-            x: clamp_i16(root.x),
-            y: clamp_i16(root.y),
-            width: clamp_u16(cw),
-            height: clamp_u16(ch),
+            x: clamp_i16(notify.x),
+            y: clamp_i16(notify.y),
+            width: clamp_u16(notify.w),
+            height: clamp_u16(notify.h),
             border_width: 0,
             override_redirect: false,
         };
@@ -2476,14 +3706,71 @@ impl<'a, C: Connection> Wm<'a, C> {
             })
     }
 
-    /// EWMH icon path: cached `_NET_WM_ICON` selection, else `WM_CLASS`
-    /// resolver fallback with a debug reason. Arrow cursor is untouched.
-    fn read_frame_icon(&self, client: Window) -> (Option<chrome::IconImage>, Option<String>) {
-        match self.read_net_wm_icon(client) {
+    /// EWMH icon path: cached `_NET_WM_ICON` selection, else catalog
+    /// `find_by_window_identity` (cached `WM_CLASS` instance/class; exec
+    /// basename left empty — no `/proc` polling) -> `DesktopEntry` `Icon=`
+    /// -> indexed `IconResolver` raster -> cached RGBA. Empty slot on miss,
+    /// never the Flame logo. Arrow cursor is untouched.
+    ///
+    /// Manage/property callers only: performs X round-trips plus bounded
+    /// catalog/indexed-icon work. Paint consumes `ManagedClient::icon`.
+    fn read_frame_icon(
+        &mut self,
+        wm_instance: &str,
+        wm_class: &str,
+        client: Window,
+    ) -> (Option<chrome::IconImage>, Option<String>) {
+        let native = self.read_net_wm_icon(client);
+        match native {
             Ok(Some(icon)) => (Some(icon), None),
-            Ok(None) => (None, Some(self.icon_fallback_reason(client, "absent"))),
-            Err(reason) => (None, Some(self.icon_fallback_reason(client, reason))),
+            Ok(None) => self.catalog_or_empty(wm_instance, wm_class, "absent"),
+            Err(reason) => self.catalog_or_empty(wm_instance, wm_class, reason),
         }
+    }
+
+    fn catalog_or_empty(
+        &mut self,
+        wm_instance: &str,
+        wm_class: &str,
+        reason: &str,
+    ) -> (Option<chrome::IconImage>, Option<String>) {
+        match self.catalog_fallback_icon(wm_instance, wm_class) {
+            Some(icon) => (Some(icon), None),
+            None => (
+                None,
+                Some(self.icon_fallback_reason_with(wm_instance, wm_class, reason)),
+            ),
+        }
+    }
+
+    /// Synchronous catalog/indexed-icon fallback. Caller must have measured
+    /// evidence when this still exceeds 16.67ms under manage-profile; then
+    /// route via the existing `IconService` instead of adding a new worker.
+    fn catalog_fallback_icon(
+        &mut self,
+        wm_instance: &str,
+        wm_class: &str,
+    ) -> Option<chrome::IconImage> {
+        let _guard = flamewm_profiler::start("wm.manage.catalog_icon");
+        let identity = flamewm_applications::WindowApplicationIdentity::new(
+            wm_instance,
+            wm_class,
+            String::new(),
+        );
+        let icon_name = self
+            .catalog
+            .find_by_window_identity(&identity)?
+            .icon()
+            .to_owned();
+        // Decoration/cache owner resolves the catalog `Icon=` name via the
+        // shared memory-only indexed lookup and converts to cached ARGB32
+        // (pure memory convert). Miss keeps the transparent empty slot,
+        // never brand artwork.
+        crate::decoration::cache::resolve_catalog_icon_rgba(
+            &mut self.icon_resolver,
+            &icon_name,
+            crate::chrome::TITLEBAR_HEIGHT,
+        )
     }
 
     fn read_net_wm_icon(&self, client: Window) -> Result<Option<chrome::IconImage>, &'static str> {
@@ -2509,8 +3796,23 @@ impl<'a, C: Connection> Wm<'a, C> {
             .ok_or("invalid-payload")
     }
 
-    fn icon_fallback_reason(&self, client: Window, reason: &str) -> String {
-        let class = self.wm_class(client).unwrap_or_default();
+    /// Parsed `WM_CLASS` identity (instance, class) for one client. The raw
+    /// property holds two NUL-separated Latin-1 strings: instance first,
+    /// class second. Cached on the owner at manage time; paint never reads
+    /// the property.
+    fn wm_identity(&self, client: Window) -> (String, String) {
+        let raw = self
+            .conn
+            .get_property(false, client, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.value)
+            .unwrap_or_default();
+        parse_wm_class(&raw)
+    }
+
+    fn icon_fallback_reason_with(&self, wm_instance: &str, wm_class: &str, reason: &str) -> String {
+        let class = format!("{wm_instance}\0{wm_class}");
         if class.is_empty() {
             format!("icon-fallback wm_class=unknown reason={reason}")
         } else {
@@ -2574,6 +3876,14 @@ impl<'a, C: Connection> Wm<'a, C> {
         }
     }
 
+    fn live_pointer_grab_target(&self, requested: Window) -> Option<Window> {
+        let client = self.frame_to_client.get(&requested).copied()?;
+        let state = self.clients.get(&client)?;
+        let resources = self.registry.lookup_by_client(client)?;
+        (state.frame == resources.frame && pointer_grab_target(requested, resources))
+            .then_some(requested)
+    }
+
     fn read_hints(&self, client: Window) -> ClientSizeHints {
         self.conn
             .get_property(
@@ -2591,6 +3901,14 @@ impl<'a, C: Connection> Wm<'a, C> {
                 ClientSizeHints::parse(&values)
             })
     }
+}
+
+fn resolve_frame_event_source(registry: &FrameRegistry, event: Window, child: Window) -> Window {
+    registry.lookup_by_xid(child).map_or(event, |_| child)
+}
+
+fn pointer_grab_target(requested: Window, resources: FrameResources) -> bool {
+    requested == resources.frame || resources.children().contains(&requested)
 }
 
 impl<C: Connection> Drop for Wm<'_, C> {
@@ -2625,10 +3943,62 @@ fn from_core_rect(rect: flamewm_api::Rect) -> Rect {
     )
 }
 
+/// Workspace root for the canonical indexed `IconResolver` (packaged icon
+/// assets live under `<workspace>/assets`). Pure path probe for resolver
+/// construction; no icon decode happens here.
+fn flamewm_workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Split a raw `WM_CLASS` property (two NUL-separated Latin-1 tokens:
+/// instance first, class second) into `(instance, class)`. Missing tokens
+/// map to empty strings; excess trailing bytes are ignored.
+fn parse_wm_class(raw: &[u8]) -> (String, String) {
+    let text = String::from_utf8_lossy(raw);
+    let mut parts = text.split('\0');
+    let instance = parts.next().unwrap_or("").trim_matches('\0').to_owned();
+    let class = parts.next().unwrap_or("").trim_matches('\0').to_owned();
+    (instance, class)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::model::ResizeEdges;
+    use crate::frame::session::{MoveAnchor, MoveSession};
+
+    fn observed_release_mapping(target: SnapTarget) -> ReleaseAction {
+        release_action(target)
+    }
+
+    fn observed_release_action(
+        session: InteractionSession,
+        mode: PlacementMode,
+        target: SnapTarget,
+    ) -> ReleaseAction {
+        let move_session = match session {
+            InteractionSession::Move(session) => Some(session),
+            _ => None,
+        };
+        release_action_for_move(move_session, Some(mode), target)
+    }
+
+    fn pending_move() -> InteractionSession {
+        InteractionSession::Move(MoveSession {
+            client: 7,
+            start_pointer: RootPoint::new(520, 230),
+            start_placement: PlacementSnapshot {
+                mode: PlacementMode::Floating,
+                rect: RootRect::new(500, 200, 400, 300),
+            },
+            anchor: MoveAnchor::new(20, 400, 30),
+            grab_window: 99,
+        })
+    }
 
     #[test]
     fn resize_from_left_preserves_right_edge() {
@@ -2760,6 +4130,113 @@ mod tests {
             Some(EngineControl::Minimize)
         );
         assert_eq!(frame_control_at(400, titlebar, 285), None);
+    }
+
+    #[test]
+    fn frame_event_source_prefers_live_registered_child() {
+        let mut registry = FrameRegistry::new();
+        registry.register(crate::frame::resources::FrameResources::new(
+            1,
+            2,
+            3,
+            [4, 5, 6],
+            [7, 8, 9, 10, 11, 12, 13, 14],
+        ));
+        assert_eq!(resolve_frame_event_source(&registry, 99, 7), 7);
+        assert_eq!(resolve_frame_event_source(&registry, 99, 0), 99);
+        assert_eq!(resolve_frame_event_source(&registry, 99, 42), 99);
+    }
+
+    #[test]
+    fn pointer_grab_target_accepts_live_frame_or_input_child() {
+        let resources = crate::frame::resources::FrameResources::new(
+            1,
+            2,
+            3,
+            [4, 5, 6],
+            [7, 8, 9, 10, 11, 12, 13, 14],
+        );
+        assert!(pointer_grab_target(2, resources));
+        assert!(pointer_grab_target(7, resources));
+        assert!(!pointer_grab_target(99, resources));
+    }
+
+    // CONTRACT-REGRESSION T10: release mapping is total and typed.
+    // TRIGGER: release policy receives each snap candidate, including None.
+    // OBSERVABLE RESULT: None is no action, Maximize stays Maximize, and the
+    // eight half/quarter candidates become their matching engine snaps.
+    // UNCOVERED GAP: release mapping collapses Maximize and None to Left.
+    // FAILURE MUTATION: retain a Maximize/None -> Left fallback arm.
+    // REPRESENTATIVE CASE: the complete release-candidate mapping table.
+    #[test]
+    fn t10_release_action_mapping_is_total() {
+        use crate::frame::model::SnapTarget as EngineSnapTarget;
+
+        let cases = [
+            (SnapTarget::None, ReleaseAction::None),
+            (SnapTarget::Maximize, ReleaseAction::Maximize),
+            (
+                SnapTarget::LeftHalf,
+                ReleaseAction::Snap(EngineSnapTarget::Left),
+            ),
+            (
+                SnapTarget::RightHalf,
+                ReleaseAction::Snap(EngineSnapTarget::Right),
+            ),
+            (
+                SnapTarget::TopHalf,
+                ReleaseAction::Snap(EngineSnapTarget::Top),
+            ),
+            (
+                SnapTarget::BottomHalf,
+                ReleaseAction::Snap(EngineSnapTarget::Bottom),
+            ),
+            (
+                SnapTarget::TopLeftQuarter,
+                ReleaseAction::Snap(EngineSnapTarget::TopLeft),
+            ),
+            (
+                SnapTarget::TopRightQuarter,
+                ReleaseAction::Snap(EngineSnapTarget::TopRight),
+            ),
+            (
+                SnapTarget::BottomLeftQuarter,
+                ReleaseAction::Snap(EngineSnapTarget::BottomLeft),
+            ),
+            (
+                SnapTarget::BottomRightQuarter,
+                ReleaseAction::Snap(EngineSnapTarget::BottomRight),
+            ),
+        ];
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(target, expected)| {
+                let actual = observed_release_mapping(target);
+                (actual != expected).then_some((target, expected, actual))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "release mapping mismatches: {mismatches:?}"
+        );
+    }
+
+    // CONTRACT-REGRESSION T11: an unactivated move cannot snap on release.
+    // TRIGGER: title press arms Move, then release reaches an edge before any
+    // activating motion crosses the threshold.
+    // OBSERVABLE RESULT: release eligibility is None; no Snap action exists.
+    // UNCOVERED GAP: release_from_move currently treats a pending Move as
+    // activated and evaluates the edge target anyway.
+    // FAILURE MUTATION: admit every InteractionSession::Move at release.
+    // REPRESENTATIVE CASE: floating title press/release with LeftHalf target.
+    #[test]
+    fn t11_unactivated_move_release_is_not_snap_eligible() {
+        let session = pending_move();
+        assert!(matches!(session, InteractionSession::Move(_)));
+        assert_eq!(
+            observed_release_action(session, PlacementMode::Floating, SnapTarget::LeftHalf),
+            ReleaseAction::None
+        );
     }
 
     #[test]

@@ -866,9 +866,10 @@ impl IconLookupIndex {
         (name.to_owned(), None)
     }
 
-    /// Memory-only lookup: normalized -> files -> current theme exact then
-    /// nearest -> inherited -> hicolor -> pixmaps. `indexed_hit` means the
-    /// returned file exists (it was recorded at build).
+    /// Memory-only lookup: normalized -> files -> global exact-size first
+    /// in chain order, then per-theme best (nearest size, directory order,
+    /// format order) in theme-rank order -> pixmaps. Returned files were
+    /// recorded at build (`indexed_hit` means the file exists in snapshot).
     #[must_use]
     pub fn lookup(&self, name: &str, physical: u32) -> (Vec<PathBuf>, bool) {
         let (base, explicit) = Self::normalize_name(name);
@@ -880,8 +881,11 @@ impl IconLookupIndex {
             let hit = !tail.is_empty();
             return (tail, hit);
         };
-        // Per-theme: current-theme any-size beats inherited exact.
-        let mut theme_best: HashMap<usize, &IndexedIconFile> = HashMap::new();
+        // Per-theme best first (current-theme any-size candidate recorded),
+        // then global exact-first to mirror resolver precedence: exact-size
+        // (distance 0) matches anywhere in the chain win in chain order,
+        // remaining per-theme bests follow in theme-rank order.
+        let mut theme_best: HashMap<usize, (&IndexedIconFile, u64)> = HashMap::new();
         for file in entries {
             if !explicit_matches(&file.path, explicit.as_deref()) {
                 continue;
@@ -889,22 +893,34 @@ impl IconLookupIndex {
             let distance = directory_distance(self, file, physical.max(1));
             let better = match theme_best.get(&file.theme_rank) {
                 None => true,
-                Some(cur) => {
-                    let cur_d = directory_distance(self, cur, physical.max(1));
+                Some((cur, cur_d)) => {
                     (distance, file.directory_rank, file.format_rank)
-                        < (cur_d, cur.directory_rank, cur.format_rank)
+                        < (*cur_d, cur.directory_rank, cur.format_rank)
                 }
             };
             if better {
-                theme_best.insert(file.theme_rank, file);
+                theme_best.insert(file.theme_rank, (file, distance));
             }
         }
-        let mut ranks: Vec<usize> = theme_best.keys().copied().collect();
-        ranks.sort();
-        let ordered: Vec<PathBuf> = ranks
+        let mut best: Vec<(usize, &IndexedIconFile, u64)> = theme_best
             .into_iter()
-            .filter_map(|rank| theme_best.get(&rank).map(|file| file.path.clone()))
+            .map(|(rank, (file, distance))| (rank, file, distance))
             .collect();
+        best.sort_by_key(|(rank, _, _)| *rank);
+        // Global exact-first mirrors resolver precedence: exact-size
+        // (distance 0) matches anywhere in the chain win in chain order,
+        // remaining per-theme bests follow in theme-rank order.
+        let mut ordered = Vec::new();
+        for (_, file, distance) in &best {
+            if *distance == 0 {
+                ordered.push(file.path.clone());
+            }
+        }
+        for (_, file, distance) in &best {
+            if *distance != 0 {
+                ordered.push(file.path.clone());
+            }
+        }
         let mut out = ordered;
         if out.is_empty() {
             if let Some(found) = self.pixmaps.get(&base) {
@@ -980,17 +996,11 @@ impl IconLookupIndex {
         }
     }
 
-    /// Indexed-theme-first candidate paths for `name` at `physical` px.
-    ///
-    /// Phase 1: exact-size (distance 0) matches anywhere in the chain, in
-    /// chain order (uses `index.ordered_dirs`). Phase 2: remaining indexed
-    /// candidates. Lazy bounded legacy fallback (`<theme>/<size>x<size>/ctx`)
-    /// is appended only when no indexed candidate file exists on disk
-    /// (bounded to 256 paths), plus `pixmaps` fallbacks.
     /// Memory-only candidate paths for `name` at `physical` px.
-    /// Normalizes explicit extensions (never appends a second ext),
-    /// returns per-theme best (current theme any-size beats inherited
-    /// exact), then pixmaps recorded at build. No FS walk, no probe cap.
+    /// Freezes application lookup precedence: normalizes explicit
+    /// extensions (never appends a second ext), returns global exact-size
+    /// matches first in chain order, then per-theme best, then pixmaps
+    /// recorded at build. No FS walk, no probe cap.
     #[must_use]
     pub fn candidates(&self, name: &str, physical: u32) -> Vec<PathBuf> {
         if let Some(hit) = self.memo_get(name, physical) {

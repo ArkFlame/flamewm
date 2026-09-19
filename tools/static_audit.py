@@ -79,6 +79,8 @@ vendor = {
     "flamewm-c-reference": 500,
     "RustWebRender-0.0.9": 150,
     "icewm-master": 500,
+    "creamshell-main": 80,
+    "creamui-main": 150,
 }
 vendor_root = ROOT / ".vendor"
 allowed_vendor_dirs = set(vendor)
@@ -749,7 +751,10 @@ if "Breeze-Dark" not in _J12_PAINT_DECOR and "CURSOR_THEME" not in _J12_PAINT_DE
 _J12H_PAINT_CORE = read_required("crates/flamewm-render-core/src/paint.rs")
 _J12H_START_MENU_CORE = read_required("crates/flamewm-shell-core/src/start_menu.rs")
 _J12H_PROJ = read_required("crates/flamewm-shell/src/projection.rs")
+_J12H_APP = read_required("crates/flamewm-shell/src/app.rs")
 _J12H_RUNTIME = read_required("crates/flamewm-shell/src/runtime.rs")
+_J12H_POPUP_CONTROLLER = read_required("crates/flamewm-shell/src/popup_controller.rs")
+_J12H_STATUS_SURFACE = read_required("crates/flamewm-shell/src/runtime/status_surface.rs")
 _J12H_MAIN = read_required("crates/flamewm-shell/src/main.rs")
 _J12H_AUDIO = read_required("crates/flamewm-shell/src/taskbar/status/audio.rs")
 _J12H_NETWORK = read_required("crates/flamewm-shell/src/taskbar/status/network.rs")
@@ -780,13 +785,17 @@ for _anchor in ["fn filter_view", "fn query_view", "fn slot_view"]:
 if "StartCategory::Power" not in _j12_code(_J12H_PROJ) or "session" not in _j12_code(_J12H_PROJ).lower():
     errors.append("Power visibility not session-gated (J12H-G04)")
 # J12H-G05: changed-slot icon reset is surface-scoped (no blanket reproject).
-if "need_panel" not in _j12_code(_J12H_MAIN) or "need_submenu" not in _j12_code(_J12H_MAIN):
+if "need_panel" not in _j12_code(_J12H_APP) or "need_submenu" not in _j12_code(_J12H_APP):
     errors.append("changed slot icon reset not surface-scoped (J12H-G05)")
 # J12H-G06: production OpenPopover path is anchored (measured, not fixed rect).
-# `open_status_anchored_id` is the live measured path; its geometry helper is
-# `measured_status_rect_by_id` (the pre-migration `anchored_rect_by_id` name
-# was retired when fallback 0,0/fixed-size rects were removed).
-if "open_status_anchored_id" not in _j12_code(_J12H_RUNTIME) or "measured_status_rect_by_id" not in _j12_code(_J12H_RUNTIME):
+# `open_status_anchored_id` enters the live status-surface transaction;
+# popup_controller owns retained source resolution and node measurement.
+if (
+    "open_status_anchored_id" not in _j12_code(_J12H_RUNTIME)
+    or "resolve_source_rect" not in _j12_code(_J12H_POPUP_CONTROLLER)
+    or "measure_node" not in _j12_code(_J12H_POPUP_CONTROLLER)
+    or "popup_controller::open_popup" not in _j12_code(_J12H_STATUS_SURFACE)
+):
     errors.append("OpenPopover production path not anchored (J12H-G06)")
 # J12H-G07: audio/network popovers have no fixed live authority (availability-gated).
 if "ServiceAvailability::Available" not in _j12_code(_J12H_AUDIO):
@@ -803,13 +812,11 @@ if "RenameFlags::NOREPLACE" not in _j12_code(_J12H_FILE_ACTIONS):
 if "v1\\t" not in _J12H_STICKY_PERSIST or "v2\\t" not in _J12H_STICKY_PERSIST:
     errors.append("sticky v1+v2 headers missing (J12H-G10)")
 # J12H-G11: WorkspacesChanged travels event-driven (no poll loop). Anchor
-# lives in doc comments; check raw text plus revision-gated code path.
-# `refresh_dynamic` is the signal-reconcile entry point (renamed from the
-# pre-migration `resnapshot_dynamic` broad-fetch helper); the tick calls only
-# it, event paths mark dirty instead of refreshing inline, and steady state
-# documents never-poll/no-polling.
-if ("refresh_dynamic" not in _j12_code(_J12H_MAIN)
-        or ("never polls" not in _J12H_MAIN.lower() and "no polling" not in _J12H_RUNTIME.lower())):
+# lives in app.rs; check raw text plus revision-gated code path. The tick
+# calls only it, event paths mark dirty instead of refreshing inline, and
+# steady state documents never-poll/no-polling.
+if ("refresh_dynamic" not in _j12_code(_J12H_APP)
+        or ("never polls" not in _J12H_APP.lower() and "no polling" not in _J12H_RUNTIME.lower())):
     errors.append("WorkspacesChanged event-driven contract missing (J12H-G11)")
 # J12H-G12: honest ExternalDrawable contract (safe-x11rb transport; geometry/material via skin).
 if "ExternalDrawableTarget" not in (_J12_PAINT_DECOR + _J12H_CHROME) or "ExternalDrawableSession" not in _J12H_EXT:
@@ -945,6 +952,7 @@ if "project_row" not in _j11_desk or "flame_fallback" not in _j11_row:
 # IconService<IconResolver> generic import is async-service use, not sync
 # resolution, so only direct prepare_*/resolve calls in wm.rs trip this.
 _j11_wm = _j11_code(read_required("crates/flamewm-wm-x11/src/wm.rs"))
+_j11_chrome_runtime = _j11_code(read_required("crates/flamewm-wm-x11/src/wm/chrome_runtime.rs"))
 if (
     "prepare_application" in _j11_wm
     or "prepare_semantic" in _j11_wm
@@ -953,11 +961,9 @@ if (
 ):
     errors.append("sync IconResolver in WM draw/manage path (J11-G05)")
 # J11-G06: frame chrome paints through the frame-engine owner (paint_chrome /
-# frame chrome plan_scene+render); no raw non-renderer paint path (direct
-# paint:: calls or core text draws). The retired Wm::draw_frame painter was
-# deleted in the J16 frame-engine cutover; either the legacy draw_frame path
-# (delegating via self.decorations) or the successor paint_chrome path
-# satisfies this guard.
+# chrome_runtime cached scene_for+paint_cached bridge); no raw non-renderer
+# paint path (direct paint:: calls or core text draws). The retired
+# Wm::draw_frame painter was deleted in the J16 frame-engine cutover.
 _has_draw = "draw_frame" in _j11_wm
 _has_chrome = "fn paint_chrome" in _j11_wm
 if not _has_draw and not _has_chrome:
@@ -971,7 +977,16 @@ if _has_chrome:
     _j11_chrome_body = _j11_fn_body(_j11_wm, "paint_chrome")
     if re.search(r"paint::paint_frame|image_text8|XDrawString|XRenderComposite", _j11_chrome_body):
         errors.append("paint_chrome uses raw non-renderer paint path (J11-G06)")
-    elif "frame_chrome::plan_scene" not in _j11_chrome_body and "frame_chrome::render" not in _j11_chrome_body:
+    elif not (
+        "frame_chrome::plan_scene" in _j11_chrome_body
+        or "frame_chrome::render" in _j11_chrome_body
+        or (
+            "runtime.scene_for" in _j11_chrome_body
+            and "runtime.paint_cached" in _j11_chrome_body
+            and "pub fn scene_for" in _j11_chrome_runtime
+            and "pub fn paint_cached" in _j11_chrome_runtime
+        )
+    ):
         errors.append("paint_chrome bypasses frame chrome owner (J11-G06)")
 # J11-G07: performance retention cleanup defaults ON (opt-out, not opt-in).
 _j11_ret = read_required("tools/performance_retention.py")

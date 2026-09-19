@@ -6,6 +6,8 @@ pub mod control_actions;
 pub mod icon_loader;
 pub mod panel;
 pub mod popovers;
+pub mod popup_controller;
+pub mod popup_role;
 pub mod projection;
 pub mod quick_controls;
 pub mod runtime;

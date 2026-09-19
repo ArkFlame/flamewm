@@ -23,9 +23,18 @@ pub struct ManagedClient {
     pub title: String,
     pub title_text_width: i32,
     /// Cached `_NET_WM_ICON` selection (largest valid image), alpha preserved.
+    /// Falls back to the catalog `Icon=` raster (converted to `IconImage`)
+    /// resolved from the cached `WM_CLASS` identity; `None` is an empty
+    /// slot, never brand artwork.
     pub icon: Option<IconImage>,
     /// Debug reason when the icon slot falls back to `WM_CLASS` identity.
     pub icon_fallback: Option<String>,
+    /// Parsed `WM_CLASS` identity cached at manage time: instance (first
+    /// NUL-separated token) and class (second token). Paint never performs
+    /// an X round-trip for these; the `_NET_WM_ICON` property path refreshes
+    /// them alongside the icon.
+    pub wm_instance: String,
+    pub wm_class: String,
     pub transient_for: Option<Window>,
     pub minimized: bool,
     pub sticky: bool,
@@ -124,6 +133,8 @@ mod tests {
             title_text_width: 0,
             icon: None,
             icon_fallback: None,
+            wm_instance: String::new(),
+            wm_class: String::new(),
             transient_for: None,
             minimized: false,
             sticky: false,

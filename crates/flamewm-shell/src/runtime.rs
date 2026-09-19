@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+pub mod start_surface;
+pub mod status_surface;
 use crate::start::{self, StartCategory};
 use flamewm_api::applications::{ApplicationLaunchOptions, DesktopApplication};
 use flamewm_api::display::DisplaySnapshot;
@@ -12,8 +14,8 @@ use flamewm_control_core::{ControlRequest, ControlResponse};
 use flamewm_control_dbus::ControlClient;
 use flamewm_control_wire::ControlSignal;
 use flamewm_shell_core::popup::{
-    anchor_popover_rect, context_menu_rect, context_menu_size, fitted_start_placement,
-    measured_popup_rect, panel_anchor, work_area_for_panel, PopupRefusal,
+    anchor_popover_rect, context_menu_rect, context_menu_size, panel_anchor, work_area_for_panel,
+    PopupRefusal,
 };
 use flamewm_shell_core::start_surface_layout;
 use flamewm_ui_core::style::ShellMetrics;
@@ -667,6 +669,7 @@ pub struct ShellSurfaces {
     pub media: SurfaceHandle,
     output: flamewm_api::display::OutputSnapshot,
     panel_snapshot: flamewm_api::panels::PanelSnapshot,
+    #[allow(dead_code)]
     start_layout: flamewm_shell_core::StartSurfaceLayout,
     placement: PanelPlacementContext,
     transient: Option<Transient>,
@@ -775,73 +778,13 @@ impl ShellSurfaces {
         self.open_start_group_measured(runtime)
     }
 
-    /// Single measured unified Start show: the already-projected Start
-    /// document is measured once (intrinsic union), anchored to the
-    /// retained panel device rect, then prepare (move_resize) ->
-    /// present (show) -> grab. Never mapped at 0,0: missing
-    /// layout/anchor refuses via `PopupRefusal`.
+    /// Single measured unified Start show via the shared popup
+    /// transaction (`runtime::start_surface`). Never mapped at 0,0:
+    /// missing layout/anchor refuses via `PopupError`.
     fn open_start_group_measured(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), String> {
-        // C04 correlated trace: one txn threads anchor -> intrinsic ->
-        // fitted -> ui-request -> native-request -> retained. Debug-only
-        // observed stage is one probe after present (0 extra X sync in
-        // normal mode).
-        let trace = GeometryTrace::begin("start-menu");
-        let anchor = start_device_anchor(runtime, self.panel, &self.start_layout);
-        trace.anchor((anchor.x, anchor.y, anchor.width, anchor.height));
-        let root_size = measured_start_root_size_traced(runtime, self.start, &self.output, &trace)?;
-        let placement = fitted_start_placement(
-            anchor,
-            root_size,
-            self.panel_snapshot.edge,
-            self.output.geometry,
-            8,
-        )
-        .map_err(|refusal| refusal.to_string())?;
-        trace.fitted((
-            placement.rect.x,
-            placement.rect.y,
-            placement.rect.width,
-            placement.rect.height,
-        ));
-        // Canonical present: `show` owns the single ordered present cycle;
-        // no separate raise/redraw chains. The unified surface takes the
-        // single group grab.
-        let panel_revision = self.placement.panels_revision;
-        let edge = self.panel_snapshot.edge;
-        let panel_rect = self.panel_snapshot.geometry;
-        let output_rect = self.output.geometry;
         let work_area = self.placement.work_area;
-        let anchor_t = (anchor.x, anchor.y, anchor.width, anchor.height);
-        let intrinsic_t = (root_size.width, root_size.height);
-        let fitted_t = (
-            placement.rect.x,
-            placement.rect.y,
-            placement.rect.width,
-            placement.rect.height,
-        );
-        let native_request_t = fitted_t;
-        self.map_raise_grab_traced(runtime, self.start, placement.rect, &trace)?;
-        trace_observed_probe(runtime, self.start, &trace);
-        let native_observed = runtime
-            .surface_device_rect(self.start)
-            .ok()
-            .map(|r| (r.x as i32, r.y as i32, r.width as i32, r.height as i32));
-        debug_popup_record(
-            "start",
-            panel_revision,
-            edge,
-            panel_rect,
-            output_rect,
-            work_area,
-            anchor_t,
-            intrinsic_t,
-            fitted_t,
-            native_request_t,
-            native_observed,
-            trace.txn,
-        );
-        debug_stack_canary_check(runtime, self.start, "start");
-        let _ = placement.content_was_capped;
+        let edge = self.panel_snapshot.edge;
+        start_surface::open(runtime, self.panel, self.start, work_area, edge)?;
         self.transient = Some(Transient::StartGroup);
         Ok(())
     }
@@ -859,63 +802,15 @@ impl ShellSurfaces {
         self.open_start_group_measured(runtime)
     }
 
-    /// Transactional resize of the already-open unified Start surface:
-    /// re-measure, prepare geometry, then map/present without dropping
-    /// the single group grab.
+    /// Transactional resize of the already-open unified Start surface
+    /// via the shared `start_surface::refit` (anchor -> measure -> fit);
+    /// prepared before re-map without dropping the group grab.
     fn resize_start_group_measured(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), String> {
-        let trace = GeometryTrace::begin("start-menu");
-        let anchor = start_device_anchor(runtime, self.panel, &self.start_layout);
-        trace.anchor((anchor.x, anchor.y, anchor.width, anchor.height));
-        let root_size = measured_start_root_size_traced(runtime, self.start, &self.output, &trace)?;
-        let placement = fitted_start_placement(
-            anchor,
-            root_size,
-            self.panel_snapshot.edge,
-            self.output.geometry,
-            8,
-        )
-        .map_err(|refusal| refusal.to_string())?;
-        trace.fitted((
-            placement.rect.x,
-            placement.rect.y,
-            placement.rect.width,
-            placement.rect.height,
-        ));
-        let panel_revision = self.placement.panels_revision;
-        let edge = self.panel_snapshot.edge;
-        let panel_rect = self.panel_snapshot.geometry;
-        let output_rect = self.output.geometry;
         let work_area = self.placement.work_area;
-        let anchor_t = (anchor.x, anchor.y, anchor.width, anchor.height);
-        let intrinsic_t = (root_size.width, root_size.height);
-        let fitted_t = (
-            placement.rect.x,
-            placement.rect.y,
-            placement.rect.width,
-            placement.rect.height,
-        );
-        self.map_raise_traced(runtime, self.start, placement.rect, &trace)?;
-        trace_observed_probe(runtime, self.start, &trace);
-        let native_observed = runtime
-            .surface_device_rect(self.start)
-            .ok()
-            .map(|r| (r.x as i32, r.y as i32, r.width as i32, r.height as i32));
-        debug_popup_record(
-            "start",
-            panel_revision,
-            edge,
-            panel_rect,
-            output_rect,
-            work_area,
-            anchor_t,
-            intrinsic_t,
-            fitted_t,
-            fitted_t,
-            native_observed,
-            trace.txn,
-        );
-        debug_stack_canary_check(runtime, self.start, "start");
-        Ok(())
+        let edge = self.panel_snapshot.edge;
+        let rect = start_surface::refit(runtime, self.panel, self.start, work_area, edge, 8)
+            .map_err(|error| error.to_string())?;
+        self.map_raise(runtime, self.start, rect)
     }
 
     #[must_use]
@@ -956,16 +851,14 @@ impl ShellSurfaces {
             return Err(format!("quick-control {name} owned by helper process"));
         }
         // Live path: stable panel node ids, edge from the panel edge, Align
-        // End; no fixed popup_rect. Single measured show: intrinsic size is
-        // resolved after content projection, then geometry -> prepare ->
-        // map/raise/grab -> present in one pass (see open_status_anchored_id).
-        self.open_status_anchored_id(runtime, name, status_source_id(name))
+        // End; no fixed popup_rect. Single measured show via the shared
+        // `status_surface` transaction (see open_status_anchored_id).
+        self.open_status_anchored_id(runtime, name, status_surface::spec().source_node_id)
     }
 
     /// Anchored open from a stable panel node id (`tray-media`,
     /// `tray-volume`, `tray-network`, `clock-button`).
-    /// Single measured show: measure (intrinsic) -> anchor (node rect) ->
-    /// prepare geometry/backbuffer/shape -> map/raise/grab -> present.
+    /// Single measured show via the shared `status_surface` transaction.
     /// Refuses `PendingLayout`/`PendingAnchor`; never maps at 0,0.
     pub fn open_status_anchored_id(
         &mut self,
@@ -977,68 +870,43 @@ impl ShellSurfaces {
             "media" => (self.media, Transient::Media),
             _ => return Err(format!("unsupported shell popup {name}")),
         };
+        // Contract: this entry resolves the source id from the role spec;
+        // the id path keeps accepting the legacy caller-supplied id only
+        // when it matches the role's canonical source node.
+        let spec = status_surface::spec();
+        if source_id != spec.source_node_id {
+            return Err(format!("unsupported shell popup source {source_id}"));
+        }
         self.close_transients(runtime)?;
-        let rect = measured_status_rect_by_id(
+        status_surface::open(
             runtime,
-            self.output.geometry,
             self.panel,
-            source_id,
             surface,
-            panel_edge_to_popover(self.panel_snapshot.edge),
+            self.placement.work_area,
+            self.panel_snapshot.edge,
         )?;
-        // Geometry -> prepare -> map/raise/grab -> present in one pass.
-        self.map_raise_grab(runtime, surface, rect)?;
         self.transient = Some(transient);
         Ok(())
     }
 
-    /// Re-measure the open popup after content changed: intrinsic size +
-    /// clamp + Align End placement. No-op when nothing is open.
-    /// Transactional: the new rect is prepared before re-mapping, and a
-    /// refused measurement leaves the currently mapped rect untouched.
+    /// Re-measure the open popup after content changed via the shared
+    /// `status_surface::refit` (anchor -> measure -> fit). No-op when
+    /// nothing is open. Transactional: a refused measurement leaves the
+    /// currently mapped rect untouched.
     pub fn remeasure_open_popup(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), String> {
-        let (surface, name) = match self.transient {
-            Some(Transient::Media) => (self.media, "media"),
+        let surface = match self.transient {
+            Some(Transient::Media) => self.media,
             _ => return Ok(()),
         };
-        let rect = measured_status_rect_by_id(
+        let rect = status_surface::refit(
             runtime,
-            self.output.geometry,
             self.panel,
-            status_source_id(name),
             surface,
-            panel_edge_to_popover(self.panel_snapshot.edge),
-        )?;
+            self.placement.work_area,
+            self.panel_snapshot.edge,
+        )
+        .map_err(|error| error.to_string())?;
         self.map_raise(runtime, surface, rect)
-    }
-
-    pub fn open_status_anchored(
-        &mut self,
-        runtime: &mut SurfaceRuntime,
-        name: &str,
-        source_surface: SurfaceHandle,
-        source_node: u32,
-    ) -> Result<(), String> {
-        let (surface, transient, edge) = match name {
-            "media" => (
-                self.media,
-                Transient::Media,
-                flamewm_ui_core::popover::PopoverEdge::Above,
-            ),
-            _ => return Err(format!("unsupported shell popup {name}")),
-        };
-        self.close_transients(runtime)?;
-        let rect = measured_status_rect_by_node(
-            runtime,
-            self.output.geometry,
-            source_surface,
-            source_node,
-            surface,
-            edge,
-        )?;
-        self.map_raise_grab(runtime, surface, rect)?;
-        self.transient = Some(transient);
-        Ok(())
     }
 
     pub fn open_context_menu(
@@ -1375,25 +1243,9 @@ fn checked_size(value: i32) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("invalid surface size {value}"))
 }
 
-fn status_source_id(name: &str) -> &'static str {
-    match name {
-        "media" => "tray-media",
-        "volume" | "audio" => "tray-volume",
-        "network" => "tray-network",
-        "clock" => "clock-button",
-        _ => "tray-network",
-    }
-}
-
-fn panel_edge_to_popover(edge: flamewm_api::PanelEdge) -> flamewm_ui_core::popover::PopoverEdge {
-    match edge {
-        flamewm_api::PanelEdge::Top => flamewm_ui_core::popover::PopoverEdge::Below,
-        _ => flamewm_ui_core::popover::PopoverEdge::Above,
-    }
-}
-
 /// Retained-device anchor: live panel node rect (`node_device_rect_by_id`,
 /// root-space device rect, no recompute) when retained layout exists.
+#[allow(dead_code)]
 fn retained_source_by_id(
     runtime: &SurfaceRuntime,
     panel: SurfaceHandle,
@@ -1403,16 +1255,6 @@ fn retained_source_by_id(
         .node_device_rect_by_id(panel, source_id)
         .map(|rect| to_api_rect(rect.x, rect.y, rect.width, rect.height))
         .filter(|rect| rect.width > 0 && rect.height > 0)
-}
-
-/// Start root anchor from retained panel `task-start` node rect, else the
-/// static layout anchor. Never 0,0 unless the layout resolves there.
-fn start_device_anchor(
-    runtime: &SurfaceRuntime,
-    panel: SurfaceHandle,
-    layout: &flamewm_shell_core::StartSurfaceLayout,
-) -> flamewm_api::Rect {
-    retained_source_by_id(runtime, panel, "task-start").unwrap_or_else(|| start_anchor_rect(layout))
 }
 
 /// Render-space device rect (f32 root space) -> API integer rect.
@@ -1426,342 +1268,8 @@ fn to_api_rect(x: f32, y: f32, width: f32, height: f32) -> flamewm_api::Rect {
     )
 }
 
-/// Measured anchoring from a stable panel node id. Uses retained-live node
-/// rects (`node_device_rect_by_id`) first, then the legacy layout-recompute
-/// path only when no retained layout exists.
-fn measured_status_rect_by_id(
-    runtime: &mut SurfaceRuntime,
-    work_area: flamewm_api::Rect,
-    panel: SurfaceHandle,
-    source_id: &str,
-    popup_surface: SurfaceHandle,
-    edge: flamewm_ui_core::popover::PopoverEdge,
-) -> Result<flamewm_api::Rect, String> {
-    let source = retained_source_by_id(runtime, panel, source_id).or_else(|| {
-        runtime
-            .node_global_rect_by_id(panel, source_id)
-            .map(|rect| {
-                flamewm_api::Rect::new(
-                    rect.x as i32,
-                    rect.y as i32,
-                    rect.width.max(1.0) as i32,
-                    rect.height.max(1.0) as i32,
-                )
-            })
-    });
-    let source = source.ok_or_else(|| PopupRefusal::PendingAnchor.to_string())?;
-    let intrinsic = measure_outer_intrinsic(
-        runtime,
-        popup_surface,
-        "media",
-        Some(source),
-        edge,
-        flamewm_ui_core::popover::PopoverAlign::End,
-        work_area,
-    )?;
-    measured_popup_rect(
-        Some(source),
-        intrinsic,
-        edge,
-        flamewm_ui_core::popover::PopoverAlign::End,
-        work_area,
-        8,
-    )
-    .map_err(|refusal| refusal.to_string())
-}
-
-/// Measured anchoring from a node handle. Same refusal contract as
-/// `measured_status_rect_by_id`; never falls back to 0,0 or a fixed size.
-fn measured_status_rect_by_node(
-    runtime: &mut SurfaceRuntime,
-    work_area: flamewm_api::Rect,
-    source_surface: SurfaceHandle,
-    source_node: u32,
-    popup_surface: SurfaceHandle,
-    edge: flamewm_ui_core::popover::PopoverEdge,
-) -> Result<flamewm_api::Rect, String> {
-    let source = runtime
-        .node_device_rect(source_surface, source_node)
-        .ok()
-        .map(|rect| to_api_rect(rect.x, rect.y, rect.width, rect.height))
-        .filter(|rect| rect.width > 0 && rect.height > 0)
-        .or_else(|| {
-            runtime
-                .node_global_rect(source_surface, source_node)
-                .map(|rect| {
-                    flamewm_api::Rect::new(
-                        rect.x as i32,
-                        rect.y as i32,
-                        rect.width.max(1.0) as i32,
-                        rect.height.max(1.0) as i32,
-                    )
-                })
-                .ok()
-        });
-    let intrinsic = measure_outer_intrinsic(
-        runtime,
-        popup_surface,
-        "media",
-        source,
-        edge,
-        flamewm_ui_core::popover::PopoverAlign::End,
-        work_area,
-    )?;
-    measured_popup_rect(
-        source,
-        intrinsic,
-        edge,
-        flamewm_ui_core::popover::PopoverAlign::End,
-        work_area,
-        8,
-    )
-    .map_err(|refusal| refusal.to_string())
-}
-
 fn ui_error(error: UiBackendError) -> String {
     format!("{error:?}")
-}
-
-/// Start root measure: intrinsic size of the already-projected Start
-/// document. Refuses `PendingLayout` instead of using a fixed size.
-/// The document root box is `#start-menu` itself (unified root width from
-/// `ShellMetrics::start_menu_width`), so the intrinsic width is used
-/// directly; only the output/work area clamps the size. Height beyond the
-/// space above the panel is capped by `fitted_start_placement` (bottom
-/// adjacency kept, content scrolls internally).
-#[allow(dead_code)]
-fn measured_start_root_size(
-    runtime: &mut SurfaceRuntime,
-    surface: SurfaceHandle,
-    output: &flamewm_api::display::OutputSnapshot,
-) -> Result<flamewm_api::Size, String> {
-    let max = outer_measure_constraint(output.geometry);
-    let logical = logical_constraint(max)?;
-    let measured = runtime
-        .measure_outer_intrinsic_device_size(surface, max.0, max.1)
-        .map_err(|_| PopupRefusal::PendingLayout.to_string())?;
-    emit_popup_measure(
-        "start",
-        "",
-        None,
-        output.geometry,
-        Some(max),
-        Some(logical),
-        Some(measured),
-        None,
-        None,
-    );
-    let size = device_to_popup_size(measured)
-        .filter(|size| size.width > 0 && size.height > 0)
-        .ok_or_else(|| PopupRefusal::PendingLayout.to_string())?;
-    let size = flamewm_api::Size::new(
-        size.width.min(output.geometry.width.max(1)),
-        size.height.min(output.geometry.height.max(1)),
-    );
-    Ok(size)
-}
-
-/// Traced Start root measure: same contract, plus the intrinsic stage on
-/// the caller's txn. Does not move START Y.
-#[allow(dead_code)]
-fn measured_start_root_size_traced(
-    runtime: &mut SurfaceRuntime,
-    surface: SurfaceHandle,
-    output: &flamewm_api::display::OutputSnapshot,
-    trace: &GeometryTrace,
-) -> Result<flamewm_api::Size, String> {
-    let size = measured_start_root_size(runtime, surface, output)?;
-    trace.intrinsic((size.width, size.height));
-    Ok(size)
-}
-
-/// Debug-only observed stage from retained state (no X sync roundtrip).
-/// Fills the observed leg of the correlated trace off the hot path.
-#[allow(dead_code)]
-fn trace_observed_retained(
-    runtime: &SurfaceRuntime,
-    surface: SurfaceHandle,
-    trace: &GeometryTrace,
-) {
-    if let Ok(rect) = runtime.surface_device_rect(surface) {
-        trace.observed((
-            rect.x as i32,
-            rect.y as i32,
-            rect.width as i32,
-            rect.height as i32,
-        ));
-    }
-}
-
-/// DEBUG-ONLY gate: true only when `FLAMEWM_DEBUG=1`. Normal mode must
-/// issue zero extra X syncs; callers check this before any probe.
-/// Local copy (no new cross-crate dep); mirrors the render owner.
-#[allow(dead_code)]
-fn shell_debug_enabled() -> bool {
-    std::env::var_os("FLAMEWM_DEBUG").is_some_and(|v| v == "1")
-}
-
-/// DEBUG-ONLY observed root-rect probe after present: normal mode is zero
-/// extra X sync; debug mode (`FLAMEWM_DEBUG=1`) issues one observed root
-/// rect probe (retained read via the X native owner, no layout recompute).
-#[allow(dead_code)]
-fn trace_observed_probe(runtime: &SurfaceRuntime, surface: SurfaceHandle, trace: &GeometryTrace) {
-    if shell_debug_enabled() {
-        let _ = runtime.debug_probe_root_rect(surface, *trace);
-    } else {
-        trace_observed_retained(runtime, surface, trace);
-    }
-}
-
-/// DEBUG-ONLY correlated popup record: panel_revision, edge, panel_rect,
-/// output_rect, work_area, anchor, intrinsic, fitted, native_request,
-/// native_observed. Emitted only under `FLAMEWM_DEBUG=1`; one record per
-/// popup show (Start in-process, Audio/Network/Calendar helper).
-#[allow(dead_code)]
-fn debug_popup_record(
-    kind: &str,
-    panel_revision: u64,
-    edge: flamewm_api::PanelEdge,
-    panel_rect: flamewm_api::Rect,
-    output_rect: flamewm_api::Rect,
-    work_area: flamewm_api::Rect,
-    anchor: (i32, i32, i32, i32),
-    intrinsic: (i32, i32),
-    fitted: (i32, i32, i32, i32),
-    native_request: (i32, i32, i32, i32),
-    native_observed: Option<(i32, i32, i32, i32)>,
-    txn: u64,
-) {
-    if !shell_debug_enabled() {
-        return;
-    }
-    eprintln!(
-        "popup-record txn={txn} kind={kind} panel_revision={panel_revision} edge={edge:?} panel_rect={panel_rect:?} output_rect={output_rect:?} work_area={work_area:?} anchor={anchor:?} intrinsic={intrinsic:?} fitted={fitted:?} native_request={native_request:?} native_observed={native_observed:?}",
-    );
-}
-
-/// DEBUG-ONLY stack canary check: desktop < normal < dock < popup. Runs
-/// only under `FLAMEWM_DEBUG=1` (or test). Pass = leave stacking alone.
-/// Fail = repair through the existing map/raise owner and report; no
-/// redesign of stacking order.
-#[allow(dead_code)]
-fn debug_stack_canary_check(runtime: &mut SurfaceRuntime, surface: SurfaceHandle, kind: &str) {
-    if !shell_debug_enabled() {
-        return;
-    }
-    match runtime.debug_stack_canary() {
-        Ok(true) => {}
-        Ok(false) => {
-            // Repair path: re-use the existing map/raise owner only.
-            let _ = runtime.raise(surface);
-            eprintln!("flamewm-shell: debug stack canary FAILED kind={kind}; re-raised via existing owner");
-        }
-        Err(error) => {
-            eprintln!("flamewm-shell: debug stack canary error kind={kind} error={error:?}");
-        }
-    }
-}
-
-/// Start root anchor: the resolved popover anchor from surface layout.
-/// Never 0,0 unless the layout itself resolves there.
-fn start_anchor_rect(layout: &flamewm_shell_core::StartSurfaceLayout) -> flamewm_api::Rect {
-    layout.anchor
-}
-
-/// Panel-edge -> Start root placement edge. Legacy helper for the generic
-/// measured path; fitted Start placement (J07) uses the panel edge directly.
-#[allow(dead_code)]
-fn start_root_edge(edge: flamewm_api::PanelEdge) -> flamewm_ui_core::popover::PopoverEdge {
-    match edge {
-        flamewm_api::PanelEdge::Top => flamewm_ui_core::popover::PopoverEdge::Below,
-        flamewm_api::PanelEdge::Left => flamewm_ui_core::popover::PopoverEdge::Right,
-        flamewm_api::PanelEdge::Right => flamewm_ui_core::popover::PopoverEdge::Left,
-        _ => flamewm_ui_core::popover::PopoverEdge::Above,
-    }
-}
-
-/// C03 outer-intrinsic popup measure helpers. Every popup consumer
-/// resolves through `measure_outer_intrinsic` (work-area device
-/// constraint -> `SurfaceRuntime::measure_outer_intrinsic_device_size`).
-/// `IntrinsicMeasureError`/backend failure refuses via `PendingLayout`;
-/// the caller keeps the alive surface untouched (no map at 0,0).
-fn outer_measure_constraint(work_area: flamewm_api::Rect) -> (f32, f32) {
-    let width = work_area.width.max(1).min(i32::MAX);
-    let height = work_area.height.max(1).min(i32::MAX);
-    (width as f32, height as f32)
-}
-
-fn logical_constraint(max_device: (f32, f32)) -> Result<(f32, f32), String> {
-    // Shared-surface ui_scale reads 1.0 for the headless/pure-math probe;
-    // live surfaces read their own scale through the runtime measure path.
-    let scale = 1.0f32;
-    if max_device.0 <= 0.0 || max_device.1 <= 0.0 {
-        return Err(PopupRefusal::PendingLayout.to_string());
-    }
-    Ok((max_device.0 / scale, max_device.1 / scale))
-}
-
-fn device_to_popup_size(measured: (f32, f32)) -> Option<flamewm_api::Size> {
-    if !measured.0.is_finite() || !measured.1.is_finite() {
-        return None;
-    }
-    let width = measured.0.max(1.0) as i32;
-    let height = measured.1.max(1.0) as i32;
-    if !width.is_positive() || !height.is_positive() {
-        return None;
-    }
-    Some(flamewm_api::Size::new(width, height))
-}
-
-fn emit_popup_measure(
-    role: &str,
-    kind: &str,
-    anchor: Option<flamewm_api::Rect>,
-    work_area: flamewm_api::Rect,
-    max_device: Option<(f32, f32)>,
-    logical: Option<(f32, f32)>,
-    measured: Option<(f32, f32)>,
-    fitted: Option<flamewm_api::Rect>,
-    refusal: Option<&str>,
-) {
-    flamewm_debug::emit(
-        flamewm_debug::SHELL_POPUP_MEASURE,
-        flamewm_debug::SHELL_POPUP_MEASURE_COOLDOWN,
-        || {
-            format!(
-                "role={role} kind={kind} anchor={anchor:?} work_area={work_area:?} max_device={max_device:?} logical={logical:?} measured={measured:?} fitted={fitted:?} refusal={refusal:?}"
-            )
-        },
-    );
-}
-
-fn measure_outer_intrinsic(
-    runtime: &mut SurfaceRuntime,
-    surface: SurfaceHandle,
-    role: &'static str,
-    anchor: Option<flamewm_api::Rect>,
-    edge: flamewm_ui_core::popover::PopoverEdge,
-    align: flamewm_ui_core::popover::PopoverAlign,
-    work_area: flamewm_api::Rect,
-) -> Result<Option<flamewm_api::Size>, String> {
-    let max = outer_measure_constraint(work_area);
-    let logical = logical_constraint(max)?;
-    let measured = runtime
-        .measure_outer_intrinsic_device_size(surface, max.0, max.1)
-        .map_err(|_| PopupRefusal::PendingLayout.to_string())?;
-    let kind = format!("{edge:?}/{align:?}");
-    emit_popup_measure(
-        role,
-        &kind,
-        anchor,
-        work_area,
-        Some(max),
-        Some(logical),
-        Some(measured),
-        None,
-        None,
-    );
-    Ok(device_to_popup_size(measured))
 }
 
 /// Shell spans (static only): shell.windows.reconcile, shell.workspaces.reconcile,

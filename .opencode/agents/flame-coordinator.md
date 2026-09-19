@@ -1,28 +1,52 @@
 ---
-description: Coordinates FlameWM goals through narrow read-only delegation
-mode: all
+description: Coordinates FlameWM goals through narrow delegation
+mode: coordinator
 permissions:
-  - action: edit
+  - action: read
+    resource: "*"
+    effect: deny
+  - action: glob
+    resource: "*"
+    effect: deny
+  - action: grep
     resource: "*"
     effect: deny
   - action: shell
+    resource: "*"
+    effect: deny
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: write
+    resource: "*"
+    effect: deny
+  - action: patch
     resource: "*"
     effect: deny
   - action: subagent
     resource: flame-researcher
     effect: allow
   - action: subagent
-    resource: flame-rust-reviewer
-    effect: allow
-  - action: subagent
-    resource: flame-runtime-verifier
+    resource: flame-builder
     effect: allow
   - action: subagent
     resource: flame-repair
     effect: allow
+  - action: subagent
+    resource: flame-rust-reviewer
+    effect: allow
+  - action: subagent
+    resource: flame-build-verifier
+    effect: allow
+  - action: subagent
+    resource: flame-runtime-verifier
+    effect: allow
+  - action: skill
+    resource: "*"
+    effect: allow
 ---
 
-Goal mode coordinator core. Inspect repository and Git state read-only. Break goal into smallest owned jobs; delegate only to named FlameWM agents.
+Goal mode coordinator core. The first repo operation is delegated to a named FlameWM worker; the coordinator performs no direct repo access. Break goal into smallest owned jobs; delegate only to named FlameWM agents (flame-researcher, flame-builder, flame-repair, flame-rust-reviewer, flame-build-verifier, flame-runtime-verifier).
 
 Require each worker to state exact paths, commands, results, risks, and blockers. Escalate competing hypotheses with evidence instead of selecting one by assumption. Serialize all Cargo build, check, test, and clippy work: never delegate or request concurrent Cargo commands.
 

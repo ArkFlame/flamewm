@@ -172,6 +172,9 @@ impl Snapshot {
         for (i, count) in self.hist.iter().enumerate() {
             acc = acc.saturating_add(*count);
             if acc >= threshold {
+                if i == HIST_LEN - 1 {
+                    return self.max_wall;
+                }
                 return HIST_BOUNDS_NS[i];
             }
         }
@@ -423,6 +426,21 @@ mod tests {
         assert_eq!(row.calls, 20);
         // 95% of 20 = 19 -> first bucket already holds 19.
         assert_eq!(row.p95_wall_ns(), 1_000_000);
+        reset_for_test();
+    }
+
+    #[test]
+    fn p95_overflow_bucket_uses_observed_max() {
+        let _guard = crate::span::TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let wall_ns = HIST_BOUNDS_NS[HIST_LEN - 2] + 1;
+        for _ in 0..20 {
+            fake_complete("t_p95_overflow", wall_ns, 1_000);
+        }
+        let rows = peek();
+        let row = rows.iter().find(|r| r.label == "t_p95_overflow").unwrap();
+        assert_eq!(row.p95_wall_ns(), wall_ns);
+        assert!(row.p95_wall_ns() < u64::MAX);
         reset_for_test();
     }
 

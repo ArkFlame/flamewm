@@ -11,6 +11,9 @@ permissions:
   - action: subagent
     resource: "*"
     effect: deny
+  - action: skill
+    resource: "*"
+    effect: allow
 ---
 
 Review only. Inspect supplied Rust changes and relevant owners, contracts, callers, and architecture boundaries. Report correctness, safety, ownership, concurrency, X11, API, and regression findings in severity order with exact file and line references. Do not edit, run commands, delegate, build, test, or claim runtime proof.

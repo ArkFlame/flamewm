@@ -13,7 +13,7 @@ Packets are UTF-8 JSON files validated by `SCHEMA.json`.
 - Packet filenames are stable, descriptive, and use `.json`.
 - A packet identifies one job, its owner, scope, requested outcome, and verification evidence.
 - A handoff declares `REQUIRED_SKILLS`; the receiving agent explicitly loads each skill before work and records them in route evidence.
-- Route evidence identifies job ID, role, source handoff, loaded skills, changed paths, commands and results, blockers, and the hypothesis ledger reference when hypotheses are used.
+- Route evidence is a UTF-8 JSON route ledger under `runtime/` with `job`, `role`, `source_handoff`, `route`, `changed_paths`, `commands`, `blockers`, and `hypothesis_ledger`. `route` preserves the `skill_route.py` object: `required`, `optional`, and `reasons`; it records loaded skills. `commands` records command/result pairs, and `hypothesis_ledger` names the ledger when hypotheses are used.
 - Hypotheses, assumptions, and their outcomes are recorded in the task-scoped hypothesis ledger at `runtime/hypotheses/<job-id>.md`; it is ignored evidence, not a source of shared contract truth.
 - Missing, ambiguous, or conflicting requirements are reported as `BLOCKED`; agents do not silently invent contract changes.
 
@@ -41,3 +41,9 @@ Reports list changed paths, verification commands and results, remaining risks, 
 - Builder's first terminal status is exactly `PATCH_APPLIED_NEEDS_VERIFY`, `BLOCKED`, or `FAILED`. A Builder never reports `PASS` for mutating work.
 - Verifier independently records verification evidence and reports exactly `PASS`, `BLOCKED`, or `FAILED`. `PASS` is valid only for verification, never mutation.
 - A Coordinator may report `DONE` only after Verifier `PASS`; it reports `UNVERIFIED` only when verification was explicitly excluded or could not run, with evidence.
+
+### 1.3 Compact-result / context-budget contract
+
+- Result capsules are <=80 lines / <=1200 tokens: status lines, changed paths, commands/results, risks, blockers.
+- Full evidence stays under `.agents/runtime/<cohort>/<job>/`; capsules reference it by path instead of inlining.
+- Dependents consume only frozen contract capsules issued by the coordinator; they re-read current source rather than replaying prior worker logs.

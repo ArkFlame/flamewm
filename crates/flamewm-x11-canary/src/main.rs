@@ -26,29 +26,31 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+mod scenarios;
+
 const BUTTON_RELEASE_EVENT: u8 = 5;
 
-struct Canary {
-    conn: RustConnection,
-    screen: usize,
-    root: Window,
+pub(crate) struct Canary {
+    pub(crate) conn: RustConnection,
+    pub(crate) screen: usize,
+    pub(crate) root: Window,
 }
 
 #[derive(Debug, Clone)]
-struct WinInfo {
-    id: u32,
-    parent: u32,
-    x: i16,
-    y: i16,
-    width: u16,
-    height: u16,
-    map_state: u8,
-    name: String,
-    class: String,
+pub(crate) struct WinInfo {
+    pub(crate) id: u32,
+    pub(crate) parent: u32,
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) map_state: u8,
+    pub(crate) name: String,
+    pub(crate) class: String,
 }
 
 impl WinInfo {
-    fn map_name(&self) -> &'static str {
+    pub(crate) fn map_name(&self) -> &'static str {
         match self.map_state {
             0 => "unmapped",
             1 => "unviewable",
@@ -56,7 +58,7 @@ impl WinInfo {
             _ => "unknown",
         }
     }
-    fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         format!(
             "{{\"id\":{},\"parent\":{},\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"map_state\":\"{}\",\"name\":{},\"class\":{}}}",
             self.id,
@@ -90,7 +92,7 @@ fn json_str(value: &str) -> String {
     out
 }
 
-fn fail(message: &str) -> ! {
+pub(crate) fn fail(message: &str) -> ! {
     eprintln!("CANARY_FAIL {message}");
     std::process::exit(1);
 }
@@ -152,13 +154,13 @@ fn j06_ledger_pass(sampled: usize, delivered: usize, non_black: usize) -> bool {
 }
 
 impl Canary {
-    fn connect() -> Result<Self, String> {
+    pub(crate) fn connect() -> Result<Self, String> {
         let (conn, screen) = x11rb::connect(None).map_err(|e| e.to_string())?;
         let root = conn.setup().roots[screen].root;
         Ok(Self { conn, screen, root })
     }
 
-    fn prop_bytes(&self, window: Window, atom: Atom) -> Vec<u8> {
+    pub(crate) fn prop_bytes(&self, window: Window, atom: Atom) -> Vec<u8> {
         self.conn
             .get_property(false, window, atom, AtomEnum::ANY, 0, u32::MAX)
             .ok()
@@ -167,7 +169,7 @@ impl Canary {
             .unwrap_or_default()
     }
 
-    fn text_prop(&self, window: Window, names: &[&str]) -> String {
+    pub(crate) fn text_prop(&self, window: Window, names: &[&str]) -> String {
         for name in names {
             let atom = self
                 .conn
@@ -199,7 +201,7 @@ impl Canary {
         String::new()
     }
 
-    fn info(&self, window: Window, parent: Window) -> Option<WinInfo> {
+    pub(crate) fn info(&self, window: Window, parent: Window) -> Option<WinInfo> {
         let geom = self.conn.get_geometry(window).ok()?.reply().ok()?;
         let attrs = self.conn.get_window_attributes(window).ok()?.reply().ok()?;
         let name = self.text_prop(window, &["_NET_WM_NAME", "WM_NAME"]);
@@ -217,7 +219,7 @@ impl Canary {
         })
     }
 
-    fn walk(&self, parent: Window, out: &mut Vec<WinInfo>) {
+    pub(crate) fn walk(&self, parent: Window, out: &mut Vec<WinInfo>) {
         let tree = match self.conn.query_tree(parent) {
             Ok(c) => match c.reply() {
                 Ok(t) => t,
@@ -233,13 +235,13 @@ impl Canary {
         }
     }
 
-    fn all(&self) -> Vec<WinInfo> {
+    pub(crate) fn all(&self) -> Vec<WinInfo> {
         let mut out = Vec::new();
         self.walk(self.root, &mut out);
         out
     }
 
-    fn find(&self, name: &str) -> Vec<WinInfo> {
+    pub(crate) fn find(&self, name: &str) -> Vec<WinInfo> {
         let needle = name.to_lowercase();
         self.all()
             .into_iter()
@@ -249,7 +251,7 @@ impl Canary {
             .collect()
     }
 
-    fn by_id(&self, id: u32) -> Option<WinInfo> {
+    pub(crate) fn by_id(&self, id: u32) -> Option<WinInfo> {
         let mut queue = VecDeque::from([self.root]);
         while let Some(parent) = queue.pop_front() {
             let tree = self.conn.query_tree(parent).ok()?.reply().ok()?;
@@ -263,7 +265,14 @@ impl Canary {
         None
     }
 
-    fn sample(&self, drawable: Window, x: i16, y: i16, w: u16, h: u16) -> Result<Vec<u8>, String> {
+    pub(crate) fn sample(
+        &self,
+        drawable: Window,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+    ) -> Result<Vec<u8>, String> {
         let reply = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, drawable, x, y, w, h, u32::MAX)
@@ -273,7 +282,7 @@ impl Canary {
         Ok(reply.data)
     }
 
-    fn pixel_stats(data: &[u8]) -> (bool, u64, u8, u8, u8) {
+    pub(crate) fn pixel_stats(data: &[u8]) -> (bool, u64, u8, u8, u8) {
         if data.is_empty() {
             return (true, 0, 0, 0, 0);
         }
@@ -308,11 +317,17 @@ impl Canary {
         (all_zero, n, mean_r, mean_g, mean_b)
     }
 
-    fn send_button(&self, window: Window, x: i16, y: i16, press: bool) -> Result<(), String> {
+    pub(crate) fn send_button(
+        &self,
+        window: Window,
+        x: i16,
+        y: i16,
+        press: bool,
+    ) -> Result<(), String> {
         self.send_button_detail(window, x, y, press, 1)
     }
 
-    fn send_button_detail(
+    pub(crate) fn send_button_detail(
         &self,
         window: Window,
         x: i16,
@@ -354,7 +369,7 @@ impl Canary {
         Ok(())
     }
 
-    fn stacking_order(&self) -> Result<Vec<Window>, String> {
+    pub(crate) fn stacking_order(&self) -> Result<Vec<Window>, String> {
         self.conn
             .query_tree(self.root)
             .map_err(|e| e.to_string())?
@@ -363,7 +378,7 @@ impl Canary {
             .map_err(|e| e.to_string())
     }
 
-    fn intern(&self, name: &str) -> Option<Atom> {
+    pub(crate) fn intern(&self, name: &str) -> Option<Atom> {
         self.conn
             .intern_atom(false, name.as_bytes())
             .ok()?
@@ -372,7 +387,7 @@ impl Canary {
             .map(|r| r.atom)
     }
 
-    fn active_window(&self) -> Option<Window> {
+    pub(crate) fn active_window(&self) -> Option<Window> {
         let atom = self.intern("_NET_ACTIVE_WINDOW")?;
         let reply = self
             .conn
@@ -394,7 +409,7 @@ impl Canary {
         None
     }
 
-    fn prop_u32(&self, window: Window, name: &str) -> Vec<u32> {
+    pub(crate) fn prop_u32(&self, window: Window, name: &str) -> Vec<u32> {
         let atom = match self.intern(name) {
             Some(a) => a,
             None => return Vec::new(),
@@ -406,11 +421,11 @@ impl Canary {
             .collect()
     }
 
-    fn motif_no_decor(&self, window: Window) -> bool {
+    pub(crate) fn motif_no_decor(&self, window: Window) -> bool {
         j13_motif_no_decorations(&self.prop_u32(window, "_MOTIF_WM_HINTS"))
     }
 
-    fn send_active_window(&self, window: Window) -> Result<(), String> {
+    pub(crate) fn send_active_window(&self, window: Window) -> Result<(), String> {
         let msg_type = self
             .intern("_NET_ACTIVE_WINDOW")
             .ok_or_else(|| "no _NET_ACTIVE_WINDOW atom".to_owned())?;
@@ -431,12 +446,12 @@ impl Canary {
         Ok(())
     }
 
-    fn root_geometry(&self) -> (u16, u16) {
+    pub(crate) fn root_geometry(&self) -> (u16, u16) {
         let setup = &self.conn.setup().roots[self.screen];
         (setup.width_in_pixels, setup.height_in_pixels)
     }
 
-    fn send_motion(&self, window: Window, x: i16, y: i16) -> Result<(), String> {
+    pub(crate) fn send_motion(&self, window: Window, x: i16, y: i16) -> Result<(), String> {
         let geom = self
             .conn
             .get_geometry(window)
@@ -468,7 +483,7 @@ impl Canary {
     }
 }
 
-fn arg(args: &[String], flag: &str) -> Option<String> {
+pub(crate) fn arg(args: &[String], flag: &str) -> Option<String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == flag {
@@ -481,7 +496,7 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
-fn has(args: &[String], flag: &str) -> bool {
+pub(crate) fn has(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
@@ -512,7 +527,8 @@ fn usage() -> ! {
           j12 [--scenario panel|start|selection|desktop-menu|context|chrome|drag-ghost|entry-menu|rename|start-power|short-submenu|audio-network|calendar|sticky|chrome-capture|all] [--json]\n  \
            j13 [--scenario ws-latency|task-activate|status-popup|black-frame|resize-cursors|fixed-size|motif-initial|motif-late|title-maximize|sticky-create|multi-resolution|all] [--json]\n  \
           j06 [--scenario postreg-calendar-300|postreg-start-single-surface|postreg-start-app-click|postreg-desktop-icon-wake|postreg-filemanager-map-latency|postreg-title-centered|postreg-resize-8|postreg-fixed-size|postreg-pixmap-ledger|all] [--json]\n  \
-          interaction-perf [--cycles <n>] [--json]"
+          interaction-perf [--cycles <n>] [--json]
+          j07 [--scenario popup|move|resize|chrome|max-snap|workspaces|retention|all] [--json] [--name <substr>] [--window <id>] [--source <substr>] [--repeats <n>] [--run a|b --digest-of <hex> --digest <path>] [--cycles <n>]"
     );
     std::process::exit(2);
 }
@@ -2531,6 +2547,7 @@ fn main() -> ExitCode {
         "j13" => cmd_j13(&canary, &rest),
         "j06" => cmd_j06(&canary, &rest),
         "interaction-perf" => cmd_interaction_perf(&canary, &rest),
+        "j07" => scenarios::cmd_j07(&canary, &rest),
         _ => usage(),
     }
     ExitCode::SUCCESS
@@ -2541,7 +2558,7 @@ mod j13_tests {
     use super::{j13_hints_resizable, j13_motif_no_decorations, j13_resize_edges};
 
     #[test]
-    fn motif_parse_matches_policy() {
+    pub(crate) fn motif_parse_matches_policy() {
         assert!(j13_motif_no_decorations(&[2, 0, 0, 0, 0]));
         assert!(!j13_motif_no_decorations(&[0, 0, 0, 0, 0]));
         assert!(!j13_motif_no_decorations(&[2, 0, 1, 0, 0]));
@@ -2549,7 +2566,7 @@ mod j13_tests {
     }
 
     #[test]
-    fn hints_fixed_pair_is_not_resizable() {
+    pub(crate) fn hints_fixed_pair_is_not_resizable() {
         let values = vec![(1 << 4) | (1 << 5), 0, 0, 0, 0, 400, 300, 400, 300];
         assert!(!j13_hints_resizable(&values));
         let values = vec![(1 << 4) | (1 << 5), 0, 0, 0, 0, 100, 100, 800, 600];
@@ -2558,21 +2575,21 @@ mod j13_tests {
     }
 
     #[test]
-    fn j06_title_centered() {
+    pub(crate) fn j06_title_centered() {
         assert_eq!(super::j06_title_center_offset(400, 100), 150);
         assert_eq!(super::j06_title_center_offset(100, 200), 0);
         assert_eq!(super::j06_title_center_offset(400, 400), 0);
     }
 
     #[test]
-    fn j06_ledger_contract() {
+    pub(crate) fn j06_ledger_contract() {
         assert!(super::j06_ledger_pass(3, 3, 1));
         assert!(!super::j06_ledger_pass(3, 2, 1));
         assert!(!super::j06_ledger_pass(0, 0, 0));
     }
 
     #[test]
-    fn eight_edges_all_hit() {
+    pub(crate) fn eight_edges_all_hit() {
         let pts = [
             (200, 2),
             (200, 297),

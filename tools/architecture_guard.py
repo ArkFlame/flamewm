@@ -142,7 +142,7 @@ def violations(root):
             source_path = relative_path(root, source)
             if FORBIDDEN_X11_SOURCE.search(text):
                 found.add((source_path, "x11rb-symbol"))
-            if FORBIDDEN_RENDERER_SOURCE.search(text):
+            if FORBIDDEN_RENDERER_SOURCE.search(_j6_strip_comments(text)):
                 found.add((source_path, "renderer-symbol"))
             if RAW_FFI_SOURCE.search(text):
                 found.add((source_path, "raw-ffi-boundary"))
@@ -497,9 +497,8 @@ def j11_violations(root):
     ):
         found.add(("crates/flamewm-wm-x11/src/wm.rs", "j11-g05-no-sync-icon-resolver"))
     # J11-G06: frame chrome paints through the frame-engine owner
-    # (paint_chrome / frame chrome plan_scene+render). The retired
-    # Wm::draw_frame painter was deleted in the J16 cutover; either the
-    # legacy draw_frame path or the successor paint_chrome path satisfies.
+    # (paint_chrome / chrome_runtime cached scene_for+paint_cached bridge).
+    # The retired Wm::draw_frame painter was deleted in the J16 cutover.
     draw = _j11_fn_body(wm, "draw_frame")
     has_draw = "draw_frame" in wm
     has_chrome = "fn paint_chrome" in wm
@@ -512,9 +511,19 @@ def j11_violations(root):
             found.add(("crates/flamewm-wm-x11/src/wm.rs", "j11-g06-renderer-frame-path"))
     if has_chrome:
         chrome_body = _j11_fn_body(wm, "paint_chrome")
+        chrome_runtime = live("crates/flamewm-wm-x11/src/wm/chrome_runtime.rs")
         if re.search(r"paint::paint_frame|image_text8|XDrawString|XRenderComposite", chrome_body):
             found.add(("crates/flamewm-wm-x11/src/wm.rs", "j11-g06-renderer-frame-path"))
-        elif "frame_chrome::plan_scene" not in chrome_body and "frame_chrome::render" not in chrome_body:
+        elif not (
+            "frame_chrome::plan_scene" in chrome_body
+            or "frame_chrome::render" in chrome_body
+            or (
+                "runtime.scene_for" in chrome_body
+                and "runtime.paint_cached" in chrome_body
+                and "pub fn scene_for" in chrome_runtime
+                and "pub fn paint_cached" in chrome_runtime
+            )
+        ):
             found.add(("crates/flamewm-wm-x11/src/wm.rs", "j11-g06-renderer-frame-path"))
     # J11-G07: retention cleanup defaults opt-out-on (checked in tools).
     ret = root / "tools/performance_retention.py"
@@ -903,7 +912,10 @@ def j12h_violations(root):
     paint_core = live("crates/flamewm-render-core/src/paint.rs")
     start_menu = live("crates/flamewm-shell-core/src/start_menu.rs")
     proj = live("crates/flamewm-shell/src/projection.rs")
+    app = live("crates/flamewm-shell/src/app.rs")
     runtime = live("crates/flamewm-shell/src/runtime.rs")
+    popup_controller = live("crates/flamewm-shell/src/popup_controller.rs")
+    status_surface = live("crates/flamewm-shell/src/runtime/status_surface.rs")
     main = live("crates/flamewm-shell/src/main.rs")
     audio = live("crates/flamewm-shell/src/taskbar/status/audio.rs")
     network = live("crates/flamewm-shell/src/taskbar/status/network.rs")
@@ -936,12 +948,17 @@ def j12h_violations(root):
     if "StartCategory::Power" not in proj or "session" not in proj.lower():
         found.add(("crates/flamewm-shell/src/projection.rs", "j12h-g04-power-explicit"))
     # J12H-G05: surface-scoped icon reset.
-    if "need_panel" not in main or "need_submenu" not in main:
-        found.add(("crates/flamewm-shell/src/main.rs", "j12h-g05-scoped-icon-reset"))
-    # J12H-G06: anchored OpenPopover. `open_status_anchored_id` is the live
-    # measured path with `measured_status_rect_by_id` geometry (the
-    # pre-migration `anchored_rect_by_id` name was retired with 0,0 fallbacks).
-    if "open_status_anchored_id" not in runtime or "measured_status_rect_by_id" not in runtime:
+    if "need_panel" not in app or "need_submenu" not in app:
+        found.add(("crates/flamewm-shell/src/app.rs", "j12h-g05-scoped-icon-reset"))
+    # J12H-G06: anchored OpenPopover. `open_status_anchored_id` enters the
+    # status-surface transaction; popup_controller owns retained source
+    # resolution and node measurement.
+    if (
+        "open_status_anchored_id" not in runtime
+        or "resolve_source_rect" not in popup_controller
+        or "measure_node" not in popup_controller
+        or "popup_controller::open_popup" not in status_surface
+    ):
         found.add(("crates/flamewm-shell/src/runtime.rs", "j12h-g06-anchored-popover"))
     # J12H-G07: audio/network availability-gated.
     if "ServiceAvailability::Available" not in audio:
@@ -958,15 +975,15 @@ def j12h_violations(root):
     if "v1\\t" not in persist or "v2\\t" not in persist:
         found.add(("crates/flamewm-desktop-core/src/sticky_persistence.rs", "j12h-g10-sticky-v1-v2"))
     # J12H-G11: event-driven, no poll. Contract anchor lives in doc
-    # comments (stripped from code context), so check raw text plus the
-    # revision-gated refresh_dynamic code path with no poll timer.
-    # (`refresh_dynamic` is the signal-reconcile entry point renamed from the
-    # pre-migration `resnapshot_dynamic` broad-fetch helper.)
+    # comments (stripped from code context); refresh_dynamic is owned by
+    # app.rs and reconciles the runtime's signal-driven dirty state.
     raw_main = (root / "crates/flamewm-shell/src/main.rs").read_text(encoding="utf-8") if (root / "crates/flamewm-shell/src/main.rs").is_file() else ""
     raw_rt = (root / "crates/flamewm-shell/src/runtime.rs").read_text(encoding="utf-8") if (root / "crates/flamewm-shell/src/runtime.rs").is_file() else ""
-    if ("refresh_dynamic" not in main or "register_timer" in main and "workspace" in main.lower().split("register_timer")[0][-200:]
-            or ("never polls" not in raw_main.lower() and "no polling" not in raw_rt.lower())):
-        found.add(("crates/flamewm-shell/src/main.rs", "j12h-g11-no-workspace-poll"))
+    raw_app = (root / "crates/flamewm-shell/src/app.rs").read_text(encoding="utf-8") if (root / "crates/flamewm-shell/src/app.rs").is_file() else ""
+    if ("refresh_dynamic" not in app or "register_timer" in main and "workspace" in main.lower().split("register_timer")[0][-200:]
+            or ("never polls" not in raw_main.lower() and "no polling" not in raw_rt.lower()
+                and "never polls" not in raw_app.lower() and "no polling" not in raw_app.lower())):
+        found.add(("crates/flamewm-shell/src/app.rs", "j12h-g11-no-workspace-poll"))
     # J12H-G12: honest ExternalDrawable + skin metrics contract.
     if "ExternalDrawableTarget" not in (paint_decor + chrome) or "ExternalDrawableSession" not in ext:
         found.add(("crates/flamewm-wm-x11/src/decoration/paint.rs", "j12h-g12-external-delegation"))

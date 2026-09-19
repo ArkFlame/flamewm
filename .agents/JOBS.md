@@ -7,7 +7,7 @@
 3. Create one claim for the job and acquire coordination locks only when needed.
 4. Make the smallest change that satisfies the handoff. Do not widen scope silently.
 5. Run the project-native verification required by the handoff. If verification is out of scope, say so.
-6. Write one completion packet to `runtime/outbox/` using `SCHEMA.json`, including route evidence and any `runtime/hypotheses/<job-id>.md` reference.
+6. Write one completion packet to `runtime/outbox/` using `SCHEMA.json`, plus a UTF-8 JSON route ledger under `runtime/` with `job`, `role`, `source_handoff`, `route`, `changed_paths`, `commands`, `blockers`, and `hypothesis_ledger`. `route` preserves `skill_route.py` `required`, `optional`, and `reasons`; `hypothesis_ledger` names any `runtime/hypotheses/<job-id>.md` reference.
 7. Close the claim and release locks.
 
 ## Handoffs
@@ -32,3 +32,7 @@ A handoff must name a unique job ID, owner, requested outcome, allowed paths, co
 ## File Rules
 
 All paths in packets are repository-relative. Runtime files stay under `.agents/runtime/`; never add runtime state, status markers, claims, locks, inbox packets, outbox packets, or `__pycache__` to a commit. Preserve existing user or agent changes, and never use destructive repository-wide reset or checkout operations.
+
+## 1.3 Compact-result / context-budget contract
+
+Result capsules are <=80 lines / <=1200 tokens (status, paths, commands/results, risks, blockers). Full evidence lives under `.agents/runtime/<cohort>/<job>/`. Dependents consume only frozen contract capsules from the coordinator and re-read current source.

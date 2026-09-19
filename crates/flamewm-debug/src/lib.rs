@@ -92,6 +92,8 @@ frame_ids!(
     (WM_FRAME_INPUT_RELAYOUTS, "wm.frame.input.relayouts"),
     (WM_FRAME_CHROME_REPAINTS, "wm.frame.chrome.repaints"),
     (WM_FRAME_GRAB_FAIL, "wm.frame.grab.fail"),
+    (WM_CONFIGURE_SUMMARY, "wm.configure.summary"),
+    (WM_CONFIGURE_MISMATCH, "wm.configure.mismatch"),
 );
 
 struct State {

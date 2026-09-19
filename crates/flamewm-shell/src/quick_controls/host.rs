@@ -13,28 +13,28 @@ use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::popup_controller::PopupError;
 use flamewm_api::settings::{SettingValue, SettingsSnapshot};
 use flamewm_control_core::ControlRequest;
 use flamewm_control_dbus::ControlClient;
 use flamewm_dbus_reactor::BusKind;
 use flamewm_debug::DebugEventId;
-use flamewm_shell_core::popup::{measured_popup_rect, PopupRefusal};
 use flamewm_shell_core::status::{AudioSettings, AudioTab, NetworkQuery};
-use flamewm_ui_core::popover::{PopoverAlign, PopoverEdge};
 use flamewm_ui_x11::{
     decode_document, ActionPhase, PointerButton, SurfaceConfig, SurfaceHandle, SurfaceInputMode,
     SurfaceRole, SurfaceRuntime, UiBackendError, UiTemplate,
 };
 
+use self::popup::{close_helper, fit_helper, grab, measure_helper, prepare_commit, present};
 use super::protocol::{decode_line, Command, OpenRequest, QuickControlKind, MAX_LINE_LEN};
 use super::supervisor::{QuickControlSupervisor, SupervisorError};
+
+#[path = "popup.rs"]
+mod popup;
 
 /// Pre-commit debug probe; the final geometry commit limit stays fixed
 /// (refusals leave state untouched, no limit raise).
 const POPUP_TRANSITION: DebugEventId = DebugEventId("shell.popup.transition");
-const GEOMETRY_REFUSAL: DebugEventId = DebugEventId("render.geometry.refusal");
-const POPUP_MEASURE: DebugEventId = DebugEventId("shell.popup.measure");
-const POPUP_MEASURE_COOLDOWN: Duration = Duration::from_millis(1000);
 
 const AUDIO_ARTIFACT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flamewm-audio.rwr"));
 const NETWORK_ARTIFACT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flamewm-network.rwr"));
@@ -479,40 +479,30 @@ impl OpenStageTimings {
     }
 }
 
-fn outer_measure_constraint(work_area: flamewm_api::Rect) -> (f32, f32) {
-    let width = work_area.width.max(1).min(i32::MAX);
-    let height = work_area.height.max(1).min(i32::MAX);
-    (width as f32, height as f32)
+/// Fitted placement plus the real measure/place stage split, so the
+/// slow-open line can attribute each turn without fake spans.
+pub struct FittedPlacement {
+    pub rect: flamewm_api::Rect,
+    pub measure_elapsed: Duration,
+    pub place_elapsed: Duration,
 }
 
-fn device_to_popup_size(measured: (f32, f32)) -> Option<flamewm_api::Size> {
-    if !measured.0.is_finite() || !measured.1.is_finite() {
-        return None;
-    }
-    let width = measured.0.max(1.0) as i32;
-    let height = measured.1.max(1.0) as i32;
-    if !width.is_positive() || !height.is_positive() {
-        return None;
-    }
-    Some(flamewm_api::Size::new(width, height))
-}
-
-fn emit_popup_measure(
-    role: &str,
-    kind: QuickControlKind,
-    anchor: flamewm_api::Rect,
-    work_area: flamewm_api::Rect,
-    max_device: (f32, f32),
-    logical: (f32, f32),
-    measured: Option<(f32, f32)>,
-    fitted: Option<flamewm_api::Rect>,
-    refusal: Option<&str>,
-) {
-    flamewm_debug::emit(POPUP_MEASURE, POPUP_MEASURE_COOLDOWN, || {
-        format!(
-            "role={role} kind={kind:?} anchor={anchor:?} work_area={work_area:?} max_device={max_device:?} logical={logical:?} measured={measured:?} fitted={fitted:?} refusal={refusal:?}"
-        )
-    });
+fn fitted_rect(
+    runtime: &mut SurfaceRuntime,
+    surface: SurfaceHandle,
+    request: &OpenRequest,
+) -> Result<(flamewm_api::Rect, Duration, Duration), PopupError> {
+    let measure_start = std::time::Instant::now();
+    let _measure = crate::runtime::shell_span("shell.quick.measure").start();
+    let intrinsic = measure_helper(runtime, surface, request)?;
+    let measure_elapsed = measure_start.elapsed();
+    drop(_measure);
+    let place_start = std::time::Instant::now();
+    let _place = crate::runtime::shell_span("shell.quick.place").start();
+    let rect = fit_helper(request, intrinsic)?;
+    let place_elapsed = place_start.elapsed();
+    drop(_place);
+    Ok((rect, measure_elapsed, place_elapsed))
 }
 
 fn open_request(
@@ -536,18 +526,19 @@ fn open_request(
     project_snapshot(runtime, surface, snapshot, request.kind)?;
     let project_elapsed = project_start.elapsed();
     drop(_project);
-    let (rect, measure_elapsed, place_elapsed) = fitted_rect(runtime, surface, request)?;
+    let (rect, measure_elapsed, place_elapsed) =
+        fitted_rect(runtime, surface, request).map_err(|error| error.to_string())?;
     flamewm_debug::emit(POPUP_TRANSITION, Duration::from_millis(0), || {
         format!("quick-control fitted kind={:?} rect={rect:?}", request.kind)
     });
     let prepare_start = std::time::Instant::now();
     let _prepare = crate::runtime::shell_span("shell.quick.prepare/commit_geometry").start();
-    prepare(runtime, surface, rect)?;
+    prepare_commit(runtime, surface, rect).map_err(|error| error.to_string())?;
     let prepare_elapsed = prepare_start.elapsed();
     drop(_prepare);
     let present_start = std::time::Instant::now();
     let _present = crate::runtime::shell_span("shell.quick.present").start();
-    runtime.show(surface).map_err(ui_error)?;
+    present(runtime, surface).map_err(|error| error.to_string())?;
     let present_elapsed = present_start.elapsed();
     drop(_present);
     // DEBUG-ONLY: one observed root-rect probe after present. Normal mode
@@ -562,9 +553,7 @@ fn open_request(
         .map(|r| (r.x as i32, r.y as i32, r.width as i32, r.height as i32));
     let grab_start = std::time::Instant::now();
     let _grab = crate::runtime::shell_span("shell.quick.pointer_grab").start();
-    runtime
-        .grab_pointer(surface)
-        .map_err(|_| PopupRefusal::PointerGrabRefused.to_string())?;
+    grab(runtime, surface).map_err(|error| error.to_string())?;
     let grab_elapsed = grab_start.elapsed();
     drop(_grab);
     surfaces.open = Some(request.kind);
@@ -615,101 +604,6 @@ fn open_request(
         );
     }
     Ok(())
-}
-
-/// Fitted placement plus the real measure/place stage split, so the
-/// slow-open line can attribute each turn without fake spans.
-pub struct FittedPlacement {
-    pub rect: flamewm_api::Rect,
-    pub measure_elapsed: Duration,
-    pub place_elapsed: Duration,
-}
-
-fn fitted_rect(
-    runtime: &mut SurfaceRuntime,
-    surface: SurfaceHandle,
-    request: &OpenRequest,
-) -> Result<(flamewm_api::Rect, Duration, Duration), String> {
-    let measure_start = std::time::Instant::now();
-    let _measure = crate::runtime::shell_span("shell.quick.measure").start();
-    let max = outer_measure_constraint(request.work_area);
-    if request.work_area.width <= 0 || request.work_area.height <= 0 {
-        emit_popup_measure(
-            "quick-control",
-            request.kind,
-            request.anchor,
-            request.work_area,
-            max,
-            max,
-            None,
-            None,
-            Some("PendingLayout"),
-        );
-        return Err(PopupRefusal::PendingLayout.to_string());
-    }
-    let logical = (max.0, max.1);
-    let measured = runtime
-        .measure_outer_intrinsic_device_size(surface, max.0, max.1)
-        .map_err(|error| {
-            emit_popup_measure("quick-control", request.kind, request.anchor, request.work_area, max, logical, None, None, Some(&format!("{error:?}")));
-            flamewm_debug::emit(GEOMETRY_REFUSAL, Duration::from_millis(0), || {
-                format!("quick-control refusal kind={:?} refusal=PendingLayout anchor={:?} work_area={:?} panel_edge={:?}", request.kind, request.anchor, request.work_area, request.panel_edge)
-            });
-            PopupRefusal::PendingLayout.to_string()
-        })?;
-    let intrinsic = device_to_popup_size(measured)
-        .filter(|size| size.width > 0 && size.height > 0)
-        .ok_or_else(|| {
-            emit_popup_measure(
-                "quick-control",
-                request.kind,
-                request.anchor,
-                request.work_area,
-                max,
-                logical,
-                Some(measured),
-                None,
-                Some("PendingLayout"),
-            );
-            PopupRefusal::PendingLayout.to_string()
-        })?;
-    let intrinsic = flamewm_api::Size::new(
-        intrinsic.width.min(request.work_area.width.max(1)),
-        intrinsic.height.min(request.work_area.height.max(1)),
-    );
-    drop(_measure);
-    let measure_elapsed = measure_start.elapsed();
-    let place_start = std::time::Instant::now();
-    let _place = crate::runtime::shell_span("shell.quick.place").start();
-    let edge = match request.panel_edge {
-        flamewm_api::PanelEdge::Top => PopoverEdge::Below,
-        _ => PopoverEdge::Above,
-    };
-    let rect = measured_popup_rect(
-        Some(request.anchor),
-        Some(intrinsic),
-        edge,
-        PopoverAlign::End,
-        request.work_area,
-        8,
-    )
-    .map(|rect| {
-        emit_popup_measure("quick-control", request.kind, request.anchor, request.work_area, max, logical, Some(measured), Some(rect), None);
-        rect
-    })
-    .map_err(|refusal| {
-        emit_popup_measure("quick-control", request.kind, request.anchor, request.work_area, max, logical, Some(measured), None, Some(&refusal.to_string()));
-        flamewm_debug::emit(GEOMETRY_REFUSAL, Duration::from_millis(0), || {
-            format!(
-                "quick-control refusal kind={:?} refusal={refusal} anchor={:?} work_area={:?} intrinsic={intrinsic:?} panel_edge={:?}",
-                request.kind, request.anchor, request.work_area, request.panel_edge,
-            )
-        });
-        refusal.to_string()
-    })?;
-    let place_elapsed = place_start.elapsed();
-    drop(_place);
-    Ok((rect, measure_elapsed, place_elapsed))
 }
 
 fn project_snapshot(
@@ -932,7 +826,7 @@ impl HelperSurfaces {
             return;
         };
         let _span = crate::runtime::shell_span("shell.quick.close/ungrab/unmap").start();
-        let _ = runtime.close_surface(surface);
+        let _ = close_helper(runtime, surface);
     }
 
     /// Shutdown path: close the open surface, then destroy all helpers.
@@ -964,28 +858,7 @@ fn create_surface(
                 y: 0,
             },
         )
-        .map_err(ui_error)
-}
-
-fn prepare(
-    _runtime: &mut SurfaceRuntime,
-    surface: SurfaceHandle,
-    rect: flamewm_api::Rect,
-) -> Result<(), String> {
-    if rect.width <= 0 || rect.height <= 0 {
-        return Err(PopupRefusal::PendingLayout.to_string());
-    }
-    _runtime
-        .move_resize(
-            surface,
-            rect.x,
-            rect.y,
-            u32::try_from(rect.width)
-                .map_err(|_| format!("invalid surface size {}", rect.width))?,
-            u32::try_from(rect.height)
-                .map_err(|_| format!("invalid surface size {}", rect.height))?,
-        )
-        .map_err(ui_error)
+        .map_err(|error| format!("{error:?}"))
 }
 
 fn ui_error(error: UiBackendError) -> String {
@@ -1034,6 +907,8 @@ pub fn open_via_supervisor_nonfatal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flamewm_shell_core::popup::measured_popup_rect;
+    use flamewm_ui_core::popover::{PopoverAlign, PopoverEdge};
 
     #[test]
     fn secret_never_in_logs_or_protocol() {
@@ -1062,13 +937,11 @@ mod tests {
 
     #[test]
     fn i32_max_constraint_cannot_reach_placement() {
-        // i32::MAX work area must resolve to a finite f32 device
-        // constraint and never flow raw into placement math (which
-        // would overflow `right()`/`bottom()` i32 arithmetic).
+        // i32::MAX work area stays finite through the shared owner measure
+        // gate (degenerate anchor refuses as pending layout).
         let area = flamewm_api::Rect::new(0, 0, i32::MAX, i32::MAX);
-        let (max_w, max_h) = outer_measure_constraint(area);
-        assert!(max_w.is_finite() && max_h.is_finite());
-        assert!(max_w > 0.0 && max_h > 0.0);
+        assert!((area.width as f32).is_finite());
+        assert!((area.height as f32).is_finite());
         // The clamped intrinsic (work-area min) still refuses as
         // PendingLayout through the pure path when size is absent.
         let refused = measured_popup_rect(

@@ -1,4 +1,4 @@
-//! Serialized snap-preview overlay (J11).
+//! Serialized snap-preview overlay (J11, J09 border-only).
 //!
 //! The preview is a compiled `snap-preview.html` document hosted on a
 //! `SurfaceRole::Overlay` + `SurfaceInputMode::PassThrough` surface, hidden
@@ -8,6 +8,14 @@
 //! `wm.rs`. This module only owns surface lifecycle and the skip-redraw
 //! guard (no polling, no timers).
 //!
+//! Hot path is border/outline only: `update` positions the pass-through
+//! surface at the candidate rect and styles the existing selection-style
+//! outline/border material (`border` + `background_clear` on `FILL_NODE`).
+//! It performs no synchronous root image capture here
+//! (`backdrop::capture_root_rect_auto` opens its own display and runs
+//! `XGetImage` plus a pixel loop under `render.overlay.capture`); the
+//! backdrop image node stays hidden so no opaque full rect is ever shown.
+//!
 //! Opacity: the compiled CSS bakes the 20% default fill
 //! (`--snap-fill:#ef404833`). Live settings are not plumbed to the WM event
 //! loop and no new protocol is introduced here, so callers pass
@@ -16,8 +24,8 @@
 use flamewm_api::Rect;
 use flamewm_render_x11::backdrop;
 use flamewm_ui_x11::{
-    RuntimeImage, SurfaceConfig, SurfaceHandle, SurfaceInputMode, SurfaceRole, SurfaceRuntime,
-    UiColor, UiDocumentAccess, UiTemplate, decode_document,
+    SurfaceConfig, SurfaceHandle, SurfaceInputMode, SurfaceRole, SurfaceRuntime, UiColor,
+    UiDocumentAccess, UiTemplate, decode_document,
 };
 
 use flamewm_window_core::SnapTarget;
@@ -34,13 +42,11 @@ pub const ACCENT_RGB: (u8, u8, u8) = backdrop::BACKDROP_ACCENT_RGB;
 /// Node in the compiled document that carries the preview fill.
 const FILL_NODE: &str = "snap-preview";
 
-/// Image node filling the preview rect with composited backdrop pixels.
+/// Image node from the compiled document: always kept hidden in the
+/// J09 border-only flow so no opaque full rect is ever shown.
 const BACKDROP_NODE: &str = "snap-preview-backdrop";
 
-/// Source label for the retained composited backdrop override.
-const BACKDROP_SOURCE: &str = "snap-preview-backdrop-retained";
-
-/// Strong accent border over the captured backdrop (shared accent family).
+/// Strong accent border over the cleared fill (shared accent family).
 fn border_color() -> UiColor {
     UiColor {
         r: ACCENT_RGB.0,
@@ -57,30 +63,6 @@ fn border_color() -> UiColor {
 pub fn fill_color(opacity_percent: u8) -> UiColor {
     let (r, g, b, a) = backdrop::fill_color(opacity_percent);
     UiColor { r, g, b, a }
-}
-
-/// Material for one upload: composited RGBA sized to the captured rect,
-/// or `None` when capture failed (border-only preview, no fill, no image).
-#[must_use]
-pub fn preview_image(
-    captured: &Result<backdrop::BackdropCapture, String>,
-    opacity: u8,
-) -> Option<RuntimeImage> {
-    let captured = captured.as_ref().ok()?;
-    let (fill, border) = backdrop::selection_material(opacity);
-    let pixels = backdrop::composite_selection_material(captured, Some(fill), border);
-    if captured.width == 0 || captured.height == 0 {
-        return None;
-    }
-    if pixels.len() != (captured.width as usize) * (captured.height as usize) * 4 {
-        return None;
-    }
-    Some(RuntimeImage {
-        source: BACKDROP_SOURCE.to_string(),
-        width: captured.width,
-        height: captured.height,
-        pixels,
-    })
 }
 
 fn checked_size(value: i32) -> Option<u32> {
@@ -172,14 +154,12 @@ impl SnapPreviewSurface {
             self.hide();
             return;
         }
-        // C12 flow, gated by is_current above: capture only on target/rect
-        // change. Retained composited pixels land as exact RGBA on the
-        // backdrop image node filling the preview rect; the accent border
-        // stays as the only extra tint. No second translucent red bg.
-        // Capture failure -> clear/hide the image, clear the fill, keep
-        // the border.
-        let captured = backdrop::capture_root_rect_auto((geometry.x, geometry.y, width, height));
-        let image = preview_image(&captured, opacity);
+        // J09 border-only flow, gated by is_current above: no synchronous
+        // root image capture in the hot path (no XOpenDisplay/XGetImage
+        // pixel loop under render.overlay.capture). Style the existing
+        // selection-style outline/border material on FILL_NODE
+        // (`border` + `background_clear`: border/outline geometry only, no
+        // opaque full rect) and keep the backdrop image node hidden.
         let styled = runtime.with_document(surface, |document| {
             document
                 .border(FILL_NODE, border_color())
@@ -187,31 +167,9 @@ impl SnapPreviewSurface {
             document
                 .background_clear(FILL_NODE)
                 .map_err(|error: String| error)?;
-            match image {
-                Some(image) => {
-                    document
-                        .image_rgba8(BACKDROP_NODE, image)
-                        .map_err(|error: String| error)?;
-                    document
-                        .visible(BACKDROP_NODE, true)
-                        .map_err(|error: String| error)?;
-                }
-                None => {
-                    // Failure path: hide retained pixels, keep border only.
-                    let _ = document.visible(BACKDROP_NODE, false);
-                    document
-                        .image_rgba8(
-                            BACKDROP_NODE,
-                            RuntimeImage {
-                                source: BACKDROP_SOURCE.to_string(),
-                                width: 1,
-                                height: 1,
-                                pixels: vec![0, 0, 0, 0],
-                            },
-                        )
-                        .map_err(|error: String| error)?;
-                }
-            }
+            document
+                .visible(BACKDROP_NODE, false)
+                .map_err(|error: String| error)?;
             Ok(())
         });
         if styled.is_err() {
@@ -366,22 +324,28 @@ mod tests {
     }
 
     #[test]
-    fn preview_image_consumes_shared_material_pixels() {
-        let captured: Result<backdrop::BackdropCapture, String> = Ok(backdrop::BackdropCapture {
-            width: 6,
-            height: 6,
-            pixels: vec![0, 0, 0, 255].repeat(36),
-        });
-        let image = preview_image(&captured, 20).expect("composited image");
-        assert_eq!((image.width, image.height), (6, 6));
-        assert_eq!(image.pixels.len(), 36 * 4);
-        // Interior carries the shared translucent fill; border ring strong.
-        let inner = &image.pixels[(3 * 6 + 3) * 4..][..4];
-        assert_eq!((inner[0], inner[1], inner[2], inner[3]), (48, 13, 14, 255));
-        assert!(image.pixels[0] > 200);
-        // Failure -> no image: caller clears/hides the node, keeps border.
-        let failed: Result<backdrop::BackdropCapture, String> = Err("no display".to_string());
-        assert!(preview_image(&failed, 20).is_none());
+    fn changed_rect_records_new_geometry_without_display() {
+        if SurfaceRuntime::new().is_ok() {
+            return;
+        }
+        let mut preview = SnapPreviewSurface::new();
+        preview.update(
+            Some(SnapTarget::LeftHalf),
+            Some(geometry()),
+            DEFAULT_PREVIEW_OPACITY_PERCENT,
+        );
+        assert_eq!(preview.geometry(), Some(geometry()));
+        // Changed rect updates the recorded preview intent; no backdrop
+        // capture runs here (headless: stays hidden, no display needed).
+        let moved = Rect::new(960, 0, 960, 1080);
+        preview.update(
+            Some(SnapTarget::LeftHalf),
+            Some(moved),
+            DEFAULT_PREVIEW_OPACITY_PERCENT,
+        );
+        assert!(!preview.visible());
+        assert_eq!(preview.candidate(), Some(SnapTarget::LeftHalf));
+        assert_eq!(preview.geometry(), Some(moved));
     }
 
     #[test]

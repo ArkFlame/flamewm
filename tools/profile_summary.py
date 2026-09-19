@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from math import isfinite
 from pathlib import Path
 
 PSS_PROFILE = re.compile(r"\bpss=(\d+)\s*kB")
@@ -98,12 +99,16 @@ def _interactions_for(path: str) -> list[tuple[str, dict[str, float]]]:
                 m = INTERACTION.match(line.rstrip("\n"))
                 if not m:
                     continue
+                maximum = float(m.group(3))
+                p95 = float(m.group(4))
+                if not isfinite(maximum) or not isfinite(p95) or p95 > maximum:
+                    continue
                 rows.append((
                     m.group(1),
                     {
                         "count": float(m.group(2)),
-                        "max": float(m.group(3)),
-                        "p95": float(m.group(4)),
+                        "max": maximum,
+                        "p95": p95,
                         "total": float(m.group(5)),
                         "over16": float(m.group(6)),
                     },

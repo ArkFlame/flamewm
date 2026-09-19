@@ -150,7 +150,7 @@ No executor decisions such as \`choose best approach\`, \`adjust as needed\`, \`
 
 \#\#\# 2.6 Domain complement loader
 
-Before emitting a handoff, load each matching domain complement. \*\*DOMAIN COMPLEMENT LAW:\*\* \`*.rs\`/\`Cargo*\` maps to \`project_sources/STEPWISE_RUST_SYSTEMS_COMPLEMENT.md\`; \`wm-x11\`/\`x11\` maps to the \`x11-window-manager-engineering\` skill. Complements add domain contracts; this planner remains the generic execution law. Recheck source/version facts named by a complement before relying on them.
+Before emitting a handoff, load each matching domain complement. \*\*DOMAIN COMPLEMENT LAW:\*\* \`*.rs\`/\`Cargo*\` maps to \`project_sources/STEPWISE_RUST_SYSTEMS_COMPLEMENT.md\`; \`wm-x11\`/\`x11\` maps to the \`flamewm-x11-window-manager\` skill. Complements add domain contracts; this planner remains the generic execution law. Recheck source/version facts named by a complement before relying on them.
 
 \---
 

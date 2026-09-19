@@ -44,7 +44,20 @@ MANDATED_ROUTES = (
     (("icon lookup", "latency"), ("flamewm-rust-systems", "flamewm-performance-proof")),
     (("module split",), ("flamewm-rust-systems", "flamewm-semantic-modularization")),
 )
-FAILURES = ("error", "fail", "failure", "crash", "hang", "regression", "broken")
+FAILURES = (
+    "error",
+    "fail",
+    "failure",
+    "crash",
+    "hang",
+    "regression",
+    "broken",
+    "panic",
+    "segfault",
+    "abort",
+    "deadlock",
+    "timeout",
+)
 
 
 def route(mode: str, text: str, paths: list[str]) -> dict[str, object]:
@@ -60,15 +73,15 @@ def route(mode: str, text: str, paths: list[str]) -> dict[str, object]:
     if substantive:
         required.append("flamewm-source-first")
         reasons["flamewm-source-first"] = "all substantive FlameWM tasks inspect source, callers, contracts, and owners first"
+    if any(token in words for token in FAILURES):
+        required.append("flamewm-failure-resolution")
+        reasons["flamewm-failure-resolution"] = "failure-resolution required"
     for tokens, skills in MANDATED_ROUTES:
         if all(token in words for token in tokens):
             for skill in skills:
                 if skill not in required:
                     required.append(skill)
                     reasons[skill] = f"mandated by {' + '.join(tokens)}"
-    if any(token in words for token in FAILURES):
-        required.append("flamewm-failure-resolution")
-        reasons["flamewm-failure-resolution"] = "failure-resolution required"
     for keyword, skills in ROUTES.items():
         if keyword in words:
             for skill in skills:

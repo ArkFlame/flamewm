@@ -13,7 +13,7 @@ Runtime files are local-only. Do not commit them or create status marker files.
 
 ## Evidence
 
-Route evidence by job under `runtime/`; include job ID, role, loaded skills, commands, results, changed paths, blockers, and `runtime/hypotheses/<job-id>.md` when used. Ignored evidence is task-scoped; tracked contracts remain source of shared rules.
+Write route evidence by job as UTF-8 JSON under `runtime/` with `job`, `role`, `source_handoff`, `route`, `changed_paths`, `commands`, `blockers`, and `hypothesis_ledger`. Preserve `skill_route.py` `required`, `optional`, and `reasons` in `route`; record command/result pairs in `commands` and any `runtime/hypotheses/<job-id>.md` in `hypothesis_ledger`. Ignored evidence is task-scoped; tracked contracts remain source of shared rules.
 
 ## Completion
 

@@ -1,35 +1,39 @@
 //! Decoration cache: WM-owned glyph/raster caches, no per-frame rediscovery.
 //!
-//! Control SVGs decode once per role, the generic fallback raster once per
+//! Control SVGs decode once per role/material (see
+//! `crate::chrome::control_glyph_raster`), native icon rasters once per
 //! slot edge, catalog `Icon=` rasters once per icon name. Thread-unsafe by
-//! design: owned by the single-threaded WM event loop.
+//! design: owned by the single-threaded WM event loop. All caches are
+//! bounded LRU with fixed capacities; bounds are kept in production.
 
-#[cfg(test)]
 use std::collections::{HashMap, VecDeque};
 
-#[cfg(test)]
+use crate::chrome::{ControlGlyphKey, ControlMaterial, ControlRole};
+
 const TITLE_MEASURE_CACHE_CAPACITY: usize = 1_024;
-#[cfg(test)]
 const ICON_RASTER_CACHE_CAPACITY: usize = 128;
+const CONTROL_GLYPH_CACHE_CAPACITY: usize = 32;
 
 /// WM-owned frame caches: control glyphs, icon rasters, title measures,
 /// profiler hook. Title measures cache the canonical Xft estimate
 /// (`external_text_measure`, IBM Plex Sans) so layout never re-measures
 /// per frame; native pixmap bytes track `external_pixmap_byte_estimate`.
-/// Control glyphs cache two materials per role: the resting glyph and the
-/// semantic hover glyph (white-circle dark-glyph for min/max/restore,
-/// red-circle light-glyph for close), decoded once each.
-#[cfg(test)]
+/// Control glyphs cache one raster per role/material (resting glyph and
+/// hover/pressed semantic glyphs: white-disk dark-glyph for min/max/
+/// restore, red-disk light-glyph for close), decoded once each. Bounded
+/// LRU: icon rasters cap at 128 entries, title measures at 1024, control
+/// glyphs at 32.
 #[derive(Debug, Default)]
 pub struct DecorationCache {
     icon_rasters: HashMap<String, flamewm_integrations_linux::icons::Rgba8Raster>,
     icon_raster_order: VecDeque<String>,
     title_measures: HashMap<(String, u32), i32>,
     title_measure_order: VecDeque<(String, u32)>,
+    control_glyphs: HashMap<(ControlRole, u32, ControlMaterial), flamewm_image_core::RgbaImage>,
+    control_glyph_order: VecDeque<(ControlRole, u32, ControlMaterial)>,
     image_cache_bytes: usize,
 }
 
-#[cfg(test)]
 impl DecorationCache {
     #[must_use]
     pub fn new() -> Self {
@@ -89,6 +93,43 @@ impl DecorationCache {
         self.title_measures.insert(key, width);
     }
 
+    /// Cached control glyph raster for one role/edge/material, decoded
+    /// once via `crate::chrome::control_glyph_raster`. Pure/cached asset
+    /// only: no application catalog lookup.
+    #[must_use]
+    pub fn control_glyph(
+        &mut self,
+        role: ControlRole,
+        edge: u32,
+        material: ControlMaterial,
+    ) -> Option<flamewm_image_core::RgbaImage> {
+        let key = (role, edge, material);
+        if let Some(cached) = self.control_glyphs.get(&key).cloned() {
+            touch(&mut self.control_glyph_order, &key);
+            return Some(cached);
+        }
+        let raster = crate::chrome::control_glyph_raster(role, edge, material)?;
+        if self.control_glyphs.contains_key(&key) {
+            self.control_glyphs.insert(key, raster.clone());
+            touch(&mut self.control_glyph_order, &key);
+            return Some(raster);
+        }
+        evict_oldest(
+            &mut self.control_glyphs,
+            &mut self.control_glyph_order,
+            CONTROL_GLYPH_CACHE_CAPACITY,
+        );
+        self.control_glyph_order.push_back(key);
+        self.control_glyphs.insert(key, raster.clone());
+        self.add_image_cache_bytes(raster.pixels.len());
+        Some(raster)
+    }
+
+    #[must_use]
+    pub fn control_glyph_count(&self) -> usize {
+        self.control_glyphs.len()
+    }
+
     /// Native pixmap bytes for the live-target image cache (w*h*4 per
     /// cached entry, canonical `external_pixmap_byte_estimate`).
     #[must_use]
@@ -100,12 +141,10 @@ impl DecorationCache {
         self.image_cache_bytes = self.image_cache_bytes.saturating_add(bytes);
     }
 
-    #[cfg(test)]
     pub fn clear_image_cache_bytes(&mut self) {
         self.image_cache_bytes = 0;
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn title_measure_count(&self) -> usize {
         self.title_measures.len()
@@ -115,9 +154,72 @@ impl DecorationCache {
     pub fn icon_raster_count(&self) -> usize {
         self.icon_rasters.len()
     }
+
+    #[must_use]
+    pub fn control_material_key(
+        role: ControlRole,
+        edge: u32,
+        hovered: bool,
+        pressed: bool,
+    ) -> ControlGlyphKey {
+        ControlGlyphKey::new(role, edge, ControlMaterial::for_pointer(hovered, pressed))
+    }
 }
 
-#[cfg(test)]
+/// Manage-time catalog icon resolution (decoration/cache owner).
+///
+/// Resolves a catalog `Icon=` name through the shared memory-only indexed
+/// application lookup at the given titlebar edge, then converts the
+/// straight RGBA8 raster to a cached ARGB32 `IconImage` (pure memory
+/// convert; no catalog/filesystem/decode here). Explicit-extension names
+/// and pixmaps resolve through the same frozen index order; misses (empty
+/// or unknown name, decode failure, size mismatch) return `None` so the
+/// caller keeps the transparent empty slot, never brand artwork.
+#[must_use]
+pub fn resolve_catalog_icon_rgba(
+    resolver: &mut flamewm_integrations_linux::IconResolver,
+    icon_name: &str,
+    titlebar_edge: u16,
+) -> Option<crate::chrome::IconImage> {
+    if icon_name.trim().is_empty() {
+        return None;
+    }
+    // Shared memory-only indexed lookup; warm path is cache-only.
+    let slot = u32::from(crate::chrome::icon_slot_for(titlebar_edge));
+    let raster = resolver
+        .prepare_application(
+            icon_name.to_owned(),
+            flamewm_integrations_linux::icons::IconSize::new(slot, slot),
+        )
+        .ok()?;
+    if raster.width == 0 || raster.height == 0 {
+        return None;
+    }
+    let pixel_count = usize::try_from(raster.width)
+        .ok()?
+        .checked_mul(usize::try_from(raster.height).ok()?)?;
+    if raster.pixels.len() != pixel_count.saturating_mul(4) {
+        return None;
+    }
+    // Straight RGBA8 -> cached ARGB32 `IconImage` (pure memory convert).
+    // Miss keeps the empty slot, never brand artwork.
+    let argb = raster
+        .pixels
+        .chunks_exact(4)
+        .map(|pixel| {
+            u32::from(pixel[3]) << 24
+                | u32::from(pixel[0]) << 16
+                | u32::from(pixel[1]) << 8
+                | u32::from(pixel[2])
+        })
+        .collect::<Vec<u32>>();
+    Some(crate::chrome::IconImage {
+        width: raster.width,
+        height: raster.height,
+        argb,
+    })
+}
+
 fn touch<K: Clone + PartialEq>(order: &mut VecDeque<K>, key: &K) {
     if let Some(position) = order.iter().position(|entry| entry == key) {
         order.remove(position);
@@ -125,7 +227,6 @@ fn touch<K: Clone + PartialEq>(order: &mut VecDeque<K>, key: &K) {
     order.push_back(key.clone());
 }
 
-#[cfg(test)]
 fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
     entries: &mut HashMap<K, V>,
     order: &mut VecDeque<K>,

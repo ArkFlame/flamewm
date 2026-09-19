@@ -593,6 +593,70 @@ impl SurfaceRuntime {
         .map_err(UiBackendError::Document)
     }
 
+    /// Intrinsic outer size of one node in device pixels under finite device
+    /// constraints. Pure measure path with no X11 roundtrip.
+    pub fn measure_node_outer_intrinsic_device_size(
+        &mut self,
+        surface: SurfaceHandle,
+        node: u32,
+        max_device_w: f32,
+        max_device_h: f32,
+    ) -> Result<(f32, f32), UiBackendError> {
+        let (max_logical_w, max_logical_h) = device_constraint_to_logical(
+            max_device_w,
+            max_device_h,
+            self.controller
+                .document_mut(surface.0)
+                .map(|document| document.ui_scale())
+                .unwrap_or(1.0),
+        )
+        .map_err(UiBackendError::Document)?;
+        let document = self
+            .controller
+            .document_mut(surface.0)
+            .map_err(UiBackendError::Document)?;
+        let scale = document.ui_scale();
+        let measured = flamewm_render_core::LayoutEngine::measure_node(
+            document,
+            node,
+            max_logical_w,
+            max_logical_h,
+            flamewm_render_core::InteractionState::default(),
+        )
+        .map_err(|error| UiBackendError::Document(error.to_string()))?;
+        logical_intrinsic_to_device(
+            measured.width,
+            measured.height,
+            scale,
+            max_device_w,
+            max_device_h,
+        )
+        .map_err(UiBackendError::Document)
+    }
+
+    /// Intrinsic outer size of one node by string id in device pixels under
+    /// finite device constraints. Resolves the compiled node id to a typed
+    /// `Document` error on missing (`missing semantic node '<id>'`, never a
+    /// root-size fallback), then delegates to the existing node measurement
+    /// path (logical/device conversion + finite validation).
+    pub fn measure_node_outer_intrinsic_device_size_by_id(
+        &mut self,
+        surface: SurfaceHandle,
+        node_id: &str,
+        max_device_w: f32,
+        max_device_h: f32,
+    ) -> Result<(f32, f32), UiBackendError> {
+        let node = self
+            .controller
+            .document_mut(surface.0)
+            .map_err(UiBackendError::Document)?
+            .node_by_id(node_id)
+            .ok_or_else(|| {
+                UiBackendError::Document(format!("missing semantic node '{node_id}'"))
+            })?;
+        self.measure_node_outer_intrinsic_device_size(surface, node, max_device_w, max_device_h)
+    }
+
     /// Intrinsic document size: content extent of the root node.
     pub fn document_intrinsic_size(
         &mut self,
@@ -721,5 +785,87 @@ mod intrinsic_tests {
     fn device_result_over_constraint_refused() {
         assert!(logical_intrinsic_to_device(200.0, 100.0, 2.0, 300.0, 300.0).is_err());
         assert!(logical_intrinsic_to_device(100.0, 200.0, 1.0, 100.0, 100.0).is_err());
+    }
+
+    /// Compact node measurement path through `LayoutEngine::measure_node`:
+    /// a fixed-size Element child measures to its explicit style extent.
+    #[test]
+    fn measure_node_compact_path_matches_explicit_extent() {
+        use flamewm_render_core::{CompiledDocument, CompiledNode, NodeKind, Style};
+        let child_style = Style {
+            width: flamewm_render_core::Length::Px(120.0),
+            height: flamewm_render_core::Length::Px(48.0),
+            ..Style::default()
+        };
+        let root = CompiledNode {
+            kind: NodeKind::Element,
+            parent: None,
+            first_child: Some(1),
+            next_sibling: None,
+            id: "root".to_string(),
+            action: String::new(),
+            text: String::new(),
+            image: None,
+            style: Style::default(),
+            hover_style: None,
+            active_style: None,
+        };
+        let child = CompiledNode {
+            kind: NodeKind::Element,
+            parent: Some(0),
+            first_child: None,
+            next_sibling: None,
+            id: "card".to_string(),
+            action: String::new(),
+            text: String::new(),
+            image: None,
+            style: child_style,
+            hover_style: None,
+            active_style: None,
+        };
+        let document = flamewm_render_core::RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![root, child],
+        })
+        .expect("fixture validates");
+        assert_eq!(document.node_by_id("card"), Some(1));
+        let node = document.node_by_id("card").expect("card resolves");
+        let measured = flamewm_render_core::LayoutEngine::measure_node(
+            &document,
+            node,
+            400.0,
+            300.0,
+            flamewm_render_core::InteractionState::default(),
+        )
+        .expect("compact node measures");
+        assert_eq!((measured.width, measured.height), (120.0, 48.0));
+        // Scale-1.0 logical->device conversion keeps the compact path exact.
+        let (device_w, device_h) =
+            logical_intrinsic_to_device(measured.width, measured.height, 1.0, 400.0, 300.0)
+                .expect("device conversion");
+        assert_eq!((device_w, device_h), (120.0, 48.0));
+        // Scaled conversion path (scale 2.0) doubles logical extents.
+        let (scaled_w, scaled_h) =
+            logical_intrinsic_to_device(measured.width, measured.height, 2.0, 400.0, 300.0)
+                .expect("scaled conversion");
+        assert_eq!((scaled_w, scaled_h), (240.0, 96.0));
+    }
+
+    /// Missing semantic ids are a typed `Document` error ("missing semantic
+    /// node '<id>'"), never a root-size fallback.
+    #[test]
+    fn missing_node_id_message_never_matches_root_size() {
+        let message = format!("missing semantic node '{}'", "nope");
+        assert!(message.contains("missing semantic node 'nope'"));
+        let error = UiBackendError::Document(message);
+        match error {
+            UiBackendError::Document(text) => {
+                assert!(text.contains("missing semantic node 'nope'"));
+            }
+            other => panic!("must be a typed Document error, got {other:?}"),
+        }
     }
 }

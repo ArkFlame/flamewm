@@ -28,4 +28,4 @@ Name hot path, allocation/I/O/lock boundary, event rate, and backpressure/coales
 
 \#\# 7.8 Rust handoff closure
 
-For each Rust change, handoff resolves manifest/features/toolchain, module/export closure, ownership/drop order, event-loop/thread owner, error behavior, and relevant performance constraint. VERIFY checks compiled feature/target surface using source-proven commands and semantic readback of ownership/lifecycle contracts. Native X11 scope additionally loads \`x11-window-manager-engineering\`; current repository architecture remains authoritative for WM, renderer, reactor, and UI ownership.
+For each Rust change, handoff resolves manifest/features/toolchain, module/export closure, ownership/drop order, event-loop/thread owner, error behavior, and relevant performance constraint. VERIFY checks compiled feature/target surface using source-proven commands and semantic readback of ownership/lifecycle contracts. Native X11 scope additionally loads \`flamewm-x11-window-manager\`; current repository architecture remains authoritative for WM, renderer, reactor, and UI ownership.

@@ -15,4 +15,5 @@
 .DS_Store
 .idea/
 .vscode/
-/tools/__pycache__/
+__pycache__/
+*.py[cod]

@@ -11,24 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::icon_theme::IconThemeCaches as ThemeLookupCaches;
-use crate::icon_theme::{inheritance_chain, search_roots, theme_dir};
 
 const GENERIC_FALLBACK: &str = "assets/web/flamewm-icon.svg";
-/// Searched theme extensions. PPM is legacy: still decoded (explicit paths
-/// and on-disk fixtures) but always tried last.
-const ICON_EXTENSIONS: &[&str] = &["png", "svg", "xpm", "ppm"];
-const LEGACY_CONTEXTS: &[&str] = &[
-    "apps",
-    "actions",
-    "categories",
-    "devices",
-    "emblems",
-    "mimetypes",
-    "places",
-    "status",
-    "",
-];
-const PIXMAPS_FALLBACK: &str = "/usr/share/pixmaps";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IconLookupPurpose {
@@ -579,21 +563,6 @@ impl IconResolver {
     }
 }
 
-fn load_theme_uncached(theme: &str, data_dirs: &[PathBuf]) -> Option<IconThemeIndex> {
-    // $HOME/.icons and XDG roots carry index.theme; plain theme dirs
-    // without an index still participate via legacy layout below.
-    for root in search_roots(data_dirs) {
-        let dir = root.join(theme);
-        if dir.join("index.theme").is_file() {
-            let name = theme.to_owned();
-            let text = fs::read_to_string(dir.join("index.theme")).ok()?;
-            return Some(IconThemeIndex::parse(&name, &text));
-        }
-    }
-    let _ = theme_dir(theme, data_dirs);
-    None
-}
-
 fn key_memory(key: &CacheKey) -> usize {
     let identity = match &key.identity {
         IconRequest::Name(name) => name.len() + 32,
@@ -963,8 +932,12 @@ impl IconResolver {
         }
     }
 
+    /// Normal application lookup: memory-only shared index in frozen
+    /// precedence (global exact-size first, then per-theme best, then
+    /// pixmaps). Explicit extensions are normalized by the index (no second
+    /// ext appended), so `foo.png` and `foo` resolve to the same record.
     fn application_theme_candidates(
-        &mut self,
+        &self,
         request: &IconRequest,
         size: IconSize,
     ) -> Vec<Candidate> {
@@ -972,9 +945,6 @@ impl IconResolver {
             IconRequest::Name(name) => name.as_str(),
             IconRequest::Path(_) => return Vec::new(),
         };
-        if !valid_icon_name(name) {
-            return Vec::new();
-        }
         self.theme_candidates(name, size)
     }
 
@@ -998,236 +968,21 @@ impl IconResolver {
         candidates
     }
 
-    fn theme_candidates(&mut self, name: &str, size: IconSize) -> Vec<Candidate> {
+    /// Semantic theme tail: reuses the same frozen shared-index order as
+    /// normal application lookup (explicit-ext aware, pixmaps included).
+    /// Packaged overrides are probed separately in `resolve_semantic_name`.
+    fn theme_candidates(&self, name: &str, size: IconSize) -> Vec<Candidate> {
         if !valid_icon_name(name) {
             return Vec::new();
         }
-        let ordered_themes = self.cached_ordered_theme_names();
-        // Phase 1 (global): exact-size (distance 0) matches anywhere in the
-        // chain, in chain order. Phase 2 (per-theme): same-theme nearest
-        // sizes before any inherited theme.
-        let mut per_theme: Vec<Vec<Candidate>> = Vec::new();
-        let mut exact_flags: Vec<Vec<bool>> = Vec::new();
-        for theme in &ordered_themes {
-            let _t = flamewm_profiler::ProfilePoint::new("icon.theme.entries").start();
-            let entries = self.cached_indexed_theme_entries(theme, name, size);
-            exact_flags.push(entries.iter().map(|(_, exact)| *exact).collect());
-            per_theme.push(
-                entries
-                    .into_iter()
-                    .map(|(candidate, _)| candidate)
-                    .collect(),
-            );
-        }
-        let mut candidates = Vec::new();
-        for (index, group) in per_theme.iter().enumerate() {
-            for (position, candidate) in group.iter().enumerate() {
-                if exact_flags[index][position] {
-                    candidates.push(candidate.clone());
-                }
-            }
-        }
-        for group in &per_theme {
-            for candidate in group {
-                if !candidates
-                    .iter()
-                    .any(|existing: &Candidate| existing.path == candidate.path)
-                {
-                    candidates.push(candidate.clone());
-                }
-            }
-        }
-        candidates.extend(self.pixmaps_candidates(name));
-        candidates
-    }
-
-    fn pixmaps_candidates(&self, name: &str) -> Vec<Candidate> {
-        let mut candidates = Vec::new();
-        for data_dir in &self.data_dirs {
-            for extension in ICON_EXTENSIONS {
-                candidates.push(Candidate {
-                    path: data_dir.join("pixmaps").join(format!("{name}.{extension}")),
-                    origin: IconOrigin::SystemTheme,
-                });
-            }
-        }
-        // Unthemed /usr/share/pixmaps fallback (no data_dirs required).
-        let pixmaps = Path::new(PIXMAPS_FALLBACK);
-        if !self
-            .data_dirs
-            .iter()
-            .any(|dir| dir.join("pixmaps") == pixmaps)
-        {
-            for extension in ICON_EXTENSIONS {
-                candidates.push(Candidate {
-                    path: pixmaps.join(format!("{name}.{extension}")),
-                    origin: IconOrigin::SystemTheme,
-                });
-            }
-        }
-        candidates
-    }
-
-    fn cached_ordered_theme_names(&mut self) -> Vec<String> {
-        let mut seeds: Vec<String> = Vec::new();
-        for theme in &self.theme_names {
-            if !theme.is_empty() && !seeds.contains(theme) {
-                seeds.push(theme.clone());
-            }
-        }
-        if seeds.is_empty() {
-            seeds.push("hicolor".to_owned());
-        }
-        let key = seeds.join("\u{1f}");
-        let generation = self.theme_generation;
-        if let Some(hit) = self.theme_caches.cached_inheritance(&key, generation) {
-            return hit;
-        }
-        // Snapshot what the loader needs so the borrow of theme_caches ends.
-        let data_dirs = self.data_dirs.clone();
-        let load_uncached = |theme: &str| load_theme_uncached(theme, &data_dirs);
-        let mut ordered = Vec::new();
-        for seed in &seeds {
-            for name in inheritance_chain(seed, &load_uncached) {
-                if !ordered.contains(&name) {
-                    ordered.push(name);
-                }
-            }
-        }
-        // Keep historical default first (Breeze before hicolor) even when the
-        // inheritance chain already ends with hicolor.
-        ordered.retain(|name| name != "hicolor");
-        if seeds.iter().all(|seed| seed != "Breeze") && !ordered.contains(&"Breeze".to_owned()) {
-            // Insert Breeze ahead of hicolor, behind explicit seeds.
-            let mut seeded: Vec<String> =
-                seeds.iter().filter(|s| *s != "hicolor").cloned().collect();
-            let mut rest: Vec<String> = Vec::new();
-            for name in ordered {
-                if !seeded.contains(&name) && name != "Breeze" {
-                    rest.push(name);
-                }
-            }
-            seeded.push("Breeze".to_owned());
-            seeded.extend(rest);
-            seeded.push("hicolor".to_owned());
-            self.theme_caches
-                .store_inheritance(&key, generation, seeded.clone());
-            return seeded;
-        }
-        if !ordered.contains(&"hicolor".to_owned()) {
-            ordered.push("hicolor".to_owned());
-        }
-        self.theme_caches
-            .store_inheritance(&key, generation, ordered.clone());
-        ordered
-    }
-
-    fn cached_load_theme(&mut self, theme: &str) -> Option<IconThemeIndex> {
-        let generation = self.theme_generation;
-        if let Some(hit) = self.theme_caches.cached_index(theme, generation) {
-            return hit;
-        }
-        let result = load_theme_uncached(theme, &self.data_dirs);
-        self.theme_caches
-            .store_index(theme, generation, result.clone());
-        result
-    }
-
-    fn cached_theme_roots(&mut self, theme: &str) -> Vec<PathBuf> {
-        let generation = self.theme_generation;
-        if let Some(hit) = self.theme_caches.cached_roots(theme, generation) {
-            return hit;
-        }
-        // Miss: single is_dir scan, then per-generation cache makes the warm
-        // path FS-free (path-exists cache covers candidate probing).
-        let mut truth: Vec<PathBuf> = Vec::new();
-        for root in search_roots(&self.data_dirs) {
-            if root.join(theme).is_dir() && !truth.contains(&root) {
-                truth.push(root);
-            }
-        }
-        self.theme_caches
-            .store_roots(theme, generation, truth.clone());
-        truth
-    }
-
-    fn cached_indexed_theme_entries(
-        &mut self,
-        theme: &str,
-        name: &str,
-        size: IconSize,
-    ) -> Vec<(Candidate, bool)> {
-        let mut candidates: Vec<(Candidate, bool)> = Vec::new();
-        let index = self.cached_load_theme(theme);
-        // Discover which roots actually carry this theme (index or any dir).
-        let theme_roots = self.cached_theme_roots(theme);
-        if let Some(index) = index {
-            for (dir, distance) in index.ordered_dirs(size.physical) {
-                let exact = distance == 0;
-                for root in &theme_roots {
-                    for extension in ICON_EXTENSIONS {
-                        candidates.push((
-                            Candidate {
-                                path: root
-                                    .join(theme)
-                                    .join(&dir)
-                                    .join(format!("{name}.{extension}")),
-                                origin: IconOrigin::SystemTheme,
-                            },
-                            exact,
-                        ));
-                    }
-                }
-            }
-        }
-        // Legacy layout fallback inside the same theme (keeps old fixtures
-        // resolving while index.theme governs ordering when present).
-        let mut size_dirs = vec![size.physical];
-        for standard in [16_u32, 22, 24, 32, 48, 64, 96, 128, 256] {
-            if !size_dirs.contains(&standard) {
-                size_dirs.push(standard);
-            }
-        }
-        size_dirs.sort_by_key(|candidate| candidate.abs_diff(size.physical));
-        for root in theme_roots {
-            let base = root.join(theme);
-            for size_dir in &size_dirs {
-                let exact = *size_dir == size.physical;
-                for context in LEGACY_CONTEXTS {
-                    for extension in ICON_EXTENSIONS {
-                        let mut path = base.join(format!("{size_dir}x{size_dir}"));
-                        if !context.is_empty() {
-                            path = path.join(context);
-                        }
-                        candidates.push((
-                            Candidate {
-                                path: path.join(format!("{name}.{extension}")),
-                                origin: IconOrigin::SystemTheme,
-                            },
-                            exact,
-                        ));
-                    }
-                }
-            }
-            let scalable = base.join("scalable");
-            for context in LEGACY_CONTEXTS {
-                for extension in ICON_EXTENSIONS {
-                    let path = if context.is_empty() {
-                        scalable.join(format!("{name}.{extension}"))
-                    } else {
-                        scalable.join(context).join(format!("{name}.{extension}"))
-                    };
-                    candidates.push((
-                        Candidate {
-                            path,
-                            origin: IconOrigin::SystemTheme,
-                        },
-                        false,
-                    ));
-                }
-            }
-        }
-        candidates
+        self.shared_index
+            .candidates(name, size.physical)
+            .into_iter()
+            .map(|path| Candidate {
+                path,
+                origin: IconOrigin::SystemTheme,
+            })
+            .collect()
     }
 }
 

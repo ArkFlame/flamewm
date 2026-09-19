@@ -11,6 +11,9 @@ permissions:
   - action: subagent
     resource: "*"
     effect: deny
+  - action: skill
+    resource: "*"
+    effect: allow
 ---
 
 Research only. Read repository sources, Git state, architecture rules, and relevant contracts. Trace ownership and call paths. Report evidence with exact file and line references. Do not edit, run commands, delegate, build, test, or claim runtime proof.

@@ -105,11 +105,10 @@ impl std::fmt::Display for IntrinsicMeasureError {
 impl std::error::Error for IntrinsicMeasureError {}
 
 impl LayoutEngine {
-    /// Outer intrinsic size of the document root under finite max constraints.
-    /// Uses `Engine::measure_node(root, max)` only; never reads
-    /// `layout.contents[root]` / `content_extent(root)` (scroll metrics owner).
-    pub fn measure_root(
+    /// Outer intrinsic size of one document node under finite max constraints.
+    pub fn measure_node(
         document: &RuntimeDocument,
+        node: u32,
         max_w: f32,
         max_h: f32,
         interaction: InteractionState,
@@ -120,11 +119,7 @@ impl LayoutEngine {
         if max_w <= 0.0 || max_h <= 0.0 {
             return Err(IntrinsicMeasureError::NonPositive);
         }
-        if document.document.nodes.is_empty() {
-            return Err(IntrinsicMeasureError::NonPositive);
-        }
-        let root = document.document.root;
-        if (root as usize) >= document.document.nodes.len() {
+        if (node as usize) >= document.document.nodes.len() {
             return Err(IntrinsicMeasureError::NonPositive);
         }
         let mut empty: Vec<LayoutBox> = Vec::new();
@@ -134,7 +129,7 @@ impl LayoutEngine {
             boxes: &mut empty,
         };
         // Finite popup constraint only; never f32::MAX here.
-        let (w, h) = probe.measure_node(root, max_w, max_h);
+        let (w, h) = probe.measure_node(node, max_w, max_h);
         if !w.is_finite() || !h.is_finite() {
             return Err(IntrinsicMeasureError::NonFinite);
         }
@@ -148,6 +143,18 @@ impl LayoutEngine {
             width: w,
             height: h,
         })
+    }
+
+    /// Outer intrinsic size of the document root under finite max constraints.
+    /// Uses `measure_node(root, max)` only; never reads
+    /// `layout.contents[root]` / `content_extent(root)` (scroll metrics owner).
+    pub fn measure_root(
+        document: &RuntimeDocument,
+        max_w: f32,
+        max_h: f32,
+        interaction: InteractionState,
+    ) -> Result<IntrinsicSize, IntrinsicMeasureError> {
+        Self::measure_node(document, document.document.root, max_w, max_h, interaction)
     }
     pub fn compute(
         document: &RuntimeDocument,
@@ -940,6 +947,50 @@ mod tests {
         .unwrap()
     }
 
+    fn popup_wrapper_doc() -> RuntimeDocument {
+        let mut wrapper_style = Style::default();
+        wrapper_style.width = Length::Percent(1.0);
+        wrapper_style.height = Length::Percent(1.0);
+        let mut popup_style = Style::default();
+        popup_style.width = Length::Px(200.0);
+        popup_style.height = Length::Px(100.0);
+        RuntimeDocument::new(CompiledDocument {
+            source_fingerprint: 0,
+            root: 0,
+            variables: Vec::new(),
+            assets: Vec::new(),
+            nodes: vec![
+                CompiledNode {
+                    kind: NodeKind::Element,
+                    parent: None,
+                    first_child: Some(1),
+                    next_sibling: None,
+                    id: "wrapper".into(),
+                    action: String::new(),
+                    text: String::new(),
+                    image: None,
+                    style: wrapper_style,
+                    hover_style: None,
+                    active_style: None,
+                },
+                CompiledNode {
+                    kind: NodeKind::Element,
+                    parent: Some(0),
+                    first_child: None,
+                    next_sibling: None,
+                    id: "popup".into(),
+                    action: String::new(),
+                    text: String::new(),
+                    image: None,
+                    style: popup_style,
+                    hover_style: None,
+                    active_style: None,
+                },
+            ],
+        })
+        .unwrap()
+    }
+
     #[test]
     fn measure_root_finite_fixed_popup() {
         let doc = fixed_doc(200.0, 100.0);
@@ -957,6 +1008,19 @@ mod tests {
         assert!(size.width < f32::MAX / 2.0 && size.height < f32::MAX / 2.0);
         assert!(size.width <= 800.0 && size.height <= 600.0);
         assert_eq!((size.width, size.height), (200.0, 100.0));
+    }
+
+    #[test]
+    fn measure_node_selects_compact_popup_over_constraint_sized_wrapper() {
+        let doc = popup_wrapper_doc();
+        let popup = doc.node_by_id("popup").expect("popup node exists");
+        let interaction = InteractionState::default();
+        let popup_size = LayoutEngine::measure_node(&doc, popup, 800.0, 600.0, interaction)
+            .expect("fixed popup measures");
+        let root_size = LayoutEngine::measure_root(&doc, 800.0, 600.0, interaction)
+            .expect("wrapper root measures");
+        assert_eq!((popup_size.width, popup_size.height), (200.0, 100.0));
+        assert_eq!((root_size.width, root_size.height), (800.0, 600.0));
     }
 
     #[test]
