@@ -36,7 +36,7 @@ pub(crate) struct XRectangle {
 pub(crate) struct XShapeBridge {
     display: *mut Display,
     shape_rectangles: ShapeRectanglesFn,
-    _library: DynamicLibrary,
+    _library: Option<DynamicLibrary>,
 }
 
 impl XShapeBridge {
@@ -50,8 +50,17 @@ impl XShapeBridge {
         Ok(Self {
             display,
             shape_rectangles,
-            _library: library,
+            _library: Some(library),
         })
+    }
+
+    /// Transfer libXext's handle to the display lifetime owner. Shape has no
+    /// client-side X resource to release, but its dynamic symbols may still be
+    /// used by Xlib's close-display teardown path.
+    pub(crate) fn into_deferred_libraries(mut self) -> Vec<DynamicLibrary> {
+        let library = self._library.take();
+        drop(self);
+        library.into_iter().collect()
     }
 
     /// Apply a rounded-rect bounding mask built from row spans.

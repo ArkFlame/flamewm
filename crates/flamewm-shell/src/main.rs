@@ -54,6 +54,9 @@ fn execute() -> Result<(), String> {
         let _s = scope.start();
         ShellSnapshot::load(&client)?
     };
+    // The startup client owns only the bootstrap roundtrip. Steady-state
+    // mutations use the dispatcher worker and snapshots arrive by signal.
+    drop(client);
     let mut runtime = {
         let scope = flamewm_profiler::ProfilePoint::new("shell.startup.runtime_create");
         let _s = scope.start();
@@ -107,25 +110,32 @@ fn execute() -> Result<(), String> {
         })
         .map_err(|error| format!("register clock timer: {error}"))?;
 
-    if let Some(dispatcher) = dispatcher.as_ref() {
-        let watch_fd = dispatcher.wake_fd();
-        let wake_dispatcher = Arc::clone(dispatcher);
-        reactor
-            .register_raw_fd_with_action(watch_fd, calloop::Interest::READ, move |_, _| {
-                flamewm_shell::control_actions::drain_results(Some(&wake_dispatcher));
-                flamewm_reactor::FdAction::Continue
-            })
-            .map_err(|error| format!("register mutation result source: {error}"))?;
-    }
     let state = Rc::new(RefCell::new(ShellLoop::new(
         flamewm_shell::ShellRuntime::new(snapshot),
         surfaces,
         start_model,
-        client,
         dispatcher,
         loader_root,
         current_exe_program(),
     )));
+    if let Some(dispatcher) = state.borrow().dispatcher.as_ref() {
+        let watch_fd = dispatcher.wake_fd();
+        let wake_dispatcher = Arc::clone(dispatcher);
+        let mutation_state = Rc::clone(&state);
+        reactor
+            .register_raw_fd_with_action(watch_fd, calloop::Interest::READ, move |_, _| {
+                flamewm_shell::control_actions::drain_results_with_settings(
+                    Some(&wake_dispatcher),
+                    |snapshot| {
+                        mutation_state
+                            .borrow_mut()
+                            .apply_settings_snapshot(snapshot)
+                    },
+                );
+                flamewm_reactor::FdAction::Continue
+            })
+            .map_err(|error| format!("register mutation result source: {error}"))?;
+    }
     // J07 parent: start the helper asynchronously after panel show. The
     // parent never blocks on the helper; spawn failure is nonfatal.
     state.borrow_mut().start_helper_after_panel();
@@ -135,7 +145,7 @@ fn execute() -> Result<(), String> {
     // Signal subscription into the same Reactor: snapshot signals apply
     // their payload directly in `mark_signal` (zero fetch); legacy
     // revision-only signals are ignored for normal refresh. The tick
-    // drains applied domains plus fetch-owned system state once per turn.
+    // drains applied domains once per turn.
     let signal_client = ControlSignalClient::connect(BusKind::Session)
         .map_err(|error| format!("subscribe control signals: {}", error))?;
     // Leak the client for process lifetime: its pump fd must stay open for the

@@ -68,7 +68,7 @@ pub struct XRenderBackend {
     destination: Picture,
     format: *mut XRenderPictFormat,
     api: XRenderApi,
-    _library: DynamicLibrary,
+    _library: Option<DynamicLibrary>,
     solids: HashMap<Color, Picture>,
 }
 
@@ -109,9 +109,31 @@ impl XRenderBackend {
             destination,
             format,
             api,
-            _library: library,
+            _library: Some(library),
             solids: HashMap::new(),
         })
+    }
+
+    /// Release XRender pictures while the display is live, then transfer the
+    /// dynamic-library handle to the display lifetime owner. The handle must
+    /// remain loaded through XCloseDisplay.
+    pub(crate) unsafe fn into_deferred_libraries(mut self) -> Vec<DynamicLibrary> {
+        unsafe { self.release_resources() };
+        let library = self._library.take();
+        drop(self);
+        library.into_iter().collect()
+    }
+
+    unsafe fn release_resources(&mut self) {
+        for (_, picture) in self.solids.drain() {
+            // SAFETY: the display remains live and the drained picture is backend-owned.
+            unsafe { (self.api.free_picture)(self.display, picture) };
+        }
+        if self.destination != 0 {
+            // SAFETY: the display remains live and `destination` is a live backend-owned picture.
+            unsafe { (self.api.free_picture)(self.display, self.destination) };
+            self.destination = 0;
+        }
     }
 
     pub unsafe fn set_drawable(&mut self, drawable: Drawable) -> Result<(), String> {
@@ -453,14 +475,6 @@ impl Drop for XRenderBackend {
     fn drop(&mut self) {
         // SAFETY: teardown only frees backend-owned pictures while `display` is
         // live; draining first guarantees each picture is released once.
-        unsafe {
-            for (_, picture) in self.solids.drain() {
-                (self.api.free_picture)(self.display, picture);
-            }
-            if self.destination != 0 {
-                (self.api.free_picture)(self.display, self.destination);
-                self.destination = 0;
-            }
-        }
+        unsafe { self.release_resources() };
     }
 }

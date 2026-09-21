@@ -1229,6 +1229,9 @@ pub enum ControlSignal {
     PanelsSnapshotChanged {
         snapshot: PanelsSnapshot,
     },
+    SystemSnapshotChanged {
+        snapshot: SystemSnapshot,
+    },
     SystemChanged {
         revision: u64,
     },
@@ -1259,6 +1262,11 @@ pub fn encode_signal(signal: &ControlSignal) -> WireSignal {
             interface: IFACE_SYSTEM.to_owned(),
             member: "SystemChanged".to_owned(),
             args: vec![WireValue::U64(*revision)],
+        },
+        ControlSignal::SystemSnapshotChanged { snapshot } => WireSignal {
+            interface: IFACE_SYSTEM.to_owned(),
+            member: "SystemSnapshotChanged".to_owned(),
+            args: vec![WireValue::Dict(system_dict(snapshot))],
         },
         ControlSignal::SettingsChanged { revision, keys } => WireSignal {
             interface: IFACE_SETTINGS.to_owned(),
@@ -1325,6 +1333,12 @@ pub fn decode_signal(signal: &WireSignal) -> Result<ControlSignal, ControlError>
         (IFACE_SYSTEM, "SystemChanged") => Ok(ControlSignal::SystemChanged {
             revision: signal_revision(&call)?,
         }),
+        (IFACE_SYSTEM, "SystemSnapshotChanged") => {
+            expect_arity(&call, 1)?;
+            Ok(ControlSignal::SystemSnapshotChanged {
+                snapshot: system_snapshot(required_dict(&call.args[0], "snapshot")?)?,
+            })
+        }
         (IFACE_SETTINGS, "SettingsChanged") => {
             expect_arity(&call, 2)?;
             Ok(ControlSignal::SettingsChanged {
@@ -3065,5 +3079,34 @@ mod tests {
             decode_signal(&encode_signal(&legacy_panels)).expect("decode"),
             legacy_panels
         );
+    }
+
+    // CONTRACT-REGRESSION: T05 SystemSnapshotChanged carries the complete authoritative snapshot.
+    // TRIGGER: receive the canonical SystemSnapshotChanged interface/member and dictionary payload.
+    // OBSERVABLE: the decoder admits the signal and preserves every snapshot field exactly.
+    // GAP: the existing SystemChanged test covers only the compatibility revision signal.
+    // MUTATION: omit the SystemSnapshotChanged decoder arm or decode its payload as SystemChanged; test must fail.
+    // CASE: full network, media, and audio fixture exercises nested and non-default fields.
+    #[test]
+    fn t05_system_snapshot_changed_round_trips_exact_snapshot_through_wire() {
+        let snapshot = system_fixture();
+        let expected = ControlSignal::SystemSnapshotChanged {
+            snapshot: snapshot.clone(),
+        };
+        assert_eq!(decode_signal(&encode_signal(&expected)), Ok(expected));
+        let signal = WireSignal {
+            interface: IFACE_SYSTEM.to_owned(),
+            member: "SystemSnapshotChanged".to_owned(),
+            args: vec![WireValue::Dict(system_dict(&snapshot))],
+        };
+
+        let decoded = decode_signal(&signal).expect("SystemSnapshotChanged must decode");
+        assert_eq!(
+            format!("{decoded:?}"),
+            format!("SystemSnapshotChanged {{ snapshot: {:?} }}", snapshot)
+        );
+
+        let legacy = ControlSignal::SystemChanged { revision: 12 };
+        assert_eq!(decode_signal(&encode_signal(&legacy)), Ok(legacy));
     }
 }

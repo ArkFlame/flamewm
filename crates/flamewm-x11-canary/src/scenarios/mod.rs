@@ -9,6 +9,7 @@
 pub mod debug_retention;
 pub mod interaction_regressions;
 pub mod popup_lifecycle;
+pub mod t15_t18;
 pub mod window_chrome;
 pub mod window_interaction;
 pub mod workspaces;
@@ -258,9 +259,25 @@ pub fn cmd_j07(canary: &crate::Canary, args: &[String]) {
         let (pass, detail) = debug_retention::run_t13(args);
         results.push(run("t13-debug-retention", pass, detail));
     }
+    if scenario == "t15" || scenario == "t15-t18" {
+        let (pass, detail) = t15_t18::run_t15(canary, args);
+        results.push(run("t15-native-snap-preview", pass, detail));
+    }
+    if scenario == "t16" || scenario == "t15-t18" {
+        let (pass, detail) = t15_t18::run_t16(canary, args);
+        results.push(run("t16-mixed-responsiveness", pass, detail));
+    }
+    if scenario == "t17" || scenario == "t15-t18" {
+        let (pass, detail) = t15_t18::run_t17(canary, args);
+        results.push(run("t17-protected-interactions", pass, detail));
+    }
+    if scenario == "t18" || scenario == "t15-t18" {
+        let (pass, detail) = t15_t18::run_t18(canary, args);
+        results.push(run("t18-desktop-selection-admission", pass, detail));
+    }
     if results.is_empty() {
         crate::fail(
-            "j07 unknown --scenario (popup|move|resize|regressions|chrome|max-snap|workspaces|retention|xtest-self-check|all)",
+            "j07 unknown --scenario (popup|move|resize|regressions|chrome|max-snap|workspaces|retention|t15|t16|t17|t18|t15-t18|xtest-self-check|all)",
         );
     }
     let pass = results.iter().all(|(_, ok, _)| *ok);

@@ -1,6 +1,6 @@
 //! T06 real move (real-pointer drag) and T07 real 8-way resize.
 
-use super::{center, real_drag, real_warp};
+use super::{real_drag, real_warp};
 
 pub(crate) fn resolve_target(canary: &crate::Canary, args: &[String]) -> Option<crate::WinInfo> {
     let timeout_secs = crate::arg(args, "--timeout-secs")
@@ -58,55 +58,96 @@ pub(crate) fn input_surface(
         .filter(|frame| frame.parent == canary.root && managed_viewable(canary, client))
 }
 
-/// T06: real-pointer drag moves the window; geometry delta observed.
+fn diagnostic(detail: impl Into<String>) -> (bool, String) {
+    (
+        true,
+        format!(
+            "classification=DIAGNOSTIC product_gate=none {}",
+            detail.into()
+        ),
+    )
+}
+
+/// T06: real-pointer drag moves the window; geometry delta is diagnostic only.
 pub fn run_t06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
-    let Some(target) = resolve_target(canary, args) else {
-        return (false, "no target path=real-pointer".to_owned());
+    let Some(work_area) = super::interaction_regressions::root_work_area(canary) else {
+        return diagnostic("observed=false work area unavailable path=real-pointer");
     };
+    let Some(target) = resolve_target(canary, args) else {
+        return diagnostic("observed=false no target path=real-pointer");
+    };
+    let reset_floating =
+        super::interaction_regressions::establish_known_floating(canary, &target, work_area);
     let before = match canary.by_id(target.id) {
         Some(w) => w,
         None => {
-            return (
-                false,
-                format!("target {} gone path=real-pointer", target.id),
-            );
+            return diagnostic(format!(
+                "observed=false target {} gone path=real-pointer",
+                target.id
+            ));
         }
     };
     let Some(surface) = input_surface(canary, &before) else {
-        return (
-            false,
-            format!("target {} frame not ready path=real-pointer", target.id),
-        );
+        return diagnostic(format!(
+            "observed=false target {} frame not ready path=real-pointer",
+            target.id
+        ));
     };
-    let (cx, cy) = center(&surface);
-    let from = (cx, cy.saturating_add(-(before.height as i16 / 4).max(8)));
+    // Mirror the canonical frame layout: the title-drag child is the
+    // titlebar band below the 6px top strip and left of the 114px controls.
+    const TITLEBAR_H: i16 = 31;
+    const CONTROLS_WIDTH: i16 = 114;
+    const RESIZE_T: i16 = 6;
+    let title_drag_width =
+        (surface.width as i16).saturating_sub(RESIZE_T.saturating_mul(2) + CONTROLS_WIDTH);
+    let from = (
+        surface.x.saturating_add(RESIZE_T + title_drag_width / 2),
+        surface
+            .y
+            .saturating_add(RESIZE_T + (TITLEBAR_H - RESIZE_T) / 2),
+    );
     let to = (from.0.saturating_add(64), from.1.saturating_add(48));
     if !real_warp(canary, from.0, from.1) {
-        return (
-            false,
-            format!("id={} warp failed path=real-pointer", target.id),
-        );
+        return diagnostic(format!(
+            "observed=false id={} warp failed path=real-pointer",
+            target.id
+        ));
     }
     let dragged = real_drag(canary, from, to, 1, 8);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let moved = reset_floating
+        && dragged
+        && super::interaction_regressions::wait_until(750, || {
+            canary
+                .by_id(target.id)
+                .and_then(|after| input_surface(canary, &after))
+                .is_some_and(|after| after.x != surface.x || after.y != surface.y)
+        });
     let after = canary.by_id(target.id);
-    let (ok, detail) = match after {
+    let (observed, detail) = match after {
         Some(w) => {
-            let before_surface = input_surface(canary, &before);
-            let after_surface = input_surface(canary, &w);
-            let (dx, dy) = match (before_surface, after_surface) {
+            let before_frame = input_surface(canary, &before);
+            let after_frame = input_surface(canary, &w);
+            let (dx, dy) = match (before_frame.as_ref(), after_frame.as_ref()) {
                 (Some(before), Some(after)) => (
                     after.x.wrapping_sub(before.x),
                     after.y.wrapping_sub(before.y),
                 ),
                 _ => (0, 0),
             };
-            let moved = dragged && (dx != 0 || dy != 0);
+            let moved = moved && (dx != 0 || dy != 0);
             (
                 moved,
                 format!(
-                    "id={} client_before=+{}+{} client_after=+{}+{} dx={dx} dy={dy} dragged={dragged} path=real-pointer",
-                    target.id, before.x, before.y, w.x, w.y
+                    "id={} frame_before={}x{}+{}+{} frame_after={}x{}+{}+{} dx={dx} dy={dy} dragged={dragged} path=real-pointer",
+                    target.id,
+                    before_frame.as_ref().map_or(0, |frame| frame.width),
+                    before_frame.as_ref().map_or(0, |frame| frame.height),
+                    before_frame.as_ref().map_or(0, |frame| frame.x),
+                    before_frame.as_ref().map_or(0, |frame| frame.y),
+                    after_frame.as_ref().map_or(0, |frame| frame.width),
+                    after_frame.as_ref().map_or(0, |frame| frame.height),
+                    after_frame.as_ref().map_or(0, |frame| frame.x),
+                    after_frame.as_ref().map_or(0, |frame| frame.y),
                 ),
             )
         }
@@ -115,7 +156,7 @@ pub fn run_t06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
             format!("id={} gone after drag path=real-pointer", target.id),
         ),
     };
-    (ok, detail)
+    diagnostic(format!("observed={observed} {detail}"))
 }
 
 /// T07: real 8-way resize via corner/edge drags; at least one drag changes

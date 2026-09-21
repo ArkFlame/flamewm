@@ -16,7 +16,8 @@ use std::time::Duration;
 use crate::popup_controller::PopupError;
 use flamewm_api::settings::{SettingValue, SettingsSnapshot};
 use flamewm_control_core::ControlRequest;
-use flamewm_control_dbus::ControlClient;
+use flamewm_control_dbus::{ControlClient, ControlSignalClient};
+use flamewm_control_wire::ControlSignal;
 use flamewm_dbus_reactor::BusKind;
 use flamewm_debug::DebugEventId;
 use flamewm_shell_core::status::{AudioSettings, AudioTab, NetworkQuery};
@@ -53,6 +54,21 @@ pub enum HostError {
     Io(io::Error),
     Control(String),
     Ui(String),
+}
+
+/// Pure helper-process termination decision. Keeping this separate from the
+/// process exit lets library callers/tests inspect the shutdown contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickControlShutdown {
+    Completed,
+    Failed,
+}
+
+pub const fn quick_control_exit_code(shutdown: QuickControlShutdown) -> i32 {
+    match shutdown {
+        QuickControlShutdown::Completed => 0,
+        QuickControlShutdown::Failed => 1,
+    }
 }
 
 impl core::fmt::Display for HostError {
@@ -134,15 +150,17 @@ struct HostState {
     surfaces: HelperSurfaces,
     snapshot: QuickControlSnapshot,
     dispatcher: Option<Arc<flamewm_control_dbus::MutationDispatcher>>,
+    /// Coalesced live system update to project on the next UI turn.
+    system_reprojection_pending: bool,
     /// Parsed parent commands awaiting the tick drain.
     queue: VecDeque<Command>,
     /// Set on parent EOF or SHUTDOWN; the tick stops the loop cleanly.
     shutdown: bool,
 }
 
-/// Duplicate stdin + O_NONBLOCK on the dup. No `unsafe`: the std `File`
-/// duplicate path (`try_clone`) keeps fd 0 stdio-owned while the clone
-/// gets its own description flags via `set_nonblocking`.
+/// Duplicate stdin + O_NONBLOCK on the dup. No unsafe: the std File
+/// duplicate path (try_clone) keeps fd 0 stdio-owned while the clone
+/// gets its own description flags via set_nonblocking.
 fn stdin_nonblocking_dup() -> Result<std::fs::File, HostError> {
     use std::os::unix::io::AsFd;
     let file = std::fs::File::open("/dev/stdin").map_err(HostError::Io)?;
@@ -234,10 +252,10 @@ fn drain_parent_fd(file: &mut std::fs::File, state: &Arc<Mutex<ParentInput>>) {
 ///
 /// Connects its own control client, creates the three helper-owned popup
 /// surfaces, then enters one reactor: X11 surface FD + nonblocking parent
-/// command FD + timers/wake -> one event loop. Reuses `flamewm-reactor`.
+/// command FD + timers/wake -> one event loop. Reuses flamewm-reactor.
 /// The tick drains commands: OPEN closes the current helper popup,
 /// projects, fits, shows/grabs; CLOSE closes; SHUTDOWN stops cleanly.
-/// The surface event callback calls [`route_helper_event`].
+/// The surface event callback calls route_helper_event.
 pub fn run_quick_control_host() -> Result<(), HostError> {
     flamewm_profiler::init_process("flamewm-quick-control");
     flamewm_debug::init_process("flamewm-quick-control");
@@ -255,6 +273,7 @@ pub fn run_quick_control_host() -> Result<(), HostError> {
         surfaces,
         snapshot,
         dispatcher,
+        system_reprojection_pending: false,
         queue: VecDeque::new(),
         shutdown: false,
     }));
@@ -270,6 +289,42 @@ pub fn run_quick_control_host() -> Result<(), HostError> {
     let input: Arc<Mutex<ParentInput>> = Arc::new(Mutex::new(ParentInput::default()));
     let mut reactor = flamewm_reactor::Reactor::new()
         .map_err(|error| HostError::Control(format!("create reactor: {error}")))?;
+    // One live control-signal client for the helper lifetime. Its pump owns
+    // the watch FD; the existing reactor only borrows that descriptor.
+    let signal_client = ControlSignalClient::connect(BusKind::Session)
+        .map_err(|error| HostError::Control(format!("subscribe control signals: {error}")))?;
+    let signal_client: &'static ControlSignalClient = Box::leak(Box::new(signal_client));
+    {
+        let signal_state = std::rc::Rc::clone(&state);
+        let watch = signal_client.watch();
+        let interest = match (
+            watch
+                .events
+                .contains(flamewm_api::ports::FdEvents::READABLE),
+            watch
+                .events
+                .contains(flamewm_api::ports::FdEvents::WRITABLE),
+        ) {
+            (true, true) => calloop::Interest::BOTH,
+            (false, true) => calloop::Interest::WRITE,
+            _ => calloop::Interest::READ,
+        };
+        reactor
+            .register_raw_fd_with_action(watch.fd, interest, move |_, _| {
+                let _ = signal_client.on_ready(|signal| {
+                    if let ControlSignal::SystemSnapshotChanged { snapshot } = signal {
+                        let mut state = signal_state.borrow_mut();
+                        if apply_system_snapshot(&mut state.snapshot, snapshot)
+                            && state.surfaces.open.is_some()
+                        {
+                            state.system_reprojection_pending = true;
+                        }
+                    }
+                });
+                flamewm_reactor::FdAction::Continue
+            })
+            .map_err(|error| HostError::Control(format!("register control signal fd: {error}")))?;
+    }
     // the callback reopens its own nonblocking handle per readiness.
     // Keep-alive holder for the dup description; the callback registers
     // the raw fd without ownership transfer.
@@ -316,7 +371,7 @@ pub fn run_quick_control_host() -> Result<(), HostError> {
     let event_state = std::rc::Rc::clone(&state);
     let tick_state = std::rc::Rc::clone(&state);
     let tick_input = Arc::clone(&input);
-    flamewm_ui_x11::run_surface_runtime_with_reactor_access(
+    let run_result = flamewm_ui_x11::run_surface_runtime_with_reactor_access(
         &mut runtime,
         &mut reactor,
         move |event, runtime| {
@@ -349,26 +404,33 @@ pub fn run_quick_control_host() -> Result<(), HostError> {
             }
             tick_host(runtime, &tick_state)?;
             if tick_state.borrow().shutdown {
-                // Clean stop: close helper popups, then drop surfaces so the
-                // runner exits when no surfaces remain.
+                // Close and destroy every helper-owned surface. A teardown
+                // error is returned so the owner exits nonzero instead of
+                // continuing into the known-crashing runtime destructor.
                 let mut state = tick_state.borrow_mut();
-                state.surfaces.close(runtime);
-                for surface in [
-                    state.surfaces.audio,
-                    state.surfaces.network,
-                    state.surfaces.calendar,
-                ] {
-                    let _ = runtime.destroy(surface);
-                }
+                state.surfaces.shutdown(runtime)?;
             }
             Ok(())
         },
     )
-    .map_err(|error| HostError::Ui(format!("surface runtime: {error:?}")))?;
+    .map_err(|error| HostError::Ui(format!("surface runtime: {error:?}")));
     // Final profiler window on clean exit: flush the cadence bucket even
     // when the loop ran fewer than one interval.
     let _ = flamewm_profiler::report_window();
-    Ok(())
+    let shutdown = match run_result {
+        Ok(()) => QuickControlShutdown::Completed,
+        Err(error) => {
+            eprintln!("flamewm-quick-control: shutdown failed: {error}");
+            QuickControlShutdown::Failed
+        }
+    };
+    // Do not return into SurfaceRuntime/SurfaceController::drop here:
+    // its native display teardown runs after the helper's owned surfaces
+    // are gone, where unavailable cache-drain support leaves the process
+    // vulnerable to the known native teardown crash.
+    // This branch is reached only by the dedicated helper process, never by
+    // the shell/WM parent.
+    std::process::exit(quick_control_exit_code(shutdown));
 }
 
 /// Coalesce queued commands: consecutive OPENs collapse to the newest;
@@ -401,15 +463,17 @@ fn tick_host(
     loop {
         let command = state.borrow_mut().queue.pop_front();
         let Some(command) = command else {
-            return Ok(());
+            break;
         };
         match command {
-            Command::Shutdown | Command::Close => {
+            Command::Shutdown => {
+                // Leave the open surface for the owning shutdown transaction
+                // below so close/ungrab/unmap/flush failures are observable.
+                state.borrow_mut().shutdown = true;
+            }
+            Command::Close => {
                 let mut guard = state.borrow_mut();
                 guard.surfaces.close(runtime);
-                if matches!(command, Command::Shutdown) {
-                    guard.shutdown = true;
-                }
             }
             Command::Open(request) => {
                 let snapshot = state.borrow().snapshot.clone();
@@ -427,13 +491,49 @@ fn tick_host(
                     close_elapsed,
                 ) {
                     eprintln!("flamewm-quick-control: open refused: {error}");
+                } else {
+                    // OPEN already projected the current snapshot; consume a
+                    // signal queued before this turn without a second pass.
+                    guard.system_reprojection_pending = false;
                 }
             }
         }
     }
+    let pending = {
+        let mut guard = state.borrow_mut();
+        if !guard.system_reprojection_pending {
+            None
+        } else {
+            guard.system_reprojection_pending = false;
+            let open = guard.surfaces.open;
+            open.map(|kind| {
+                (
+                    guard.surfaces.surface_for(kind),
+                    guard.snapshot.clone(),
+                    kind,
+                )
+            })
+        }
+    };
+    if let Some((surface, snapshot, kind)) = pending {
+        project_snapshot(runtime, surface, &snapshot, kind).map_err(UiBackendError::Document)?;
+        runtime.redraw(surface)?;
+    }
+    Ok(())
 }
 
-/// True open stages: each label maps to one real turn in `open_request`
+fn apply_system_snapshot(
+    snapshot: &mut QuickControlSnapshot,
+    system: flamewm_api::system::SystemSnapshot,
+) -> bool {
+    if snapshot.system == system {
+        return false;
+    }
+    snapshot.system = system;
+    true
+}
+
+/// True open stages: each label maps to one real turn in open_request
 /// (project, measure, place, prepare/commit_geometry, present,
 /// pointer_grab) plus the total and the real close
 /// (close/ungrab/unmap). No fake spans.
@@ -456,7 +556,7 @@ pub fn is_slow_open(total: Duration) -> bool {
 }
 
 /// Pure seam: stage timings carried by one open turn, rendered by the
-/// slow-open debug line. `close` is the pre-open close of the previous
+/// slow-open debug line. close is the pre-open close of the previous
 /// popup on the same tick (zero when nothing was open).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenStageTimings {
@@ -553,7 +653,17 @@ fn open_request(
         .map(|r| (r.x as i32, r.y as i32, r.width as i32, r.height as i32));
     let grab_start = std::time::Instant::now();
     let _grab = crate::runtime::shell_span("shell.quick.pointer_grab").start();
-    grab(runtime, surface).map_err(|error| error.to_string())?;
+    if let Err(error) = grab(runtime, surface).map_err(|error| error.to_string()) {
+        drop(_grab);
+        if let Err(close_error) = close_helper(runtime, surface) {
+            eprintln!("flamewm-quick-control: popup rollback close failed: {close_error}");
+        }
+        match surfaces.open {
+            Some(kind) if kind != request.kind => {}
+            _ => surfaces.open = None,
+        }
+        return Err(error);
+    }
     let grab_elapsed = grab_start.elapsed();
     drop(_grab);
     surfaces.open = Some(request.kind);
@@ -660,7 +770,7 @@ fn project_snapshot(
 /// typed audio/network actions forward via the existing dispatcher
 /// contract. Events inside the active popup or its submodules are kept;
 /// a release outside the active popup closes it on the same turn.
-/// Returns `true` when the loop should keep running.
+/// Returns true when the loop should keep running.
 pub fn route_helper_event(
     event: &flamewm_ui_x11::SurfaceEvent,
     runtime: &mut SurfaceRuntime,
@@ -777,8 +887,8 @@ fn helper_control_request(action: &str, snapshot: &QuickControlSnapshot) -> Opti
     }
 }
 
-/// Pure helpers for the close-one/close-none contract: `take_close_target`
-/// consumes `open` and yields the single kind to close (None = zero calls).
+/// Pure helpers for the close-one/close-none contract: take_close_target
+/// consumes open and yields the single kind to close (None = zero calls).
 pub fn take_close_target(open: Option<QuickControlKind>) -> Option<QuickControlKind> {
     open
 }
@@ -829,12 +939,29 @@ impl HelperSurfaces {
         let _ = close_helper(runtime, surface);
     }
 
-    /// Shutdown path: close the open surface, then destroy all helpers.
-    pub fn shutdown(&mut self, runtime: &mut SurfaceRuntime) {
-        self.close(runtime);
-        for surface in [self.audio, self.network, self.calendar] {
-            let _ = runtime.destroy(surface);
+    /// Shutdown path: close the open surface (the shared close owner performs
+    /// ungrab/unmap/present/flush), then destroy all helpers. Every failure is
+    /// diagnosed and returned so the process owner can choose nonzero exit.
+    pub fn shutdown(&mut self, runtime: &mut SurfaceRuntime) -> Result<(), UiBackendError> {
+        let mut first_error = None;
+        if let Some(surface) = self.close_handle() {
+            let _span = crate::runtime::shell_span("shell.quick.close/ungrab/unmap").start();
+            if let Err(error) = close_helper(runtime, surface) {
+                eprintln!("flamewm-quick-control: popup close during shutdown failed: {error}");
+                first_error = Some(UiBackendError::Renderer(error.to_string()));
+            }
         }
+        for surface in [self.audio, self.network, self.calendar] {
+            if let Err(error) = runtime.destroy(surface) {
+                eprintln!(
+                    "flamewm-quick-control: surface destroy during shutdown failed: {error:?}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -866,7 +993,7 @@ fn ui_error(error: UiBackendError) -> String {
 }
 
 /// Parent-side helper: restart the supervisor with the J07 static span
-/// (`shell.quick_control.restart`). Failures are nonfatal: the caller logs
+/// (shell.quick_control.restart). Failures are nonfatal: the caller logs
 /// and keeps the shell running without quick-control popups.
 pub fn poll_supervisor_nonfatal(supervisor: &mut QuickControlSupervisor) {
     let _span = crate::runtime::shell_span("shell.quick_control.restart").start();
@@ -933,6 +1060,22 @@ mod tests {
             panel_edge: flamewm_api::PanelEdge::Bottom,
         }));
         assert!(!line.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn system_snapshot_update_is_direct_and_deduplicated() {
+        let mut quick = QuickControlSnapshot {
+            system: flamewm_api::system::SystemSnapshot::default(),
+            audio_tab: AudioTab::default(),
+            audio_settings: AudioSettings::default(),
+            network_query: NetworkQuery::default(),
+            network_secret_masked_len: 0,
+        };
+        let mut next = quick.system.clone();
+        next.revision = 7;
+        assert!(apply_system_snapshot(&mut quick, next.clone()));
+        assert_eq!(quick.system, next);
+        assert!(!apply_system_snapshot(&mut quick, next));
     }
 
     #[test]
@@ -1088,6 +1231,12 @@ mod tests {
     }
 
     #[test]
+    fn normal_helper_shutdown_selects_zero_exit() {
+        assert_eq!(quick_control_exit_code(QuickControlShutdown::Completed), 0);
+        assert_eq!(quick_control_exit_code(QuickControlShutdown::Failed), 1);
+    }
+
+    #[test]
     fn stage_labels_are_real_turns() {
         // True stages only: every label maps to a real turn in
         // open_request/fitted_rect/close; no fake snapshot/measure/place.
@@ -1147,5 +1296,39 @@ mod tests {
         };
         assert_eq!(placement.rect.x, 10);
         assert_eq!(placement.measure_elapsed, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn red_grab_refusal_rolls_back_the_post_map_open() {
+        // No SurfaceRuntime fake exists at this boundary. Keep this RED
+        // regression source-level so it still proves the owner stages show
+        // before grab and requires the real close owner on grab refusal.
+        let source = include_str!("host.rs");
+        let (_, open) = source
+            .split_once("fn open_request(")
+            .expect("open_request owner");
+        let (open, _) = open
+            .split_once("\nfn project_snapshot(")
+            .expect("open_request body");
+        let present = open
+            .find("present(runtime, surface)")
+            .expect("post-map present stage");
+        let grab = open
+            .find("grab(runtime, surface)")
+            .expect("pointer-grab stage");
+        assert!(present < grab, "grab must follow the mapped present stage");
+        let after_grab = &open[grab..];
+        assert!(
+            after_grab.contains("if let Err") || after_grab.contains("match grab"),
+            "grab refusal must have an explicit rollback branch"
+        );
+        assert!(
+            after_grab.contains("close_helper(runtime, surface)"),
+            "grab refusal must hide/unmap through the existing close owner"
+        );
+        assert!(
+            after_grab.contains("surfaces.open = None"),
+            "grab refusal must not leave stale open state"
+        );
     }
 }

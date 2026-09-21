@@ -13,7 +13,7 @@ use flamewm_render_core::{Color, CursorKind, Rect};
 use super::external_drawable::{
     ExternalDrawableSession, ExternalDrawableTarget, external_text_measure, use_cstring_title,
 };
-use super::native::cursor::{NativeCursorSession, XcursorBackend};
+use super::native::cursor::{DeferredNativeLibraryHandles, NativeCursorSession, XcursorBackend};
 use super::xlib::{
     Display, XCloseDisplay, XFlush, XOpenDisplay, install_x_protocol_error_handler, x_io_broken,
 };
@@ -33,20 +33,37 @@ pub struct ExternalDecorationRenderer {
 
 impl Drop for ExternalDecorationRenderer {
     fn drop(&mut self) {
-        // Release X-backed resources before closing the connection:
-        // cached pixmaps/pictures (target), cursors, then GC/colormap.
-        self.target.take();
-        if let Some(cursor) = self.cursor.as_mut() {
-            if !self.display.is_null() {
-                unsafe { cursor.free_all() };
-            }
+        // Release X-backed objects while the display is live, but retain every
+        // dynamic backend handle until after XCloseDisplay. This includes the
+        // target's Xft/XRender/XShape libraries and the cursor library.
+        let mut deferred_native = DeferredNativeLibraryHandles::new();
+        let broken = x_io_broken();
+        let mut target = self.target.take();
+        if broken {
+            // A broken connection cannot safely release X resources. Preserve
+            // all native owners rather than invoking their Drop paths.
+            std::mem::forget(target);
+            std::mem::forget(self.cursor.take());
+            std::mem::forget(self.session.take());
+            return;
         }
-        self.cursor.take();
-        self.session.take();
-        if !self.display.is_null() && !x_io_broken() {
+        if let Some(target) = target.as_mut() {
+            // SAFETY: this renderer still owns the live display/session.
+            deferred_native.extend(unsafe { target.take_deferred_native_libraries() });
+        }
+        drop(target);
+        if let Some(cursor) = self.cursor.take() {
+            // SAFETY: this renderer still owns the live display.
+            deferred_native.extend(unsafe {
+                DeferredNativeLibraryHandles::from_backends(Some(cursor), None, None, None)
+            });
+        }
+        drop(self.session.take());
+        if !self.display.is_null() {
             unsafe { XCloseDisplay(self.display) };
             self.display = ptr::null_mut();
         }
+        drop(deferred_native);
     }
 }
 
@@ -62,8 +79,13 @@ impl ExternalDecorationRenderer {
             );
         }
         install_x_protocol_error_handler();
-        let session = unsafe { ExternalDrawableSession::new(display) }
-            .map_err(|error| format!("ExternalDecorationRenderer session: {error}"))?;
+        let session = match unsafe { ExternalDrawableSession::new(display) } {
+            Ok(session) => session,
+            Err(error) => {
+                unsafe { XCloseDisplay(display) };
+                return Err(format!("ExternalDecorationRenderer session: {error}"));
+            }
+        };
         let backend = unsafe { XcursorBackend::with_theme(display, None, None) };
         Ok(Self {
             display,

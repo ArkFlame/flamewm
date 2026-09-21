@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use flamewm_api::applications::ApplicationLaunchOptions;
+use flamewm_api::workspace::WorkspaceSnapshot;
 use flamewm_api::{OutputId, Point, Rect};
 use flamewm_applications::DesktopEntry;
 use flamewm_control_core::{ControlRequest, ControlResponse};
-use flamewm_control_dbus::{ControlClient, ControlSignalClient};
+use flamewm_control_dbus::{ControlClient, ControlSignalClient, MutationDispatcher};
 use flamewm_dbus_reactor::BusKind;
 use flamewm_desktop_core::file_actions::{
     CommandIntent, EntryMenuAction, LauncherOpen, create_new_folder, desktop_settings,
@@ -48,6 +49,7 @@ use flamewm_ui_x11::{
 };
 
 mod projection;
+mod workspace_sync;
 
 use std::sync::OnceLock;
 
@@ -211,6 +213,42 @@ fn workspace_change_counter() -> &'static CounterPoint {
     COUNTER.get_or_init(|| CounterPoint::new("desktop.workspace.change"))
 }
 
+fn workspace_signal_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.workspace.signal"))
+}
+
+fn workspace_apply_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.workspace.apply"))
+}
+
+fn workspace_project_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.workspace.project"))
+}
+
+fn workspace_present_point() -> &'static ProfilePoint {
+    static POINT: OnceLock<ProfilePoint> = OnceLock::new();
+    POINT.get_or_init(|| ProfilePoint::new("desktop.workspace.present"))
+}
+
+fn workspace_snapshot_received_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.workspace.snapshot_received"))
+}
+
+fn workspace_legacy_ignored_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.workspace.legacy_ignored"))
+}
+
+#[allow(dead_code)]
+fn workspace_filesystem_rescan_from_workspace_counter() -> &'static CounterPoint {
+    static COUNTER: OnceLock<CounterPoint> = OnceLock::new();
+    COUNTER.get_or_init(|| CounterPoint::new("desktop.workspace.filesystem_rescan_from_workspace"))
+}
+
 fn model_gauge() -> &'static MemoryGauge {
     static GAUGE: OnceLock<MemoryGauge> = OnceLock::new();
     GAUGE.get_or_init(|| MemoryGauge::new("desktop.model"))
@@ -292,12 +330,15 @@ struct DesktopState {
     icons_pending: Arc<AtomicBool>,
     rename: Option<RenameState>,
     drag_ghost: Option<DragGhost>,
-    active_workspace: usize,
     sticky_edit: Option<StickyEdit>,
     sticky_gesture: Option<StickyGesture>,
     sticky_persist_pending: bool,
     sticky_persist_armed: bool,
     sticky_persist_due: Option<Instant>,
+    workspace: workspace_sync::WorkspaceAuthority,
+    workspace_visual_dirty: bool,
+    workspace_present_pending: bool,
+    workspace_present_span: Option<flamewm_profiler::SpanGuard>,
 }
 
 #[derive(Clone)]
@@ -401,7 +442,7 @@ fn main() -> Result<(), String> {
                 | inotify::WatchMask::ATTRIB,
         )
         .map_err(|error| format!("watch desktop directory: {error}"))?;
-    let active_workspace = query_active_workspace();
+    let workspace = query_workspaces();
     let state_cell = std::rc::Rc::new(std::cell::RefCell::new({
         let mut state = DesktopState {
             directory,
@@ -423,12 +464,15 @@ fn main() -> Result<(), String> {
             icons_pending: Arc::clone(&icons_pending),
             rename: None,
             drag_ghost: None,
-            active_workspace,
             sticky_edit: None,
             sticky_gesture: None,
             sticky_persist_pending: false,
             sticky_persist_armed: false,
             sticky_persist_due: None,
+            workspace: workspace_sync::WorkspaceAuthority::new(workspace),
+            workspace_visual_dirty: false,
+            workspace_present_pending: false,
+            workspace_present_span: None,
         };
         refresh_launchers(&mut state);
         update_gauges(&state);
@@ -463,8 +507,9 @@ fn main() -> Result<(), String> {
         )
         .map_err(|error| format!("register profiler timer: {error}"))?;
     register_sticky_persist_timer(&mut reactor)?;
-    // Best-effort workspace signal subscription: startup query already ran,
-    // WorkspacesChanged only refreshes the active index and sticky visibility.
+    // Best-effort workspace signal subscription: startup query already ran.
+    // WorkspacesSnapshotChanged is the live workspace authority; the legacy
+    // revision-only signal is intentionally not a fetch trigger.
     match ControlSignalClient::connect(BusKind::Session) {
         Ok(client) => {
             let client: &'static ControlSignalClient = Box::leak(Box::new(client));
@@ -486,18 +531,30 @@ fn main() -> Result<(), String> {
                 move |_, _| {
                     let state_cell = &workspace_cell;
                     let _ = client.on_ready(|signal| {
-                        if let flamewm_control_wire::ControlSignal::WorkspacesChanged { .. } =
-                            signal
-                        {
-                            let mut state = state_cell.borrow_mut();
-                            // Exactly one GetWorkspaces per signal, then update + sync.
-                            let next = query_active_workspace();
-                            if next != state.active_workspace {
-                                state.active_workspace = next;
-                                workspace_change_counter().increment();
-                                let _ = refresh_if_changed_direct(&mut state);
+                        match signal {
+                            flamewm_control_wire::ControlSignal::WorkspacesSnapshotChanged {
+                                snapshot,
+                            } => {
+                                let _signal = workspace_signal_point().start();
+                                workspace_snapshot_received_counter().increment();
+                                let mut state = state_cell.borrow_mut();
+                                // Authoritative apply consumes snapshot.active_index directly.
+                                let active_changed = {
+                                    let _apply = workspace_apply_point().start();
+                                    state.workspace.apply_snapshot(snapshot)
+                                };
+                                if active_changed {
+                                    workspace_change_counter().increment();
+                                    state.workspace_visual_dirty = true;
+                                }
                             }
+                            signal if workspace_sync::is_legacy_workspace_signal(&signal) => {
+                                workspace_legacy_ignored_counter().increment();
+                            }
+                            _ => {}
                         }
+                        // The next UI turn projects sync_sticky and sync_menu only;
+                        // workspace signals never enter filesystem refresh.
                     });
                     FdAction::Continue
                 }
@@ -510,6 +567,34 @@ fn main() -> Result<(), String> {
         }
         Err(error) => {
             eprintln!("desktop: degraded workspaces signal subscription: {error:?}");
+        }
+    }
+    let workspace_mutations = match MutationDispatcher::start(BusKind::Session, 16) {
+        Ok(dispatcher) => Some(dispatcher),
+        Err(error) => {
+            eprintln!(
+                "desktop: degraded workspace mutation dispatcher: {}",
+                error.message
+            );
+            None
+        }
+    };
+    if let Some(dispatcher) = workspace_mutations.as_ref() {
+        let dispatcher = Arc::clone(dispatcher);
+        let registration = reactor.register_raw_fd_with_action(
+            dispatcher.wake_fd(),
+            calloop::Interest::READ,
+            move |_, _| {
+                while let Some(result) = dispatcher.try_recv_result() {
+                    if let Err(error) = result.outcome {
+                        eprintln!("desktop: workspace mutation failed: {}", error.message);
+                    }
+                }
+                FdAction::Continue
+            },
+        );
+        if let Err(error) = registration {
+            eprintln!("desktop: degraded workspace mutation subscription: {error}");
         }
     }
     reactor
@@ -565,14 +650,18 @@ fn main() -> Result<(), String> {
         &mut reactor,
         {
             let event_cell = std::rc::Rc::clone(&state_cell);
+            let mutation_dispatcher = workspace_mutations.clone();
             move |event, document| {
                 let state_cell = &event_cell;
                 let mut state = state_cell.borrow_mut();
                 refresh_if_changed(document, &mut state)?;
+                refresh_workspace_projection(document, &mut state)?;
                 apply_pending_icon_results(document, &mut state)?;
                 poll_sticky_persist(document, &mut state)?;
                 let UiControllerEvent::Action(action) = event;
-                handle_event(action, document, &mut state)
+                let result =
+                    handle_event(action, document, &mut state, mutation_dispatcher.as_ref());
+                result
             }
         },
         {
@@ -580,10 +669,17 @@ fn main() -> Result<(), String> {
             move |document| {
                 let state_cell = &flush_cell;
                 let mut state = state_cell.borrow_mut();
+                let _completed_workspace_present = state.workspace_present_span.take();
                 refresh_if_changed(document, &mut state)?;
+                refresh_workspace_projection(document, &mut state)?;
                 apply_pending_icon_results(document, &mut state)?;
                 poll_sticky_persist(document, &mut state)?;
-                flush_sticky_persist_if_due(document, &mut state)
+                let result = flush_sticky_persist_if_due(document, &mut state);
+                if result.is_ok() && state.workspace_present_pending {
+                    state.workspace_present_pending = false;
+                    state.workspace_present_span = Some(workspace_present_point().start());
+                }
+                result
             }
         },
     )?;
@@ -591,20 +687,27 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn query_active_workspace() -> usize {
+fn query_workspaces() -> WorkspaceSnapshot {
+    let fallback = WorkspaceSnapshot {
+        revision: 0,
+        count: 1,
+        active_index: 0,
+        last_index: None,
+        names: Vec::new(),
+    };
     match control_client() {
         Ok(client) => match client.call(&ControlRequest::GetWorkspaces) {
-            Ok(ControlResponse::Workspaces(snapshot)) => snapshot.active_index,
-            _ => 0,
+            Ok(ControlResponse::Workspaces(snapshot)) => snapshot,
+            _ => fallback,
         },
-        Err(_) => 0,
+        Err(_) => fallback,
     }
 }
 
 fn refresh_if_changed_direct(state: &mut DesktopState) -> Result<(), String> {
-    // Workspace signal path has no document handle; sticky visibility sync
-    // happens on the next event/refresh tick through sync_document.
-    state.dirty.store(true, Ordering::Release);
+    // Kept as a narrow compatibility seam for the startup/event boundary:
+    // workspace visual dirtiness is never filesystem dirtiness.
+    state.workspace_visual_dirty = true;
     Ok(())
 }
 
@@ -761,6 +864,21 @@ fn refresh_if_changed(
     Ok(())
 }
 
+fn refresh_workspace_projection(
+    document: &mut impl UiDocumentAccess,
+    state: &mut DesktopState,
+) -> Result<(), String> {
+    if !state.workspace_visual_dirty {
+        return Ok(());
+    }
+    let _project = workspace_project_point().start();
+    sync_sticky(document, state)?;
+    sync_menu(document, state)?;
+    state.workspace_visual_dirty = false;
+    state.workspace_present_pending = true;
+    Ok(())
+}
+
 /// Launcher metadata cache keyed by path, refreshed after every rescan.
 /// The Icon= value wins; per-kind defaults apply otherwise. Parsing stays in
 /// the applications owner; this cache only records the outcome.
@@ -900,7 +1018,7 @@ const STICKY_SLOTS: usize = projection::STICKY_SLOT_COUNT;
 fn visible_sticky_notes(state: &DesktopState) -> Vec<StickyNote> {
     state
         .sticky
-        .notes_for_workspace(state.active_workspace)
+        .notes_for_workspace(state.workspace.active_index())
         .into_iter()
         .take(STICKY_SLOTS)
         .cloned()
@@ -974,6 +1092,7 @@ fn handle_event(
     action: &UiActionEvent,
     document: &mut impl UiDocumentAccess,
     state: &mut DesktopState,
+    mutation_dispatcher: Option<&Arc<MutationDispatcher>>,
 ) -> Result<(), String> {
     if action.action == "keyboard.input" {
         if action.text.as_deref() == Some("") {
@@ -995,7 +1114,7 @@ fn handle_event(
         && is_menu_action(&action.action)
     {
         context_action_counter().increment();
-        return handle_menu_action(&action.action, document, state);
+        return handle_menu_action(&action.action, document, state, mutation_dispatcher);
     }
     if matches!(
         action.action.as_str(),
@@ -1410,6 +1529,7 @@ fn handle_menu_action(
     action: &str,
     document: &mut impl UiDocumentAccess,
     state: &mut DesktopState,
+    mutation_dispatcher: Option<&Arc<MutationDispatcher>>,
 ) -> Result<(), String> {
     match action {
         "menu.terminal" => {
@@ -1438,7 +1558,7 @@ fn handle_menu_action(
             let anchor = state.menu.as_ref().map(|menu| menu.anchor);
             let anchor = anchor.unwrap_or(state.grid.work_area.origin());
             if state.sticky.enabled() {
-                let workspace = state.active_workspace;
+                let workspace = state.workspace.active_index();
                 let sequence = state.sticky.count_for_workspace(workspace) + 1;
                 let id = format!("sticky-{workspace}-{sequence}");
                 if state.sticky.count_for_workspace(workspace) < STICKY_SLOTS {
@@ -1456,7 +1576,7 @@ fn handle_menu_action(
             sync_document(document, state)?;
         }
         "menu.desktop" => {
-            insert_workspace_after()?;
+            insert_workspace_after(mutation_dispatcher, state)?;
             state.menu = None;
             sync_menu(document, state)?;
         }
@@ -1720,23 +1840,20 @@ fn control_client() -> Result<ControlClient, String> {
     ControlClient::connect(BusKind::Session).map_err(|error| format!("{error:?}"))
 }
 
-fn insert_workspace_after() -> Result<(), String> {
-    let client = control_client()?;
-    let (index, revision) = match client.call(&ControlRequest::GetWorkspaces) {
-        Ok(ControlResponse::Workspaces(snapshot)) => {
-            (snapshot.count.saturating_sub(1), snapshot.revision)
-        }
-        Ok(response) => return Err(format!("GetWorkspaces returned {response:?}")),
-        Err(error) => return Err(error.message.clone()),
-    };
-    match client.call(&ControlRequest::InsertWorkspaceAfter {
-        index,
-        expected_revision: revision,
-    }) {
-        Ok(ControlResponse::Unit) => Ok(()),
-        Ok(response) => Err(format!("InsertWorkspaceAfter returned {response:?}")),
-        Err(error) => Err(error.message.clone()),
-    }
+fn insert_workspace_after(
+    mutation_dispatcher: Option<&Arc<MutationDispatcher>>,
+    state: &DesktopState,
+) -> Result<(), String> {
+    let dispatcher = mutation_dispatcher
+        .ok_or_else(|| "workspace mutation dispatcher unavailable".to_owned())?;
+    let snapshot = state.workspace.snapshot();
+    dispatcher
+        .submit(ControlRequest::InsertWorkspaceAfter {
+            index: snapshot.count.saturating_sub(1),
+            expected_revision: snapshot.revision,
+        })
+        .map(|_| ())
+        .map_err(|error| error.message)
 }
 
 /// Collision-safe shortcut: `.desktop` sources are copied with a ` link`

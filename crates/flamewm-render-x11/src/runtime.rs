@@ -62,18 +62,31 @@ where
             }
         };
         let x_fd = XConnectionNumber(display);
-        let token = reactor
-            .register_raw_fd_with_action(x_fd, calloop::Interest::READ, |_, _| FdAction::Continue)
-            .map_err(|error| error.to_string())?;
+        let token =
+            match reactor.register_raw_fd_with_action(x_fd, calloop::Interest::READ, |_, _| {
+                FdAction::Continue
+            }) {
+                Ok(token) => token,
+                Err(error) => {
+                    let deferred_native = app.take_deferred_native_libraries();
+                    drop(app);
+                    XCloseDisplay(display);
+                    drop(deferred_native);
+                    return Err(error.to_string());
+                }
+            };
         let result = app.event_loop_with_reactor(
             &mut document,
             &mut |event, document| on_event(&ControllerEvent::Action(event.clone()), document),
             reactor,
             &mut on_reactor,
         );
-        reactor.remove(token).map_err(|error| error.to_string())?;
+        let remove_result = reactor.remove(token).map_err(|error| error.to_string());
+        let deferred_native = app.take_deferred_native_libraries();
         drop(app);
         XCloseDisplay(display);
+        drop(deferred_native);
+        remove_result?;
         result
     }
 }
@@ -115,8 +128,10 @@ where
             }
         };
         let result = app.event_loop(&mut document, &mut on_action);
+        let deferred_native = app.take_deferred_native_libraries();
         drop(app);
         XCloseDisplay(display);
+        drop(deferred_native);
         result
     }
 }

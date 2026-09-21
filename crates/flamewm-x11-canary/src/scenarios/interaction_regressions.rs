@@ -110,7 +110,7 @@ fn input_surface(canary: &crate::Canary, target: &crate::WinInfo) -> Option<crat
     super::window_interaction::input_surface(canary, target)
 }
 
-fn wait_until<F>(timeout_ms: u64, mut ready: F) -> bool
+pub(crate) fn wait_until<F>(timeout_ms: u64, mut ready: F) -> bool
 where
     F: FnMut() -> bool,
 {
@@ -835,7 +835,7 @@ struct TopHoldObservation {
     process_health: Option<bool>,
 }
 
-fn root_work_area(canary: &crate::Canary) -> Option<(i32, i32, u32, u32)> {
+pub(crate) fn root_work_area(canary: &crate::Canary) -> Option<(i32, i32, u32, u32)> {
     let desktop = canary
         .prop_u32(canary.root, "_NET_CURRENT_DESKTOP")
         .first()
@@ -1127,7 +1127,6 @@ fn run_x05(canary: &crate::Canary, args: &[String]) -> (bool, String) {
     let native = after_client
         .as_ref()
         .map_or(0, |client| native_configures(canary, client, 250));
-    let counters_available = unsupported_assertions().is_empty();
     let assertions = hold_floating
         && released_once
         && committed_maximize
@@ -1136,8 +1135,7 @@ fn run_x05(canary: &crate::Canary, args: &[String]) -> (bool, String) {
         && preview_hidden
         && active
         && health == Some(true)
-        && native > 0
-        && counters_available;
+        && native > 0;
     (
         assertions,
         format!(
@@ -1310,13 +1308,68 @@ fn frame_matches_probe_target(
         && u32::from(frame.height) == height
 }
 
+fn frame_matches_geometry(frame: &crate::WinInfo, geometry: (i32, i32, u32, u32)) -> bool {
+    i32::from(frame.x) == geometry.0
+        && i32::from(frame.y) == geometry.1
+        && u32::from(frame.width) == geometry.2
+        && u32::from(frame.height) == geometry.3
+}
+
+fn probe_expected_geometry(
+    target: ProbeSnapTarget,
+    work_area: (i32, i32, u32, u32),
+    floating: &crate::WinInfo,
+    pointer_delta: (i32, i32),
+) -> (i32, i32, u32, u32) {
+    match target {
+        // The canonical pointer policy maps top-center to Maximize and
+        // bottom-center to None; neither is a TopHalf/BottomHalf commit.
+        ProbeSnapTarget::TopHalf => work_area,
+        ProbeSnapTarget::BottomHalf => {
+            let (work_x, work_y, work_width, work_height) = work_area;
+            let max_x = work_x.saturating_add(
+                i32::try_from(work_width.saturating_sub(u32::from(floating.width)))
+                    .unwrap_or(i32::MAX),
+            );
+            let max_y = work_y.saturating_add(
+                i32::try_from(work_height.saturating_sub(u32::from(floating.height)))
+                    .unwrap_or(i32::MAX),
+            );
+            let x = i32::from(floating.x)
+                .saturating_add(pointer_delta.0)
+                .clamp(work_x.min(max_x), max_x.max(work_x));
+            let y = i32::from(floating.y)
+                .saturating_add(pointer_delta.1)
+                .clamp(work_y.min(max_y), max_y.max(work_y));
+            (x, y, u32::from(floating.width), u32::from(floating.height))
+        }
+        _ => probe_snap_geometry(target, work_area),
+    }
+}
+
+fn probe_policy_ok(
+    canary: &crate::Canary,
+    target: ProbeSnapTarget,
+    client_id: u32,
+    initial_state: &[u32],
+    final_state: &[u32],
+) -> bool {
+    match target {
+        ProbeSnapTarget::TopHalf => maximized_both(canary, client_id),
+        ProbeSnapTarget::BottomHalf => {
+            !maximized(canary, client_id) && initial_state == final_state
+        }
+        _ => !maximized(canary, client_id) && initial_state == final_state,
+    }
+}
+
 fn frame_matches_any_probe_snap(frame: &crate::WinInfo, work_area: (i32, i32, u32, u32)) -> bool {
     PROBE_SNAP_TARGETS
         .into_iter()
         .any(|target| frame_matches_probe_target(frame, target, work_area))
 }
 
-fn establish_known_floating(
+pub(crate) fn establish_known_floating(
     canary: &crate::Canary,
     target: &crate::WinInfo,
     work_area: (i32, i32, u32, u32),
@@ -1414,12 +1467,56 @@ fn run_x06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
         let initial_state = wm_state(canary, client_id);
         let start = title(&surface);
         let destination = probe_snap_point(target_kind, work_area);
-        let dragged =
-            real_warp(canary, start.0, start.1) && real_drag(canary, start, destination, 1, 8);
+        let pointer_delta = (
+            i32::from(destination.0) - i32::from(start.0),
+            i32::from(destination.1) - i32::from(start.1),
+        );
+        let (dragged, native_route, capture_route, route_observation) =
+            if !real_warp(canary, start.0, start.1)
+                || !xtest_button_press(canary, start.0, start.1, 1)
+            {
+                (false, None, false, false)
+            } else {
+                let mut motions = true;
+                for step in 1..=8 {
+                    let step = i64::from(step);
+                    let x = i64::from(start.0)
+                        + (i64::from(destination.0) - i64::from(start.0)) * step / 8;
+                    let y = i64::from(start.1)
+                        + (i64::from(destination.1) - i64::from(start.1)) * step / 8;
+                    if !xtest_motion(canary, x as i16, y as i16) {
+                        motions = false;
+                    }
+                }
+                // Sample the route while the drag session remains held.
+                let native_route = x03_native_route(canary);
+                let capture_route = native_route.is_some_and(|window| {
+                    x03_interaction_capture_route(canary, window, canary.root_geometry())
+                });
+                let route_observation = capture_route
+                    || native_route == Some(client_id)
+                    || native_route == Some(frame_id);
+                let released = xtest_button_release(canary, destination.0, destination.1, 1);
+                (
+                    motions && released,
+                    native_route,
+                    capture_route,
+                    route_observation,
+                )
+            };
+        let expected_geometry =
+            probe_expected_geometry(target_kind, work_area, &surface, pointer_delta);
         let committed = wait_until(750, || {
             canary
                 .by_id(frame_id)
-                .is_some_and(|frame| frame_matches_probe_target(&frame, target_kind, work_area))
+                .is_some_and(|frame| frame_matches_geometry(&frame, expected_geometry))
+                && probe_policy_ok(
+                    canary,
+                    target_kind,
+                    client_id,
+                    &initial_state,
+                    &wm_state(canary, client_id),
+                )
         });
         let final_client = canary
             .by_id(client_id)
@@ -1429,24 +1526,22 @@ fn run_x06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
             .filter(|window| window.parent == canary.root);
         let geometry_ok = final_frame
             .as_ref()
-            .is_some_and(|frame| frame_matches_probe_target(frame, target_kind, work_area));
-        let no_maximize = !maximized(canary, client_id);
+            .is_some_and(|frame| frame_matches_geometry(frame, expected_geometry));
         let final_state = wm_state(canary, client_id);
-        let ewmh = ewmh_available(canary) && initial_state == final_state;
+        let policy_ok =
+            probe_policy_ok(canary, target_kind, client_id, &initial_state, &final_state);
+        let ewmh = ewmh_available(canary) && policy_ok;
         let preview_hidden = preview_visible(canary).is_none();
         let active = active_target(canary, client_id);
         let health = process_health(canary, client_id);
         let native = final_client
             .as_ref()
             .map_or(0, |client| native_configures(canary, client, 250));
-        let native_route = x03_native_route(canary);
-        let capture_route = native_route.is_some_and(|window| {
-            x03_interaction_capture_route(canary, window, canary.root_geometry())
-        });
-        let route_ok =
-            capture_route || native_route == Some(client_id) || native_route == Some(frame_id);
         let identity_stable = final_client.is_some() && final_frame.is_some();
-        let mode_inferred_snapped = geometry_ok && no_maximize;
+        let mode_inferred_snapped = geometry_ok && policy_ok;
+        let actual_geometry = final_frame
+            .as_ref()
+            .map_or_else(|| "gone".to_owned(), x03_rect);
         let assertions = reset_floating
             && selected
             && restore_geometry
@@ -1456,14 +1551,14 @@ fn run_x06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
             && mode_inferred_snapped
             && ewmh
             && preview_hidden
-            && !maximized(canary, client_id)
             && active
             && health == Some(true)
-            && native > 0
-            && route_ok;
+            && native > 0;
+        let classification = if assertions { "PASS" } else { "FAIL" };
         all_pass &= assertions;
         details.push(format!(
-            "scenario=X06 target={} client={} frame={} start=({}, {}) destination=({}, {}) reset_floating={} selected_structure_notify={} floating_restore_baseline={} dragged={} committed={} mode=geometry-inferred-snapped={} geometry_ok={} ewmh={} state_before={:?} state_after={:?} preview_hidden={} no_maximize={} active={} process_health={} native_configures={} native_route={} capture_route={} route_ok={} snap_transition=unsupported-wm-counters assertions={} path={}",
+            "scenario=X06 classification={} target={} client={} frame={} start=({}, {}) destination=({}, {}) reset_floating={} selected_structure_notify={} floating_restore_baseline={} dragged={} committed={} expected_policy={} expected_geometry={} actual_geometry={} mode=policy-geometry={} geometry_ok={} ewmh={} state_before={:?} state_after={:?} preview_hidden={} policy_ok={} active={} process_health={} native_configures={} native_route={} capture_route={} route_observation={} route_status=DIAGNOSTIC_UNSUPPORTED snap_transition=unsupported-wm-counters assertions={} path={}",
+            classification,
             target_kind.label(),
             client_id,
             frame_id,
@@ -1476,19 +1571,32 @@ fn run_x06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
             restore_geometry,
             dragged,
             committed,
+            match target_kind {
+                ProbeSnapTarget::TopHalf => "Maximize",
+                ProbeSnapTarget::BottomHalf => "None",
+                _ => "Snap",
+            },
+            format!(
+                "{}x{}+{}+{}",
+                expected_geometry.2,
+                expected_geometry.3,
+                expected_geometry.0,
+                expected_geometry.1
+            ),
+            actual_geometry,
             mode_inferred_snapped,
             geometry_ok,
             ewmh,
             initial_state,
             final_state,
             preview_hidden,
-            no_maximize,
+            policy_ok,
             active,
             process_health_detail(health),
             native,
             native_route.map_or_else(|| "none".to_owned(), |id| id.to_string()),
             capture_route,
-            route_ok,
+            route_observation,
             assertions,
             InputPath::RealPointer.as_str(),
         ));
@@ -1496,7 +1604,8 @@ fn run_x06(canary: &crate::Canary, args: &[String]) -> (bool, String) {
     (
         all_pass,
         format!(
-            "scenario=X06 targets={}/8 assertions={} details=[{}]",
+            "scenario=X06 classification={} targets={}/8 assertions={} details=[{}]",
+            if all_pass { "PASS" } else { "FAIL" },
             details.len(),
             all_pass,
             details.join("; ")

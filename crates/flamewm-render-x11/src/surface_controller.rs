@@ -2,6 +2,7 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::native::cursor::DeferredNativeLibraryHandles;
 use crate::xlib::*;
 use flamewm_reactor::Reactor;
 use flamewm_render_core::{Rect, SurfaceDamage};
@@ -84,8 +85,10 @@ where
                 document,
             )
         });
+        let deferred_native = unsafe { app.take_deferred_native_libraries() };
         drop(app);
         XCloseDisplay(display);
+        drop(deferred_native);
         result
     }
 }
@@ -386,6 +389,10 @@ pub struct SurfaceController {
     next_id: u64,
     surfaces: HashMap<SurfaceId, SurfaceInstance>,
     windows: HashMap<Window, SurfaceId>,
+    /// Dynamic Xft/XRender/XShape/Xcursor handles outlive all apps and
+    /// XCloseDisplay. Backend X resources are drained before this owner closes
+    /// the display; the handles are dropped only afterwards.
+    deferred_native_libraries: Vec<DeferredNativeLibraryHandles>,
 }
 
 impl SurfaceController {
@@ -403,6 +410,7 @@ impl SurfaceController {
                 next_id: 1,
                 surfaces: HashMap::new(),
                 windows: HashMap::new(),
+                deferred_native_libraries: Vec::new(),
             })
         }
     }
@@ -524,6 +532,16 @@ impl SurfaceController {
                     XUngrabPointer(self.display, CURRENT_TIME);
                 }
                 instance.app.pointer_grabbed = false;
+            }
+            if x_io_broken() || x_error_seen() || !display_fd_alive(self.display) {
+                // No backend may call into a broken display. Preserve the
+                // complete app until process teardown rather than unloading a
+                // library whose close-display hook may still be referenced.
+                std::mem::forget(instance);
+            } else {
+                // SAFETY: this controller still owns the live display.
+                self.deferred_native_libraries
+                    .push(unsafe { instance.app.take_deferred_native_libraries() });
             }
             Ok(())
         } else {
@@ -1496,13 +1514,22 @@ impl Drop for SurfaceController {
             let surfaces = std::mem::take(&mut self.surfaces);
             std::mem::forget(surfaces);
             self.windows.clear();
+            let deferred = std::mem::take(&mut self.deferred_native_libraries);
+            std::mem::forget(deferred);
             return;
+        }
+        let mut deferred_native = std::mem::take(&mut self.deferred_native_libraries);
+        for instance in self.surfaces.values_mut() {
+            // SAFETY: the display owner has verified a live connection, and
+            // this owner retains every dynamic handle beyond XCloseDisplay.
+            deferred_native.push(unsafe { instance.app.take_deferred_native_libraries() });
         }
         self.surfaces.clear();
         self.windows.clear();
         unsafe {
             XCloseDisplay(self.display);
         }
+        drop(deferred_native);
     }
 }
 

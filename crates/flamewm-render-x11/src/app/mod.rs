@@ -12,7 +12,7 @@ use flamewm_render_core::{
 use std::os::raw::{c_int, c_ulong};
 
 use super::config::{X11Config, X11WindowRole};
-use super::native::cursor::{NativeCursorSession, XcursorBackend};
+use super::native::cursor::{DeferredNativeLibraryHandles, NativeCursorSession, XcursorBackend};
 use super::native::surface_format::{SurfaceAlphaMode, fallback_mode, validate_argb32_visual};
 use super::native::target::{
     GeometryCommit, NativeSurfaceTarget, PresentationState, presenter_error,
@@ -563,6 +563,20 @@ impl X11App {
     pub(crate) fn backbuffer_bytes(&self) -> usize {
         self.backbuffer_bytes
     }
+
+    /// Transfer all dynamically loaded backend handles to the display owner.
+    /// Backend X resources are released while the display is live; the typed
+    /// owner must be retained until after `XCloseDisplay`.
+    pub(crate) unsafe fn take_deferred_native_libraries(&mut self) -> DeferredNativeLibraryHandles {
+        unsafe {
+            DeferredNativeLibraryHandles::from_backends(
+                self.xcursor.take(),
+                self.xft.take(),
+                self.xrender.take(),
+                self.xshape.take(),
+            )
+        }
+    }
 }
 
 fn shape_available(display: *mut Display) -> bool {
@@ -722,14 +736,10 @@ impl Drop for X11App {
             std::mem::forget(xrender);
             return;
         }
-        // XftDraw owns resources associated with the drawable. Destroy it before
-        // the X window so its teardown never observes an invalid drawable.
-        drop(self.xft.take());
-        drop(self.xrender.take());
-        drop(self.xshape.take());
-        if let Some(mut xcursor) = self.xcursor.take() {
-            unsafe { xcursor.free_all() };
-        }
+        // Release backend-owned X resources before core X resources. Normal
+        // display owners call `take_deferred_native_libraries` first and keep
+        // its dynamic handles alive through XCloseDisplay.
+        let _deferred = unsafe { self.take_deferred_native_libraries() };
         unsafe {
             if self.pointer_grabbed {
                 XUngrabPointer(self.display, CURRENT_TIME);

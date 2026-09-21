@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use flamewm_api::settings::SettingsSnapshot as ApiSettingsSnapshot;
 use flamewm_control_core::{ControlMutationQueue, ControlRequest, MutationLane};
 use flamewm_control_dbus::MutationDispatcher;
 
@@ -39,11 +40,25 @@ pub fn enqueue_on_queue(queue: &Arc<ControlMutationQueue>, request: ControlReque
 /// Nonblocking result drain for the reactor turn. Failures are nonfatal
 /// diagnostics; the event loop survives either way.
 pub fn drain_results(dispatcher: Option<&Arc<MutationDispatcher>>) {
+    drain_results_with_settings(dispatcher, |_| {});
+}
+
+/// Drain the bounded mutation result queue on the reactor turn. Settings
+/// mutation responses retain their typed snapshot and are handed to the shell
+/// state owner; all other successful responses remain intentionally generic.
+pub fn drain_results_with_settings(
+    dispatcher: Option<&Arc<MutationDispatcher>>,
+    mut apply_settings: impl FnMut(ApiSettingsSnapshot),
+) {
     let Some(dispatcher) = dispatcher else {
         return;
     };
     while let Some(result) = dispatcher.try_recv_result() {
-        match &result.outcome {
+        match result.outcome {
+            Ok(flamewm_control_core::ControlResponse::Settings(snapshot)) => {
+                result_ok_counter().increment();
+                apply_settings(snapshot);
+            }
             Ok(_) => result_ok_counter().increment(),
             Err(error) => {
                 result_err_counter().increment();
@@ -79,7 +94,30 @@ fn result_err_counter() -> &'static flamewm_profiler::CounterPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flamewm_control_core::ControlMutationQueue;
+    use flamewm_api::settings::{SettingValue, SettingsSnapshot};
+    use flamewm_control_core::{
+        ControlMutationQueue, ControlMutationResult, ControlResponse, MutationLane,
+    };
+
+    fn production_source() -> &'static str {
+        include_str!("control_actions.rs")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("control action tests must have a production section")
+    }
+
+    fn settings_result_fixture() -> ControlMutationResult {
+        let mut snapshot = SettingsSnapshot::new(7);
+        snapshot.values.insert(
+            "audio.raise_maximum".to_owned(),
+            SettingValue::Boolean(true),
+        );
+        ControlMutationResult {
+            id: 11,
+            lane: MutationLane::Settings,
+            outcome: Ok(ControlResponse::Settings(snapshot)),
+        }
+    }
 
     #[test]
     fn enqueue_returns_immediately_and_full_is_nonfatal() {
@@ -92,5 +130,23 @@ mod tests {
             "full queue must be nonfatal None, not panic"
         );
         assert_eq!(queue.pending_len(), 1, "full entry retained, not dropped");
+    }
+
+    #[test]
+    fn red_t06_settings_mutation_result_requires_direct_snapshot_application() {
+        // RED(T06): the current drain path matches Ok(_) and discards this
+        // Settings snapshot instead of handing it to the shell state owner.
+        let result = settings_result_fixture();
+        assert!(matches!(
+            result.outcome,
+            Ok(ControlResponse::Settings(snapshot))
+                if snapshot.revision == 7
+                    && snapshot.values.get("audio.raise_maximum")
+                        == Some(&SettingValue::Boolean(true))
+        ));
+        assert!(
+            production_source().contains("ControlResponse::Settings"),
+            "T06 RED: drain_results must consume Settings(snapshot) directly; current mutation only logs generic Ok(_)"
+        );
     }
 }

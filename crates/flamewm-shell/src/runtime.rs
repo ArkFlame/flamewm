@@ -206,9 +206,9 @@ impl ShellRuntime {
 
     /// Record a delivered `ControlSignal` by applying snapshot payloads
     /// directly. No fetch happens here and legacy revision-only signals
-    /// (`WindowsChanged` / `WorkspacesChanged` / `PanelsChanged`) are
-    /// ignored for normal refresh; the shell loop projects from the
-    /// already-applied snapshot once per turn.
+    /// (`WindowsChanged` / `WorkspacesChanged` / `PanelsChanged` /
+    /// `SystemChanged`) are ignored for normal refresh; the shell loop
+    /// projects from the already-applied snapshot once per turn.
     pub fn mark_signal(&mut self, signal: &ControlSignal) {
         match signal {
             ControlSignal::WindowsSnapshotChanged { windows, .. } => {
@@ -231,79 +231,53 @@ impl ShellRuntime {
                     self.dirty.panels = true;
                 }
             }
-            ControlSignal::SystemChanged { .. } => self.dirty.system = true,
+            ControlSignal::SystemSnapshotChanged { snapshot } => {
+                let _s = crate::runtime::shell_span("shell.signal_to_visual.system").start();
+                if snapshot != &self.snapshot.system {
+                    self.snapshot.system = snapshot.clone();
+                    self.dirty.system = true;
+                }
+            }
+            ControlSignal::SystemChanged { .. } => {}
             _ => {}
         }
     }
 
-    /// Drain already-applied snapshot domains (windows/workspaces/panels)
-    /// into a change set without any fetch. Proves the zero-fetch contract:
-    /// snapshot signals need no `GetWindows` / `GetWorkspaces` / `GetPanels`
-    /// roundtrip.
-    pub fn reconcile_applied(&mut self) -> ChangedDomains {
+    /// Reconcile already-applied snapshot domains into a change set without
+    /// any fetch. Every steady-state domain is supplied by a snapshot signal;
+    /// this method only consumes dirty flags and never owns a control client.
+    pub fn reconcile_dirty(&mut self) -> ChangedDomains {
         let mut changed = ChangedDomains::default();
         if self.dirty.windows {
             changed.windows = true;
             self.dirty.windows = false;
+            domain_reconcile_counter(DomainKind::Windows).increment();
         }
         if self.dirty.workspaces {
             changed.workspaces = true;
             self.dirty.workspaces = false;
+            domain_reconcile_counter(DomainKind::Workspaces).increment();
         }
         if self.dirty.panels {
             changed.panels = true;
             self.dirty.panels = false;
+            domain_reconcile_counter(DomainKind::Panels).increment();
         }
+        if self.dirty.system {
+            changed.system = true;
+            self.dirty.system = false;
+            domain_reconcile_counter(DomainKind::System).increment();
+        }
+        // No application signal is owned by this reconciliation path; keep
+        // the flag consumed if a producer marks it before a future snapshot
+        // contract is added.
+        self.dirty.applications = false;
         changed
     }
 
-    /// Reconcile remaining fetch-owned dirty domains (currently system
-    /// only). Windows/workspaces/panels arrive as snapshot payloads via
-    /// `mark_signal` + `reconcile_applied` and are never fetched here;
-    /// legacy revision-only signals set no flags for normal refresh.
-    /// Returns the set of domains that actually changed so the caller can
-    /// project only the affected surfaces (§6: Windows->task slots only,
-    /// Workspaces->pager only, no broad refresh of hidden surfaces).
-    pub fn reconcile_dirty(&mut self, client: &ControlClient) -> Result<ChangedDomains, String> {
-        let mut changed = self.reconcile_applied();
-        if !self.dirty.any() {
-            return Ok(changed);
-        }
-        if self.dirty.system {
-            let system = match client.call(&ControlRequest::GetSystem) {
-                Ok(ControlResponse::System(snapshot)) => snapshot,
-                Ok(response) => return Err(format!("GetSystem returned {response:?}")),
-                Err(error) => return Err(format!("GetSystem failed: {}", error.message)),
-            };
-            if system.revision != self.snapshot.system.revision {
-                self.snapshot.system = system;
-                changed.system = true;
-                domain_reconcile_counter(DomainKind::System).increment();
-            }
-        }
-        // Applications are owned by `refresh_applications` (gated on the
-        // applications dirty flag by the caller); never fetched here so one
-        // flag maps to exactly one fetch.
-        self.dirty.clear();
-        Ok(changed)
-    }
-
-    /// Fetch the live applications list and replace the start-set domain.
-    /// Returns `true` when applications content changed. Always consumes
-    /// the applications dirty flag so one flag maps to exactly one fetch.
-    pub fn refresh_applications(&mut self, client: &ControlClient) -> Result<bool, String> {
-        self.dirty.applications = false;
-        let applications = match client.call(&ControlRequest::GetApplications) {
-            Ok(ControlResponse::Applications(snapshot)) => snapshot,
-            Ok(response) => return Err(format!("GetApplications returned {response:?}")),
-            Err(error) => return Err(format!("GetApplications failed: {}", error.message)),
-        };
-        if applications == self.snapshot.applications {
-            return Ok(false);
-        }
-        self.snapshot.applications = applications;
-        domain_reconcile_counter(DomainKind::Applications).increment();
-        Ok(true)
+    /// Compatibility name for callers that only consume applied snapshots.
+    pub fn reconcile_applied(&mut self) -> ChangedDomains {
+        self.reconcile_dirty()
     }
 
     #[must_use]
@@ -1275,7 +1249,8 @@ fn ui_error(error: UiBackendError) -> String {
 /// Shell spans (static only): shell.windows.reconcile, shell.workspaces.reconcile,
 /// shell.tasks.project, shell.pager.project, shell.popup.request,
 /// shell.quick_control.open_request, shell.quick_control.restart,
-/// shell.signal_to_visual.windows, shell.signal_to_visual.workspaces.
+/// shell.signal_to_visual.windows, shell.signal_to_visual.workspaces,
+/// shell.signal_to_visual.system.
 #[allow(dead_code)]
 pub fn shell_span(label: &'static str) -> flamewm_profiler::ProfilePoint {
     debug_assert!(
@@ -1299,6 +1274,7 @@ pub fn shell_span(label: &'static str) -> flamewm_profiler::ProfilePoint {
                 | "shell.quick.open.total"
                 | "shell.signal_to_visual.windows"
                 | "shell.signal_to_visual.workspaces"
+                | "shell.signal_to_visual.system"
         ),
         "shell span label must be a static J07 span, got {label}"
     );
@@ -1459,6 +1435,7 @@ mod tests {
         runtime.mark_signal(&ControlSignal::WindowsChanged { revision: 9 });
         runtime.mark_signal(&ControlSignal::WorkspacesChanged { revision: 3 });
         runtime.mark_signal(&ControlSignal::PanelsChanged { revision: 4 });
+        runtime.mark_signal(&ControlSignal::SystemChanged { revision: 6 });
         assert!(!runtime.dirty().any());
     }
 
@@ -1506,6 +1483,20 @@ mod tests {
     }
 
     #[test]
+    fn system_snapshot_signal_updates_model_without_fetch() {
+        let mut runtime = ShellRuntime::default();
+        let mut snapshot = runtime.snapshot().system.clone();
+        snapshot.revision = 9;
+        runtime.mark_signal(&ControlSignal::SystemSnapshotChanged {
+            snapshot: snapshot.clone(),
+        });
+        assert_eq!(runtime.snapshot().system, snapshot);
+        let changed = runtime.reconcile_dirty();
+        assert!(changed.system);
+        assert!(!runtime.dirty().any());
+    }
+
+    #[test]
     fn identical_snapshot_signal_sets_no_flag() {
         let mut runtime = ShellRuntime::default();
         let windows = runtime.snapshot().windows.clone();
@@ -1514,6 +1505,24 @@ mod tests {
             windows,
         });
         assert!(!runtime.dirty().any());
+    }
+
+    #[test]
+    fn red_t08_steady_state_has_no_blocking_get_system_reconciliation() {
+        // RED(T08): current steady state still enters reconcile_dirty with a
+        // ControlClient and calls GetSystem from the shell tick.
+        let source = include_str!("runtime.rs")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("runtime tests must have a production section");
+        assert!(
+            !source.contains("pub fn reconcile_dirty(&mut self, client: &ControlClient)"),
+            "T08 RED: shell runtime must not expose blocking ControlClient reconciliation"
+        );
+        assert!(
+            !source.contains("client.call(&ControlRequest::GetSystem)"),
+            "T08 RED: steady-state shell updates must not fetch GetSystem"
+        );
     }
 
     fn panel_output(id: &str, geometry: flamewm_api::Rect) -> flamewm_api::display::OutputSnapshot {

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -51,8 +51,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
     flamewm_profiler::init_process("flamewm-wm");
     flamewm_debug::init_process("wm");
     let settings_path = settings_path();
-    let mut host = None;
-    let control = ControlServer::connect_session()?;
+    let control = Rc::new(ControlServer::connect_session()?);
     let reactor = Rc::new(RefCell::new(Reactor::new()?));
     let integrations = Rc::new(RefCell::new(LinuxIntegrationRuntime::connect()?));
     if let Err(error) = integrations.borrow_mut().start() {
@@ -143,6 +142,18 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
             return Err(error.into());
         }
     };
+    let host = Rc::new(RefCell::new(None::<PlatformHost<X11Desktop>>));
+    let control_now_ms = Rc::new(Cell::new(0_u64));
+    let control_error = Rc::new(RefCell::new(None::<AnyError>));
+    let mut control_registration =
+        match register_control(&reactor, &control, &host, &control_now_ms, &control_error) {
+            Ok(registration) => registration,
+            Err(error) => {
+                drop(pulse);
+                integrations.borrow_mut().stop();
+                return Err(error);
+            }
+        };
     // Profiler report timer on the reactor; interval from
     // `FLAMEWM_PROFILE_INTERVAL` (floored at 10s, default 60s), never
     // hardcoded here. No timer thread.
@@ -172,8 +183,24 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
     let pulse_for_hook = Rc::clone(&pulse);
     let audio_updates_for_hook = Rc::clone(&audio_updates);
     let reactor_for_hook = Rc::clone(&reactor);
+    let host_for_hook = Rc::clone(&host);
+    let control_for_hook = Rc::clone(&control);
+    let control_now_ms_for_hook = Rc::clone(&control_now_ms);
+    let control_error_for_hook = Rc::clone(&control_error);
 
     let result = run_with_hook(config, &catalog, &reactor, move |conn, screen, changes| {
+        if let Some(error) = control_error_for_hook.borrow_mut().take() {
+            return Err(error);
+        }
+        refresh_control(
+            &reactor_for_hook,
+            &mut control_registration,
+            &control_for_hook,
+            &host_for_hook,
+            &control_now_ms_for_hook,
+            &control_error_for_hook,
+        )?;
+        let mut host = host_for_hook.borrow_mut();
         // Scoped per-turn span: the whole-process `wm.loop` guard above has
         // been removed so loop-turn CPU is attributed per turn, not once
         // across the full process lifetime.
@@ -210,7 +237,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
                     &snapshot.media,
                 ),
             }));
-            host = Some(new_host);
+            *host = Some(new_host);
         }
         let host = host.as_mut().expect("host initialized");
         if !host_started {
@@ -223,9 +250,7 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
             let mut audio_updates = audio_updates_for_hook.borrow_mut();
             for snapshot in audio_updates.drain(..) {
                 if host.system_mut().update_audio(snapshot) {
-                    control.emit_signal(&ControlSignal::SystemChanged {
-                        revision: host.system_snapshot().revision,
-                    })?;
+                    emit_system_signals(host, control_for_hook.as_ref())?;
                 }
             }
         }
@@ -240,14 +265,10 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
                 let network = integrations.network_snapshot();
                 let media = integrations.media_snapshot();
                 if host.system_mut().update_network(network) {
-                    control.emit_signal(&ControlSignal::SystemChanged {
-                        revision: host.system_snapshot().revision,
-                    })?;
+                    emit_system_signals(host, control_for_hook.as_ref())?;
                 }
                 if host.system_mut().update_media(media) {
-                    control.emit_signal(&ControlSignal::SystemChanged {
-                        revision: host.system_snapshot().revision,
-                    })?;
+                    emit_system_signals(host, control_for_hook.as_ref())?;
                 }
             }
         }
@@ -264,13 +285,27 @@ pub fn run(config: WmConfig) -> Result<(), AnyError> {
             &provider_error_for_hook,
         )?;
         let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        flush_wm_changes(host, &control, changes)?;
-        control.on_ready(host, now_ms)?;
+        control_now_ms_for_hook.set(now_ms);
+        flush_wm_changes(host, control_for_hook.as_ref(), changes)?;
         Ok(())
     });
     drop(pulse);
     integrations.borrow_mut().stop();
     result
+}
+
+fn emit_system_signals<E>(host: &PlatformHost<E>, control: &ControlServer) -> Result<(), AnyError>
+where
+    E: flamewm_api::ports::EnginePorts,
+{
+    let snapshot = host.system_snapshot();
+    control.emit_signal(&ControlSignal::SystemSnapshotChanged {
+        snapshot: snapshot.clone(),
+    })?;
+    control.emit_signal(&ControlSignal::SystemChanged {
+        revision: snapshot.revision,
+    })?;
+    Ok(())
 }
 
 /// Drain one `WmChangeSet` once per reactor turn: refresh only required
@@ -338,6 +373,80 @@ fn any_from_flame(error: flamewm_api::FlameError) -> AnyError {
         std::io::ErrorKind::Other,
         error.to_string(),
     ))
+}
+
+struct ControlRegistration {
+    fd: i32,
+    events: FdEvents,
+    token: RegistrationToken,
+}
+
+fn register_control(
+    reactor: &Rc<RefCell<Reactor>>,
+    control: &Rc<ControlServer>,
+    host: &Rc<RefCell<Option<PlatformHost<X11Desktop>>>>,
+    now_ms: &Rc<Cell<u64>>,
+    control_error: &Rc<RefCell<Option<AnyError>>>,
+) -> Result<ControlRegistration, AnyError> {
+    let watch = control.watch();
+    let control = Rc::clone(control);
+    let host = Rc::clone(host);
+    let now_ms = Rc::clone(now_ms);
+    let control_error = Rc::clone(control_error);
+    let token = reactor.borrow_mut().register_raw_fd_with_action(
+        watch.fd,
+        interest_for(watch.events),
+        move |_, readiness| {
+            if readiness.error || readiness.hangup {
+                let mut control_error = control_error.borrow_mut();
+                if control_error.is_none() {
+                    *control_error = Some(Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "control D-Bus FD closed",
+                    )));
+                }
+                return FdAction::Remove;
+            }
+            if !(readiness.readable || readiness.writable) {
+                return FdAction::Continue;
+            }
+            let mut host = host.borrow_mut();
+            let Some(host) = host.as_mut() else {
+                return FdAction::Continue;
+            };
+            if let Err(error) = control.on_ready(host, now_ms.get()) {
+                let mut control_error = control_error.borrow_mut();
+                if control_error.is_none() {
+                    *control_error = Some(Box::new(error));
+                }
+                FdAction::Remove
+            } else {
+                FdAction::Continue
+            }
+        },
+    )?;
+    Ok(ControlRegistration {
+        fd: watch.fd,
+        events: watch.events,
+        token,
+    })
+}
+
+fn refresh_control(
+    reactor: &Rc<RefCell<Reactor>>,
+    registration: &mut ControlRegistration,
+    control: &Rc<ControlServer>,
+    host: &Rc<RefCell<Option<PlatformHost<X11Desktop>>>>,
+    now_ms: &Rc<Cell<u64>>,
+    control_error: &Rc<RefCell<Option<AnyError>>>,
+) -> Result<(), AnyError> {
+    let watch = control.watch();
+    if watch.fd == registration.fd && watch.events == registration.events {
+        return Ok(());
+    }
+    reactor.borrow_mut().remove(registration.token)?;
+    *registration = register_control(reactor, control, host, now_ms, control_error)?;
+    Ok(())
 }
 
 struct ProviderRegistration {

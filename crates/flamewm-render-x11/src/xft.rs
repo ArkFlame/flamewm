@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_uchar, c_ulong};
+use std::os::raw::{c_char, c_int, c_short, c_uchar, c_ulong, c_ushort};
 use std::path::Path;
 use std::ptr;
 
@@ -46,13 +46,33 @@ struct FcConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct XGlyphInfo {
-    width: c_int,
-    height: c_int,
-    x: c_int,
-    y: c_int,
-    x_off: c_int,
-    y_off: c_int,
+    width: c_ushort,
+    height: c_ushort,
+    x: c_short,
+    y: c_short,
+    x_off: c_short,
+    y_off: c_short,
 }
+
+// XRender.h's XGlyphInfo is two unsigned shorts followed by four shorts.
+const _: () = {
+    assert!(std::mem::size_of::<XGlyphInfo>() == 12);
+    assert!(std::mem::align_of::<XGlyphInfo>() == 2);
+    let info = XGlyphInfo {
+        width: 0,
+        height: 0,
+        x: 0,
+        y: 0,
+        x_off: 0,
+        y_off: 0,
+    };
+    let _: c_ushort = info.width;
+    let _: c_ushort = info.height;
+    let _: c_short = info.x;
+    let _: c_short = info.y;
+    let _: c_short = info.x_off;
+    let _: c_short = info.y_off;
+};
 
 type XftDrawCreateFn =
     unsafe extern "C" fn(*mut Display, Drawable, *mut Visual, Colormap) -> *mut XftDraw;
@@ -117,7 +137,7 @@ pub struct XftBackend {
     colormap: Colormap,
     draw: *mut XftDraw,
     api: XftApi,
-    _xft_library: DynamicLibrary,
+    _xft_library: Option<DynamicLibrary>,
     _fontconfig_library: Option<DynamicLibrary>,
     fonts: HashMap<FontKey, *mut XftFont>,
     colors: HashMap<Color, XftColor>,
@@ -193,7 +213,7 @@ impl XftBackend {
             colormap,
             draw,
             api,
-            _xft_library: xft_library,
+            _xft_library: Some(xft_library),
             _fontconfig_library: fontconfig_library,
             fonts: HashMap::new(),
             colors: HashMap::new(),
@@ -368,24 +388,46 @@ impl XftBackend {
         self.colors.insert(color, allocated);
         Ok(allocated)
     }
+
+    /// Release Xft-owned display resources while the display is live, then
+    /// transfer the dynamic-library handles to the display lifetime owner.
+    /// Function pointers and Xft objects are never allowed to outlive these
+    /// handles; the returned libraries must remain alive through XCloseDisplay.
+    pub(crate) unsafe fn into_deferred_libraries(mut self) -> Vec<DynamicLibrary> {
+        unsafe { self.release_resources() };
+        let mut libraries = Vec::with_capacity(2);
+        if let Some(library) = self._xft_library.take() {
+            libraries.push(library);
+        }
+        if let Some(library) = self._fontconfig_library.take() {
+            libraries.push(library);
+        }
+        drop(self);
+        libraries
+    }
+
+    unsafe fn release_resources(&mut self) {
+        for (_, mut color) in self.colors.drain() {
+            // SAFETY: the display, visual, and colormap remain live; drained colors are backend-owned.
+            unsafe { (self.api.color_free)(self.display, self.visual, self.colormap, &mut color) };
+        }
+        for (_, font) in self.fonts.drain() {
+            // SAFETY: the display remains live and the drained font is closed exactly once.
+            unsafe { (self.api.font_close)(self.display, font) };
+        }
+        if !self.draw.is_null() {
+            // SAFETY: `draw` is a live backend-owned handle and its library remains loaded.
+            unsafe { (self.api.draw_destroy)(self.draw) };
+            self.draw = ptr::null_mut();
+        }
+    }
 }
 
 impl Drop for XftBackend {
     fn drop(&mut self) {
         // SAFETY: teardown only touches backend-owned Xft handles while `display`
         // remains live; draining first guarantees each handle is freed once.
-        unsafe {
-            for (_, mut color) in self.colors.drain() {
-                (self.api.color_free)(self.display, self.visual, self.colormap, &mut color);
-            }
-            for (_, font) in self.fonts.drain() {
-                (self.api.font_close)(self.display, font);
-            }
-            if !self.draw.is_null() {
-                (self.api.draw_destroy)(self.draw);
-                self.draw = ptr::null_mut();
-            }
-        }
+        unsafe { self.release_resources() };
     }
 }
 
@@ -479,6 +521,18 @@ pub(crate) fn xrender_color_for(color: Color) -> (u16, u16, u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xglyph_info_matches_xrender_abi() {
+        assert_eq!(std::mem::size_of::<XGlyphInfo>(), 12);
+        assert_eq!(std::mem::align_of::<XGlyphInfo>(), 2);
+        assert_eq!(std::mem::offset_of!(XGlyphInfo, width), 0);
+        assert_eq!(std::mem::offset_of!(XGlyphInfo, height), 2);
+        assert_eq!(std::mem::offset_of!(XGlyphInfo, x), 4);
+        assert_eq!(std::mem::offset_of!(XGlyphInfo, y), 6);
+        assert_eq!(std::mem::offset_of!(XGlyphInfo, x_off), 8);
+        assert_eq!(std::mem::offset_of!(XGlyphInfo, y_off), 10);
+    }
 
     #[test]
     fn css_weights_map_to_available_plex_faces() {

@@ -9,6 +9,7 @@ use std::ptr;
 
 use flamewm_render_core::{Color, Rect, RuntimeDocument};
 
+use super::native::cursor::DeferredNativeLibraryHandles;
 use super::native::xresource::{X11ResourceAllocator, refresh_image_gauge};
 use super::xft::{XftBackend, xft_measure_estimate};
 use super::xlib::*;
@@ -205,6 +206,21 @@ impl Drop for ExternalDrawableTarget {
 }
 
 impl ExternalDrawableTarget {
+    /// Move all dynamically loaded backend handles to the display owner after
+    /// releasing their drawable-bound X resources. The target remains valid
+    /// for its image-cache teardown, but no backend library is dropped before
+    /// XCloseDisplay.
+    pub(crate) unsafe fn take_deferred_native_libraries(&mut self) -> DeferredNativeLibraryHandles {
+        unsafe {
+            DeferredNativeLibraryHandles::from_backends(
+                None,
+                self.xft.take(),
+                self.xrender.take(),
+                self.xshape.take(),
+            )
+        }
+    }
+
     /// # Safety
     /// `session` must outlive the target; `drawable` must be valid on the
     /// session display. Backend construction failures are recorded as `None`

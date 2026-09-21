@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use chrono::{Datelike, Local};
 use flamewm_api::settings::{SettingValue, SettingsSnapshot, SettingsTransaction};
 use flamewm_control_core::ControlRequest;
-use flamewm_control_dbus::ControlClient;
 use flamewm_shell::async_projection::{self, StartViewNote};
 use flamewm_shell::icon_loader::{DependentSurface, IconLoader, IconTarget};
 use flamewm_shell::start::StartCategory;
@@ -77,7 +76,6 @@ pub(crate) struct ShellLoop {
     pub(crate) shell: ShellRuntime,
     pub(crate) surfaces: ShellSurfaces,
     pub(crate) start_model: flamewm_shell_core::StartModel,
-    pub(crate) control: ControlClient,
     pub(crate) dispatcher: Option<std::sync::Arc<flamewm_control_dbus::MutationDispatcher>>,
     pub(crate) start_category: StartCategory,
     pub(crate) start_query: String,
@@ -103,7 +101,6 @@ impl ShellLoop {
         shell: ShellRuntime,
         surfaces: ShellSurfaces,
         start_model: flamewm_shell_core::StartModel,
-        control: ControlClient,
         dispatcher: Option<std::sync::Arc<flamewm_control_dbus::MutationDispatcher>>,
         loader_root: std::path::PathBuf,
         quick_program: String,
@@ -114,7 +111,6 @@ impl ShellLoop {
             shell,
             surfaces,
             start_model,
-            control,
             dispatcher,
             start_category: StartCategory::All,
             start_query: String::new(),
@@ -148,21 +144,13 @@ impl ShellLoop {
         self.shell.mark_signal(signal);
     }
 
-    pub(crate) fn refresh_settings_revision(&mut self) -> Result<(), UiBackendError> {
-        match self.control.call(&ControlRequest::GetSettings) {
-            Ok(flamewm_control_core::ControlResponse::Settings(snapshot)) => {
-                self.settings_revision = snapshot.revision;
-                if let Some(SettingValue::Boolean(raise)) =
-                    snapshot.values.get(AudioSettings::SETTINGS_KEY)
-                {
-                    self.audio_settings.raise_maximum = *raise;
-                }
-                self.settings_cache = Some(snapshot);
-                Ok(())
-            }
-            Ok(_) => Ok(()),
-            Err(_) => Ok(()),
+    pub(crate) fn apply_settings_snapshot(&mut self, snapshot: SettingsSnapshot) {
+        self.settings_revision = snapshot.revision;
+        if let Some(SettingValue::Boolean(raise)) = snapshot.values.get(AudioSettings::SETTINGS_KEY)
+        {
+            self.audio_settings.raise_maximum = *raise;
         }
+        self.settings_cache = Some(snapshot);
     }
 
     /// J07 nonblocking submit: enqueue onto the mutation queue and return
@@ -367,7 +355,6 @@ impl ShellLoop {
                 }],
                 reset_section: None,
             }));
-            let _ = self.refresh_settings_revision();
             return None;
         }
         if action == "network.filter.clear" {
@@ -766,25 +753,12 @@ impl ShellLoop {
         Ok(())
     }
 
-    /// Signal-driven dynamic refresh (§6): reconcile dirty domains flagged
-    /// by `ControlSignal` delivery (at most one fetch round), then project
-    /// only the surfaces each changed domain owns.
+    /// Signal-driven dynamic refresh (§6): reconcile snapshot domains flagged
+    /// by `ControlSignal` delivery, then project only the surfaces each
+    /// changed domain owns.
     pub(crate) fn refresh_dynamic(&mut self, runtime: &mut SurfaceRuntime) {
-        use flamewm_shell::runtime::{ChangedDomains, ProjectionKind};
-        let applications_dirty = self.shell.dirty().applications;
-        let applications_changed = if applications_dirty {
-            match self.shell.refresh_applications(&self.control) {
-                Ok(applications_changed) => applications_changed,
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-        let mut changed = match self.shell.reconcile_dirty(&self.control) {
-            Ok(changed) => changed,
-            Err(_) => ChangedDomains::default(),
-        };
-        changed.applications = applications_changed;
+        use flamewm_shell::runtime::ProjectionKind;
+        let mut changed = self.shell.reconcile_dirty();
         // F10: display geometry change may arrive without a panels dirty
         // flag, so check generation/revision/geometry drift even when no
         // changed domain fired. Sync happens BEFORE next open/projection.
@@ -795,10 +769,6 @@ impl ShellLoop {
         }
         if !changed.any() && !resynced {
             return;
-        }
-        if applications_changed {
-            self.start_model
-                .replace_applications(self.shell.snapshot().applications.clone());
         }
         let request_id = self
             .shell
@@ -1020,6 +990,13 @@ fn clear_transient_state_fields(
 
 #[cfg(test)]
 mod tests {
+    fn production_source() -> &'static str {
+        include_str!("app.rs")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("app tests must have a production section")
+    }
+
     #[test]
     fn escape_close_clears_start_and_transient_state() {
         let mut start_open = true;
@@ -1033,5 +1010,37 @@ mod tests {
 
         assert!(!start_open);
         assert!(context_menu.is_none());
+    }
+
+    #[test]
+    fn red_t06_settings_toggle_has_no_follow_up_get_settings_fetch() {
+        // RED(T06): the current toggle submits ApplySettings, then performs a
+        // blocking UI-thread GetSettings roundtrip instead of using its result.
+        let source = production_source();
+        assert!(
+            !source.contains("self.control.call(&ControlRequest::GetSettings"),
+            "T06 RED: settings mutation must not be followed by UI GetSettings"
+        );
+        assert!(
+            !source.contains("refresh_settings_revision"),
+            "T06 RED: remove the blocking settings refresh seam"
+        );
+    }
+
+    #[test]
+    fn red_t08_shell_loop_has_no_steady_state_control_client_field() {
+        // RED(T08): the current ShellLoop retains a blocking ControlClient
+        // solely for steady-state reconciliation.
+        let source = production_source();
+        let shell_loop = source
+            .split_once("pub(crate) struct ShellLoop {")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n}\n\nimpl ShellLoop"))
+            .map(|(body, _)| body)
+            .expect("ShellLoop definition must remain discoverable");
+        assert!(
+            !shell_loop.contains("ControlClient"),
+            "T08 RED: ShellLoop steady state must not own a blocking ControlClient"
+        );
     }
 }

@@ -9,10 +9,13 @@ use std::sync::Once;
 use flamewm_render_core::CursorKind;
 
 use crate::ffi::dynamic_library::DynamicLibrary;
+use crate::xft::XftBackend;
 use crate::xlib::{
     Cursor, Display, Window, XCURSOR_LIBRARY_NAMES, XCURSOR_SET_SIZE_SYMBOL,
     XCURSOR_SET_THEME_SYMBOL,
 };
+use crate::xrender::XRenderBackend;
+use crate::xshape::XShapeBridge;
 
 type LibraryLoadCursorFn = unsafe extern "C" fn(*mut Display, *const c_char) -> Cursor;
 type LibrarySetThemeFn = unsafe extern "C" fn(*mut Display, *const c_char);
@@ -127,6 +130,15 @@ impl XcursorBackend {
         }
     }
 
+    /// Release cursor objects while the display is live, then transfer the
+    /// library handle to the display lifetime owner.
+    pub(crate) unsafe fn into_deferred_libraries(mut self) -> Vec<DynamicLibrary> {
+        unsafe { self.free_all() };
+        let library = self._library.take();
+        drop(self);
+        library.into_iter().collect()
+    }
+
     /// Define the cursor for `kind` on `window`, falling back to Default.
     /// Callers pass the WM-computed semantic kind (resize edges, hover);
     /// this manager is the single renderer-side cursor owner.
@@ -203,5 +215,63 @@ impl NativeCursorSession {
 
     pub unsafe fn free_all(&mut self) {
         unsafe { self.backend.free_all() };
+    }
+
+    pub(crate) unsafe fn into_deferred_libraries(self) -> Vec<DynamicLibrary> {
+        unsafe { self.backend.into_deferred_libraries() }
+    }
+}
+
+/// Dynamic backend handles retained by the display owner across
+/// `XCloseDisplay`. Each backend first releases its display-bound objects while
+/// the display is live; this owner then keeps the shared objects loaded until
+/// Xlib has finished its close-display callbacks. This is the native lifetime
+/// boundary: dropping a handle before XCloseDisplay is a use-after-unload risk.
+pub(crate) struct DeferredNativeLibraryHandles {
+    libraries: Vec<DynamicLibrary>,
+}
+
+impl DeferredNativeLibraryHandles {
+    pub(crate) fn new() -> Self {
+        Self {
+            libraries: Vec::new(),
+        }
+    }
+
+    /// # Safety
+    /// All supplied backends refer to the same live display. Their X-backed
+    /// resources are released before this owner is returned.
+    pub(crate) unsafe fn from_backends(
+        cursor: Option<NativeCursorSession>,
+        xft: Option<XftBackend>,
+        xrender: Option<XRenderBackend>,
+        xshape: Option<XShapeBridge>,
+    ) -> Self {
+        let mut owner = Self::new();
+        if let Some(cursor) = cursor {
+            owner
+                .libraries
+                .extend(unsafe { cursor.into_deferred_libraries() });
+        }
+        if let Some(xft) = xft {
+            owner
+                .libraries
+                .extend(unsafe { xft.into_deferred_libraries() });
+        }
+        if let Some(xrender) = xrender {
+            owner
+                .libraries
+                .extend(unsafe { xrender.into_deferred_libraries() });
+        }
+        if let Some(xshape) = xshape {
+            owner.libraries.extend(xshape.into_deferred_libraries());
+        }
+        owner
+    }
+
+    /// Merge handles from another display-bound owner before either owner is
+    /// dropped. Both owners must belong to the same display lifetime.
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.libraries.extend(other.libraries);
     }
 }

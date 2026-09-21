@@ -346,9 +346,14 @@ fn error_name(error: &FlameError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flamewm_control_wire::system_dict;
 
     fn signal_message(signal: &ControlSignal) -> Message {
         let wire = encode_signal(signal);
+        wire_signal_message(&wire)
+    }
+
+    fn wire_signal_message(wire: &WireSignal) -> Message {
         let mut message =
             Message::new_signal(OBJECT_PATH, &wire.interface, &wire.member).expect("signal");
         message.append_items(
@@ -421,5 +426,43 @@ mod tests {
             signal_match_rule(),
             format!("type='signal',path='{OBJECT_PATH}'")
         );
+    }
+
+    // CONTRACT-REGRESSION: T05 SystemSnapshotChanged carries the complete authoritative snapshot through D-Bus.
+    // TRIGGER: marshal and unmarshal the canonical SystemSnapshotChanged signal on the control object path.
+    // OBSERVABLE: D-Bus decoding admits the signal and preserves the exact snapshot payload.
+    // GAP: existing bus tests cover legacy/revision-only and non-system snapshot signals only.
+    // MUTATION: omit the SystemSnapshotChanged wire decoder arm or route its payload to SystemChanged; test must fail.
+    // CASE: non-default revision and status fields distinguish the snapshot from a revision-only signal.
+    #[test]
+    fn t05_system_snapshot_changed_round_trips_exact_snapshot_through_dbus() {
+        let mut snapshot = flamewm_api::system::SystemSnapshot::default();
+        snapshot.revision = 37;
+        snapshot.network.label = "ArkNet 5G".to_owned();
+        snapshot.network.strength_percent = 82;
+        snapshot.media.title = "Neon Skyline".to_owned();
+        snapshot.audio.volume_percent = 72;
+        let expected = ControlSignal::SystemSnapshotChanged {
+            snapshot: snapshot.clone(),
+        };
+        assert_eq!(
+            decode_bus_signal(&signal_message(&expected)),
+            Some(expected)
+        );
+        let wire = WireSignal {
+            interface: flamewm_control_core::IFACE_SYSTEM.to_owned(),
+            member: "SystemSnapshotChanged".to_owned(),
+            args: vec![WireValue::Dict(system_dict(&snapshot))],
+        };
+
+        let decoded = decode_bus_signal(&wire_signal_message(&wire))
+            .expect("SystemSnapshotChanged must decode from D-Bus");
+        assert_eq!(
+            format!("{decoded:?}"),
+            format!("SystemSnapshotChanged {{ snapshot: {:?} }}", snapshot)
+        );
+
+        let legacy = ControlSignal::SystemChanged { revision: 37 };
+        assert_eq!(decode_bus_signal(&signal_message(&legacy)), Some(legacy));
     }
 }

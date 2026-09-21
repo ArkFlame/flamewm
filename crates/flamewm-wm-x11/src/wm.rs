@@ -767,6 +767,13 @@ where
         calloop::Interest::READ,
         |_, _| flamewm_reactor::FdAction::Continue,
     )?;
+    // Snap worker fd source: borrowed fd wakes dispatch; result drain stays at
+    // the loop boundary below, on the WM thread. The callback never borrows Wm.
+    let _snap_preview_token = reactor.borrow_mut().register_raw_fd_with_action(
+        wm.snap_preview.wake_fd(),
+        calloop::Interest::READ,
+        |_, _| flamewm_reactor::FdAction::Continue,
+    )?;
 
     loop {
         // Buffered drain before block: one pump collapses contiguous
@@ -806,6 +813,12 @@ where
         resize_counters().record_committed(batch as u64);
         if batch > resize_counters().max_batch() {
             resize_counters().set_max_batch(batch);
+        }
+        // Worker readiness is only a wakeup. Drain bytes and consume the
+        // latest result after both event-pump passes, before the next block.
+        {
+            let _guard = flamewm_profiler::start("wm.snap.wake.dispatch");
+            wm.snap_preview.drain_worker();
         }
         emit_resize_summary();
         emit_move_summary();
@@ -1452,6 +1465,7 @@ impl<'a, C: Connection> Wm<'a, C> {
         if let Some(session) = self.sessions.get_mut(&client) {
             session.session.cancel();
         }
+        self.snap_preview.hide();
         self.release_pointer();
     }
 
@@ -1665,6 +1679,7 @@ impl<'a, C: Connection> Wm<'a, C> {
     }
 
     fn reconcile_work_area(&mut self) -> Result<(), ReplyError> {
+        self.snap_preview.hide();
         let work = self.work_area();
         let work_root = RootRect::new(
             work.x,
@@ -3457,6 +3472,7 @@ impl<'a, C: Connection> Wm<'a, C> {
         if target >= self.workspace_count || target == self.current_workspace {
             return Ok(());
         }
+        self.snap_preview.hide();
         let old = self.current_workspace;
         self.current_workspace = target;
         let ids = self.clients.keys().copied().collect::<Vec<_>>();
@@ -3501,6 +3517,7 @@ impl<'a, C: Connection> Wm<'a, C> {
         if requested == self.workspace_count {
             return Ok(());
         }
+        self.snap_preview.hide();
         let mut moved = Vec::new();
         if requested < self.workspace_count {
             for state in self.clients.values_mut() {
@@ -3548,6 +3565,7 @@ impl<'a, C: Connection> Wm<'a, C> {
         if target >= self.workspace_count {
             return Ok(());
         }
+        self.snap_preview.hide();
         let (frame, visible) = {
             let Some(state) = self.clients.get_mut(&client) else {
                 return Ok(());
